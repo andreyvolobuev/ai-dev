@@ -11,6 +11,7 @@ from virtual_dev.application.services.injection_filter import (
 )
 from virtual_dev.application.services.link_extractor import ExtractedLinks, extract_links
 from virtual_dev.application.services.researcher import ResearcherToolkit
+from virtual_dev.application.services.rules import RulesLoader
 
 __all__ = [
     "SYSTEM_PROMPT_ABOUT_UNTRUSTED",
@@ -18,6 +19,7 @@ __all__ = [
     "ExtractedLinks",
     "InjectionFilter",
     "ResearcherToolkit",
+    "RulesLoader",
     "ThreadDigest",
     "WrappedUntrusted",
     "extract_links",

@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     db_url: str = "sqlite+aiosqlite:///./data/virtual_dev.db"
     workspaces_dir: str = "./workspaces"
 
+    # --- Bot identity used when committing / opening MRs.
+    # Push is done with the GitLab token above (same account as the user),
+    # but the commit author is always the bot — so humans see at a glance
+    # who wrote the code.
+    dev_git_author_name: str = "Virtual Dev"
+    dev_git_author_email: str = "virtual-dev@datamining.2gis.ru"
+    dev_branch_prefix: str = "ai-dev"
+    dev_mr_draft: bool = True   # open MRs as draft by default
+
     web_host: str = "127.0.0.1"
     web_port: int = 8080
 
