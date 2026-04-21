@@ -1,0 +1,78 @@
+# Настройки агентов и Jira-фильтрации.
+#
+# Модели:
+#   Используем Claude Sonnet 4.5 как основную, Haiku для лёгких задач.
+#   Названия модели можно переопределить на агента.
+#   Полный перечень моделей: https://docs.claude.com/en/docs/about-claude/models/overview
+
+models:
+  default: "claude-sonnet-4-5"
+  lightweight: "claude-haiku-4-5"
+
+# JQL, по которому Orchestrator забирает задачи из Jira.
+# На старте — свои задачи пользователя с определённым label.
+# Позже можно поменять на отдельный bot-аккаунт (assignee = "ai-dev").
+task_source:
+  jql: 'assignee = currentUser() AND labels = "ai-dev" AND status = "To Do"'
+  poll_interval_seconds: 120
+
+# Переходы статусов в Jira. Проверь, что имена совпадают с реальным workflow.
+jira_transitions:
+  to_in_progress: "In Progress"
+  to_review: "Review"
+  to_testing: "Testing"
+  to_done: "Done"
+
+# Рабочие часы для общения в Mattermost (Московское время).
+# Вне этих часов Communicator копит задачи и шлёт утром.
+working_hours:
+  timezone: "Europe/Moscow"
+  start_hour: 10
+  end_hour: 20
+  weekdays_only: true
+
+# Настройки по отдельным агентам.
+agents:
+  orchestrator:
+    model: default
+    max_tokens_per_turn: 4000
+
+  analyst:
+    model: default
+    max_tokens_per_turn: 8000
+
+  researcher:
+    model: default
+    max_tokens_per_turn: 8000
+
+  communicator:
+    model: lightweight  # мелкие сообщения, Haiku справится
+    max_tokens_per_turn: 2000
+    rate_limit_per_hour: 20  # не более N сообщений в канал/личку за час
+
+  developer:
+    model: default
+    max_tokens_per_turn: 16000
+    max_iterations_per_task: 30
+
+  reviewer:
+    model: default
+    max_tokens_per_turn: 8000
+
+  qa:
+    model: default
+    max_tokens_per_turn: 8000
+
+  devops:
+    model: default
+    max_tokens_per_turn: 4000
+
+# Ревью-политика.
+review_policy:
+  required_approvals: 1
+  ping_reviewers_after_hours: 4
+  escalate_after_hours: 24
+
+# Эскалация: куда писать, когда бот застрял.
+escalation:
+  mattermost_user: your.name  # твой mm-username, замени

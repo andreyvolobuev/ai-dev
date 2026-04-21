@@ -1,0 +1,77 @@
+# Список репозиториев, на которых работает бот.
+#
+# Как это работает:
+# - Orchestrator при старте читает этот файл.
+# - Для каждого репо поднимает N dev-агентов в соответствии с `agents`.
+# - Можно добавить новый репо — и после перезапуска появятся новые агенты.
+#
+# Поля:
+#   key                — уникальный идентификатор (snake_case).
+#   url                — SSH или HTTPS URL GitLab-репо.
+#   local_path         — (опц.) путь к уже склонированному репо. Если не задан — клонируем в WORKSPACES_DIR/<key>.
+#   description        — для дашборда.
+#   jira_components    — список jira-компонентов, которые роутятся в этот репо. Используется Analyst-агентом.
+#   default_branch     — базовая ветка для MR (обычно main / master / develop).
+#   agents             — кто работает с этим репо:
+#       backend:   true|false
+#       frontend:  true|false
+#       devops:    true|false
+#   primary_language   — для backend-агента: подсказка в prompt (python, go, ...).
+#   frontend_stack     — для frontend-агента: (опц.) react, vue, typescript-react, ...
+#   tests_cmd          — команда прогона тестов (для QA-агента и backend/frontend-агентов).
+#   lint_cmd           — команда линтера.
+#   ci_provider        — gitlab_ci (на будущее — github_actions, etc).
+
+repositories:
+  - key: bellingshausen
+    url: git@gitlab.2gis.ru:sd-data-mining/bellingshausen.git
+    local_path: /Users/andreyvolobuev/Documents/2gis/bellingshausen
+    description: "Монорепа (бэкенд + фронтенд)."
+    jira_components: []  # заполнишь позже
+    default_branch: master   # проверь, возможно main
+    agents:
+      backend: true
+      frontend: true
+      devops: false
+    primary_language: python
+    frontend_stack: unknown   # заменить на реальный: react, vue, ...
+    tests_cmd: "pytest"
+    lint_cmd: "ruff check ."
+    ci_provider: gitlab_ci
+
+  # --- Остальные подключим позже, когда bellingshausen поедет. Шаблоны закомментированы. ---
+
+  # - key: rainbow
+  #   url: git@gitlab.2gis.ru:sd-data-mining/rainbow.git
+  #   description: "..."
+  #   jira_components: []
+  #   default_branch: master
+  #   agents: { backend: true, frontend: false, devops: false }
+  #   primary_language: python
+  #   tests_cmd: "pytest"
+  #   lint_cmd: "ruff check ."
+  #   ci_provider: gitlab_ci
+
+  # - key: pts_aggregator
+  #   url: git@gitlab.2gis.ru:sd-data-mining/pts-aggregator.git
+  #   ...
+
+  # - key: greeder
+  #   url: git@gitlab.2gis.ru:sd-data-mining/greeder.git
+  #   ...
+
+  # - key: alertilka_backend
+  #   url: git@gitlab.2gis.ru:sd-data-mining/alertilka/alertilka-backend.git
+  #   agents: { backend: true, frontend: false, devops: false }
+  #   ...
+
+  # - key: alertilka_deploy
+  #   url: git@gitlab.2gis.ru:sd-data-mining/alertilka/alertilka-deploy.git
+  #   agents: { backend: false, frontend: false, devops: true }
+  #   ...
+
+  # - key: alertilka_ui
+  #   url: git@gitlab.2gis.ru:sd-data-mining/alertilka/alertilka-ui.git
+  #   agents: { backend: false, frontend: true, devops: false }
+  #   frontend_stack: ???
+  #   ...

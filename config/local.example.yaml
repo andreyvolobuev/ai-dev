@@ -1,0 +1,14 @@
+# Локальные переопределения для твоей машины.
+# Этот файл НЕ в git (см. .gitignore). Скопируй в config/local.yaml и правь.
+#
+# Любое поле из repositories.yaml / agents.yaml / mappings.yaml можно переопределить здесь.
+# Приоритет: local.yaml > agents.yaml / repositories.yaml / mappings.yaml.
+
+# Пример: у меня локально другой путь к репо
+# repositories:
+#   - key: bellingshausen
+#     local_path: /Users/andreyvolobuev/Documents/2gis/bellingshausen
+
+# Пример: для тестов хочу смотреть только один тикет
+# task_source:
+#   jql: 'key = "DM-1234"'

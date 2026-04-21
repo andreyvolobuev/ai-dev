@@ -1,0 +1,26 @@
+# Маппинги, нужные агентам для принятия решений.
+# На старте большинство пустые — заполним по мере роста.
+
+# email → mattermost-username.
+# Используется Communicator'ом, когда Dev-агент просит "спроси у автора коммита".
+# Автор коммита берётся из git blame → email → ищем здесь.
+# Если email не найден — Communicator попробует найти пользователя в MM по email через API.
+email_to_mattermost:
+  # "ivan.ivanov@2gis.ru": "ivanov"
+  # "petr.petrov@2gis.ru": "petrov"
+
+# jira-компонент → repo key (из repositories.yaml).
+# Если тикет помечен компонентом — сразу понимаем, какой репо.
+# Если не помечен — Analyst попробует догадаться из текста.
+component_to_repo:
+  # "Bellingshausen API": bellingshausen
+  # "Rainbow": rainbow
+
+# Команда → канал в Mattermost (куда писать "ребята, подскажите").
+team_channels:
+  datamining: "datamining-general"  # замени на реальное имя канала
+
+# Шаблон сообщения-дисклеймера бота (первое сообщение в треде / в личке).
+disclaimer_template: |
+  👋 Привет! Я — виртуальный разработчик команды DataMining (экспериментальный AI-бот).
+  Могу ошибаться или говорить ерунду. Если видишь, что я делаю что-то не так — напиши `!ALARM` и меня остановит человек.
