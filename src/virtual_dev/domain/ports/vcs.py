@@ -27,15 +27,26 @@ class VcsPort(ABC):
 
     @abstractmethod
     async def create_branch(self, repo_key: str, branch: str, base: str) -> None:
-        """Create a new branch off ``base``."""
+        """Create a new branch off ``base`` and check it out."""
 
     @abstractmethod
     async def commit_all(self, repo_key: str, message: str) -> str:
-        """Stage everything and commit. Returns the commit SHA."""
+        """Stage everything and commit. Returns the commit SHA.
+
+        Returns an empty string if there was nothing to commit.
+        """
 
     @abstractmethod
     async def push(self, repo_key: str, branch: str) -> None:
         """Push ``branch`` to origin."""
+
+    @abstractmethod
+    async def current_branch(self, repo_key: str) -> str:
+        """Return the name of the currently checked-out branch."""
+
+    @abstractmethod
+    async def has_uncommitted_changes(self, repo_key: str) -> bool:
+        """Return ``True`` iff the working tree has staged or unstaged changes."""
 
     # --- Remote API ---
 
