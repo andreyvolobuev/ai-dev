@@ -3,6 +3,11 @@
 Most agents go through :class:`CodeAgentPort`, but a handful of lightweight
 calls (thread summarisation, JSON-only structured extraction) use a simpler
 completion interface.
+
+No ``max_tokens`` / ``temperature`` parameters: the production adapter runs
+through ``claude-agent-sdk``, which drives the Claude Code CLI and does not
+expose those knobs. ``input_tokens`` / ``output_tokens`` in the response are
+informational estimates returned by the SDK, not a billing signal.
 """
 
 from __future__ import annotations
@@ -36,9 +41,7 @@ class LlmPort(ABC):
         messages: list[LlmMessage],
         *,
         model: str,
-        max_tokens: int,
         system: str | None = None,
-        temperature: float = 1.0,
     ) -> LlmResponse:
         """Return a single completion."""
 
@@ -48,8 +51,6 @@ class LlmPort(ABC):
         messages: list[LlmMessage],
         *,
         model: str,
-        max_tokens: int,
         system: str | None = None,
-        temperature: float = 1.0,
     ) -> AsyncIterator[str]:
         """Stream completion chunks as they arrive."""

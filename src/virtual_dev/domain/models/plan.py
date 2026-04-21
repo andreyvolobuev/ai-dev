@@ -55,7 +55,9 @@ class Plan:
     status: PlanStatus = PlanStatus.DRAFT
     target_repo_key: str | None = None   # determined by Analyst from components / hints
 
-    # Bookkeeping
+    # Bookkeeping — informational only. We run on Claude Max (no metered
+    # billing), so cost_usd is the SDK's estimate shown in the dashboard,
+    # not a figure we enforce against.
     cost_usd: float = 0.0
     iterations: int = 0
     model: str = ""

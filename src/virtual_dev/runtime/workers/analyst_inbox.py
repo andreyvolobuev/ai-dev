@@ -48,7 +48,7 @@ def _render_plan_comment(plan: Plan, dashboard_url: str | None = None) -> str:
         for risk in plan.risks:
             lines.append(f"- {risk}")
     lines.append("")
-    lines.append(f"_Cost: ${plan.cost_usd:.4f}, turns: {plan.iterations}._")
+    lines.append(f"_Turns: {plan.iterations}._")
     if dashboard_url:
         lines.append(f"_Dashboard: {dashboard_url}_")
     return "\n".join(lines)

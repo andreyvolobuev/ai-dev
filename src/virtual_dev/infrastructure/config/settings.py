@@ -43,10 +43,6 @@ class Settings(BaseSettings):
     db_url: str = "sqlite+aiosqlite:///./data/virtual_dev.db"
     workspaces_dir: str = "./workspaces"
 
-    daily_budget_usd: float = 20.0
-    per_task_budget_usd: float = 5.0
-    per_task_iteration_limit: int = 30
-
     web_host: str = "127.0.0.1"
     web_port: int = 8080
 

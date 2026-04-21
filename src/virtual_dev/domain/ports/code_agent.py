@@ -24,15 +24,20 @@ class CodeAgentTool:
 
 @dataclass
 class CodeAgentRequest:
-    """Inputs for a single agent run."""
+    """Inputs for a single agent run.
+
+    No token / dollar budget fields by design: this project runs on the
+    user's Claude Max subscription via `claude-agent-sdk`, not on a
+    metered API, so output length and per-call spend are not things we
+    enforce. ``max_turns`` is the only cycle guard.
+    """
 
     agent_key: str                       # e.g. "dev-bellingshausen-backend"
     system_prompt: str
     user_prompt: str
     working_dir: str | None = None       # where the agent runs shell/files
     allowed_tools: Sequence[CodeAgentTool] = field(default_factory=list)
-    max_turns: int = 30
-    max_tokens_per_turn: int = 8000
+    max_turns: int = 30                  # runaway-loop guard, NOT a billing cap
     model: str | None = None             # override default model per run
     # Adapter-specific escape hatch. Keeps the abstract signature clean while
     # letting callers pass adapter knobs (e.g. MCP server handles for the

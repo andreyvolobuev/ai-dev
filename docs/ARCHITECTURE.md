@@ -129,10 +129,11 @@ Writes in Phase 1: Jira transition + comment. **No MM writes.**
 
 ## Safety rails
 
-- Every message originating outside the bot is marked `trusted=False`. Any LLM-facing code must run untrusted data through an injection filter (not yet implemented — Phase 1).
+- Every message originating outside the bot is marked `trusted=False`. LLM-facing code runs untrusted data through `InjectionFilter` (Phase 1+). Untrusted content is wrapped in `<untrusted_content>` blocks; the system prompt instructs the model to treat them as data.
 - Repositories are gated through `config/repositories.yaml`: no allowlist hit → no Dev-agent.
-- Budgets (`DAILY_BUDGET_USD`, `PER_TASK_BUDGET_USD`, `PER_TASK_ITERATION_LIMIT`) are enforced by the `CodeAgentPort` adapter (Phase 2).
-- Kill-switch: `POST /kill` stops the orchestrator; real wiring of all agents arrives in Phase 1.
+- No billing caps — the project runs on a Claude Max subscription, not on API credits. The only loop guard is `max_iterations_per_task` in `config/agents.yaml`, which limits the number of agent turns (protection against runaway loops, not against spend).
+- `cost_usd` in the `plans` table is an informational estimate returned by `claude-agent-sdk`; nothing is enforced against it.
+- Kill-switch: `POST /kill` stops the orchestrator and the Analyst runner.
 
 ## Testing strategy
 

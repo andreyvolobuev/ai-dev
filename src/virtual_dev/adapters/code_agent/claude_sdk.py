@@ -1,18 +1,14 @@
 """CodeAgentPort backed by ``claude-agent-sdk``.
 
 The SDK spawns the ``claude`` CLI as a subprocess and reuses the logged-in
-Claude Code (Claude Max) session — no API key needed.
+Claude Code (Claude Max) session — no API key needed, no per-task budget
+to enforce.
 
-Public surface of the SDK we rely on:
-    * ``query(prompt, options) -> AsyncIterator[Message]``
-    * ``ClaudeAgentOptions(system_prompt, max_turns, max_budget_usd, model,
-      permission_mode, cwd, mcp_servers, allowed_tools, disallowed_tools)``
-    * ``AssistantMessage`` with ``content: list[TextBlock | ToolUseBlock | ...]``
-    * ``ResultMessage`` with ``total_cost_usd``, ``num_turns``, ``is_error``,
-      ``stop_reason``, ``result``
-
-We translate :class:`CodeAgentRequest` into those options, drain the message
-stream, and produce a :class:`CodeAgentResult` from the final ``ResultMessage``.
+We translate :class:`CodeAgentRequest` into ``ClaudeAgentOptions``, drain
+the message stream, and produce a :class:`CodeAgentResult` from the final
+``ResultMessage``. ``max_turns`` is wired through as a runaway-loop guard;
+token / dollar fields in the result are informational estimates, never
+used for enforcement.
 """
 
 from __future__ import annotations

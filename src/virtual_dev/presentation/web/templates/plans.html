@@ -13,7 +13,6 @@
                     <th>Summary</th>
                     <th>Confidence</th>
                     <th>Repo</th>
-                    <th>Cost</th>
                     <th>Turns</th>
                     <th>When</th>
                 </tr>
@@ -30,7 +29,6 @@
                         <td>{{ p.summary | truncate(140) }}</td>
                         <td>{{ "%.2f"|format(p.confidence) }}</td>
                         <td>{{ p.target_repo_key or "—" }}</td>
-                        <td>${{ "%.4f"|format(p.cost_usd) }}</td>
                         <td>{{ p.iterations }}</td>
                         <td>{{ p.created_at.strftime("%Y-%m-%d %H:%M") if p.created_at else "—" }}</td>
                     </tr>

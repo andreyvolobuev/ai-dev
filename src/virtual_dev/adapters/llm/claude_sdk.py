@@ -42,9 +42,7 @@ class ClaudeAgentSdkLlm(LlmPort):
         messages: list[LlmMessage],
         *,
         model: str,
-        max_tokens: int,
         system: str | None = None,
-        temperature: float = 1.0,
     ) -> LlmResponse:
         prompt = _render_prompt(messages)
         options = self._options(model=model, system=system)
@@ -78,9 +76,7 @@ class ClaudeAgentSdkLlm(LlmPort):
         messages: list[LlmMessage],
         *,
         model: str,
-        max_tokens: int,
         system: str | None = None,
-        temperature: float = 1.0,
     ) -> AsyncIterator[str]:
         prompt = _render_prompt(messages)
         options = self._options(model=model, system=system)

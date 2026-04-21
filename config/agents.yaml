@@ -4,6 +4,11 @@
 #   Используем Claude Sonnet 4.5 как основную, Haiku для лёгких задач.
 #   Названия модели можно переопределить на агента.
 #   Полный перечень моделей: https://docs.claude.com/en/docs/about-claude/models/overview
+#
+# ВАЖНО: бот работает через Claude Max подписку (claude CLI в subprocess),
+# так что полей про budget / токены / деньги тут НЕТ. max_iterations_per_task —
+# это защита от runaway-цикла (не биллинг), rate_limit_per_hour — защита от
+# спама в MM каналах (Phase 3).
 
 models:
   default: "claude-sonnet-4-5"
@@ -35,37 +40,30 @@ working_hours:
 agents:
   orchestrator:
     model: default
-    max_tokens_per_turn: 4000
 
   analyst:
     model: default
-    max_tokens_per_turn: 8000
+    max_iterations_per_task: 15    # plan-building rarely needs more turns
 
   researcher:
     model: default
-    max_tokens_per_turn: 8000
 
   communicator:
     model: lightweight  # мелкие сообщения, Haiku справится
-    max_tokens_per_turn: 2000
-    rate_limit_per_hour: 20  # не более N сообщений в канал/личку за час
+    rate_limit_per_hour: 20  # не более N сообщений в канал/личку за час (Phase 3)
 
   developer:
     model: default
-    max_tokens_per_turn: 16000
-    max_iterations_per_task: 30
+    max_iterations_per_task: 30    # coding может долго грести по тестам
 
   reviewer:
     model: default
-    max_tokens_per_turn: 8000
 
   qa:
     model: default
-    max_tokens_per_turn: 8000
 
   devops:
     model: default
-    max_tokens_per_turn: 4000
 
 # Ревью-политика.
 review_policy:

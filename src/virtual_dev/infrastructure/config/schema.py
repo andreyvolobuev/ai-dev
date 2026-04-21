@@ -73,9 +73,10 @@ class WorkingHoursCfg(_StrictModel):
 
 class AgentCfg(_StrictModel):
     model: str = "default"                  # reference into ModelsCfg
-    max_tokens_per_turn: int = 4000
+    # Cycle guard, NOT a billing cap. Claude Max has no per-task budget —
+    # this is only to stop runaway agent loops.
     max_iterations_per_task: int | None = None
-    rate_limit_per_hour: int | None = None
+    rate_limit_per_hour: int | None = None  # used by Communicator in Phase 3
 
 
 class ReviewPolicyCfg(_StrictModel):

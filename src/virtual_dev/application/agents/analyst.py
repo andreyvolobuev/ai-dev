@@ -101,8 +101,7 @@ class AnalystAgent:
         confluence_host: str | None = None,
         mattermost_host: str | None = None,
         gitlab_host: str | None = None,
-        max_turns: int = 15,
-        max_budget_usd: float | None = None,
+        max_turns: int | None = None,
     ) -> None:
         self._code_agent = code_agent
         self._researcher = researcher
@@ -113,8 +112,8 @@ class AnalystAgent:
         self._confluence_host = confluence_host
         self._mattermost_host = mattermost_host
         self._gitlab_host = gitlab_host
-        self._max_turns = max_turns
-        self._max_budget_usd = max_budget_usd or settings.per_task_budget_usd
+        # Cycle guard (runaway-loop protection), NOT a billing cap.
+        self._max_turns = max_turns or _analyst_max_turns(config) or 15
 
     # --- entry points ---
 
@@ -491,6 +490,11 @@ def _strip_tz(dt: Any) -> Any:
     if hasattr(dt, "tzinfo") and getattr(dt, "tzinfo", None) is not None:
         return dt.replace(tzinfo=None)
     return dt
+
+
+def _analyst_max_turns(config: AppConfig) -> int | None:
+    cfg = config.agents.agents.get("analyst")
+    return cfg.max_iterations_per_task if cfg is not None else None
 
 
 # For tests that want to exercise plan parsing independently:
