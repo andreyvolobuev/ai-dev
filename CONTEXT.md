@@ -10,7 +10,7 @@
 - Python 3.13+ (на моей машине 3.14, но `requires-python = ">=3.13"` для совместимости зависимостей)
 - Менеджер пакетов: uv
 - LLM: Claude Sonnet 4.5 (основная), Haiku 4.5 (для лёгких задач типа "суммаризируй тред")
-- Агентный фреймворк: Claude Agent SDK
+- Агентный фреймворк: **Claude Agent SDK** (`claude-agent-sdk` на PyPI) — обёртка над `claude` CLI, работает через залогиненную Claude Max сессию. **API-ключ не используем**, SDK `anthropic` в зависимостях нет. См. «LLM-инфра» ниже.
 - Трекер: Jira (self-hosted 2GIS)
 - VCS: GitLab (self-hosted 2GIS)
 - Чат: Mattermost (self-hosted 2GIS)
@@ -18,6 +18,15 @@
 - БД на старте: SQLite
 - Web-дашборд: FastAPI + Jinja2
 - CLI: typer
+
+### LLM-инфра (важно!)
+- Бот работает **через Claude Max подписку пользователя**, не через Anthropic API.
+- Все вызовы модели идут через `claude-agent-sdk` → subprocess `claude` (из PATH) → уже залогиненный Claude Code на машине.
+- `ANTHROPIC_API_KEY` нигде не ставим, пакет `anthropic` в зависимостях НЕ нужен.
+- **Нет budget-лимитов в долларах и токенах:** у Max нет per-token/per-dollar биллинга. Не добавлять `PER_TASK_BUDGET_USD`, `max_tokens_per_turn`, `max_budget_usd` и подобное.
+- Единственный лимит — `max_iterations_per_task` (он же `ClaudeAgentOptions.max_turns`): защита от runaway-циклов, не от денег.
+- `plans.cost_usd` в БД — это оценочная цифра из `ResultMessage.total_cost_usd`, хранится как информация для аналитики; ничего на ней не enforce'ится и наружу не показывается.
+- Rate-limit Max'а (сообщений в 5-часовое окно) — SDK выдаёт `RateLimitEvent`, обработаем backoff'ом, не cost-логикой.
 
 ### Архитектура — hexagonal (ports & adapters)
 Слои:
@@ -64,9 +73,9 @@
 - Timeout 4 часа в рабочее время → эскалация человеку (тимлиду).
 
 ### Безопасность
-- Все входные данные от людей = untrusted, пропускаются через injection-фильтр.
+- Все входные данные от людей = untrusted, пропускаются через injection-фильтр (`InjectionFilter` оборачивает в `<untrusted_content>`).
 - Белый список репо в конфиге.
-- Лимиты: $5/задачу, 30 итераций/задачу, $20/день на весь бот.
+- Защита от runaway-цикла: `max_iterations_per_task` в `config/agents.yaml` (15 для analyst, 30 для developer).
 - Kill-switch в дашборде.
 - Секреты: на старте `.env`, потом Vault (есть в компании).
 
@@ -86,63 +95,49 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
 - Бот пишет в канал "гляньте MR", пингует неотреагировавших.
 - Когда собрал N апрувов — пишет "апрувы собрал, прошу смержить".
 
-## Что уже сделано (Фаза 0, частично)
+## Что уже сделано
 
-Создана структура директорий и файлы:
-- `pyproject.toml` (uv + все зависимости + ruff/mypy/pytest)
-- `README.md`
-- `.gitignore`, `.env.example`
-- `config/repositories.yaml` (bellingshausen раскомментирован, остальные — закомм. шаблоны)
-- `config/agents.yaml`
-- `config/mappings.yaml`
-- `config/local.example.yaml`
-- `config/rules/dev-bellingshausen-backend.md`
-- `config/rules/dev-bellingshausen-frontend.md`
-- Структура `src/virtual_dev/{domain,application,adapters,infrastructure,presentation,runtime}/` со всеми подпапками и `__init__.py`
-- Модели домена: `domain/models/{task,repository,chat,merge_request,kb}.py`
+### Фаза 0 — СДЕЛАНО ✅
+- Структура проекта, `pyproject.toml`, `.gitignore`, `.env.example`, `config/*.yaml`, `config/rules/*.md`.
+- Все domain-модели (`Task, Repository, ChatMessage, MergeRequest, KBPage, Plan`).
+- Все 8 ports (`TaskTrackerPort, VcsPort, ChatPort, KnowledgeBasePort, LlmPort, CodeAgentPort, SecretsPort, MessageBusPort`).
+- Адаптер Jira (`JiraTaskTracker`) через `atlassian-python-api`.
+- Infrastructure: pydantic-settings, yaml-loader с мерджем `local.yaml`, async SQLAlchemy 2.0, ORM-модели (TaskRow, MergeRequestRow, AgentMessageRow, EventRow, PlanRow), DI-container, loguru-setup.
+- Минимальный Orchestrator + FastAPI-дашборд + typer CLI (`db init`, `run`, `poll-once`).
+- `docs/ARCHITECTURE.md`.
 
-## Что осталось для Фазы 0 (минимум, чтобы `uv run virtual-dev run` что-то делал)
+### Фаза 1 — СДЕЛАНО ✅
+- **Analyst** (`application/agents/analyst.py`): подписан на `task.discovered` через message bus, собирает контекст (Jira desc + MM-треды через read-only Communicator + опционально Confluence), пропускает через InjectionFilter, зовёт Claude через `claude-agent-sdk` с двумя in-process MCP-серверами (Researcher tools + private `submit_plan`), получает структурированный Plan, сохраняет в БД, обновляет internal_status (READY / CLARIFYING / FAILED). Идемпотентность: повторная обработка того же тикета = no-op при свежем плане.
+- **Researcher** (`application/services/researcher.py`): in-process MCP-сервер с тулами `search_code` (git grep), `read_file`, `kb_search`, `kb_fetch_page_by_url`. Результаты всех тулов оборачиваются в `<untrusted_content>`. **RAG по истории MR — ещё нет**, это Phase 2 (для Dev-агента).
+- **Communicator** (`application/services/communicator.py`): **read-only**. `digest_thread(url)` читает тред из MM, рендерит и оборачивает через InjectionFilter. `send_*` методы в `MattermostChat` бросают `NotImplementedError` — Phase 3 включит запись.
+- **Injection filter** (`application/services/injection_filter.py`): `<untrusted_content>`-обёртка с disarmed closing-тегом, санитайз zero-width/bidi/tag-unicode, регексы на 5 классов инъекций (override, role-play-takeover, prompt-boundary, tool-call-forgery, jailbreak) → notes вне блока.
+- **SqliteMessageBus** (`adapters/message_bus/sqlite.py`): durable шина через `agent_messages` table. Single-consumer per `to_agent`, atomic claim через stamped `consumed_at`, `"*"` broadcast фанаутит на известных подписчиков. Продакшн-дефолт; `InMemoryMessageBus` оставлен для тестов.
+- **Claude Agent SDK адаптеры** (`adapters/code_agent/claude_sdk.py`, `adapters/llm/claude_sdk.py`): через `claude-agent-sdk.query()`. MCP servers и allowed_tools передаются через `CodeAgentRequest.extras`. Бюджетов/токенов нет (см. «LLM-инфра»).
+- **Mattermost adapter** (`adapters/chat/mattermost.py`): read_thread + find_user_by_*; send_* и subscribe — NotImplementedError (Phase 3).
+- **Confluence adapter** (`adapters/knowledge_base/confluence.py`): fetch_page, fetch_page_by_url (парсит URL трёх видов), search (CQL).
+- **AnalystInbox** (`runtime/workers/analyst_inbox.py`): handler на `task.discovered`. Optimistic transition Jira To Do → In Progress, потом `AnalystAgent.handle_task()`, потом Jira-комментарий со сводкой плана (если план не FAILED). Каждый side-effect в своём try/except.
+- **AgentRunner** (`runtime/workers/agent_runner.py`): generic subscribe-and-dispatch цикл на одного агента. Клеит подписку на шину с таблицей handler'ов по topic.
+- **Orchestrator**: теперь публикует `task.discovered` на шину после commit'а новой задачи (обновления — нет).
+- **Dashboard**: `/plans` список, секция планов на `/tasks/{id}`, healthz показывает статусы всех адаптеров (Jira/MM/KB/Analyst/Orchestrator).
+- **CLI**: `virtual-dev plan-task DM-1234 [--post]` — прогнать Analyst локально, флаг `--post` включает запись в Jira.
+- **Тесты**: 44 unit (Plan domain, SqliteBus, InjectionFilter, link extractor, Communicator, Researcher, Analyst c подменой `_call_model`, Orchestrator publish, AgentRunner). `claude-agent-sdk` в тестах не запускается — фейковый CodeAgentPort.
 
-1. **Ports** в `domain/ports/`:
-   - `task_tracker.py` (fetch_tasks, transition, comment)
-   - `vcs.py` (clone/pull, create_branch, commit, push, create_mr, list_comments, approve, merge)
-   - `chat.py` (send_direct, send_to_channel, read_thread, find_user_by_email, subscribe)
-   - `knowledge_base.py` (fetch_page, search)
-   - `llm.py` (complete, stream)
-   - `code_agent.py` (run_task — инкапсулирует Claude Agent SDK)
-   - `secrets.py` (get)
-   - `message_bus.py` (publish, subscribe)
+### Поправки/коррекции в ходе Phase 1 (важно)
+- Удалили из кода все "API-мышление": `ANTHROPIC_API_KEY`, `PER_TASK_BUDGET_USD`, `DAILY_BUDGET_USD`, `max_tokens_per_turn`, `max_budget_usd`, `temperature`. У Max этого нет.
+- `MessageBusPort` — теперь durable SQLite, не in-memory (все агенты через шину — архитектурное требование).
+- Rule-файлы `config/rules/<agent>.md` — пока лежат как есть, но в system prompt агентов пока не подкладываются. Это делается в Phase 2 (для Dev-агента — обязательно).
 
-2. **Первый адаптер — Jira** (`adapters/task_tracker/jira.py`), через `atlassian-python-api`.
+## Фазы
 
-3. **Infrastructure**:
-   - `config/loader.py` — читает yaml + env с pydantic-settings
-   - `container.py` — DI, связывает ports с adapters по конфигу
-   - `db/` — SQLAlchemy модели (Task, MergeRequest, AgentMessage, Event), alembic init
-
-4. **Минимальный Orchestrator** (`application/agents/orchestrator.py`), умеет:
-   - Раз в 2 минуты дёргать TaskTrackerPort.fetch_tasks()
-   - Писать новые задачи в БД
-   - НЕ пишет в Jira, НЕ пишет в MM, НЕ пишет код (это Фаза 0)
-
-5. **FastAPI-дашборд** (`presentation/web/`):
-   - `GET /` — таблица задач
-   - `GET /tasks/{id}` — детальная страница
-   - `POST /kill` — kill-switch (на будущее)
-
-6. **CLI** (`presentation/cli/main.py`):
-   - `virtual-dev db init` — создаёт БД
-   - `virtual-dev run` — запускает scheduler + дашборд
-
-7. `docs/ARCHITECTURE.md`
-
-8. Пара unit-тестов на доменные модели.
-
-## Фазы после 0
-
-- **Фаза 1** — Analyst + Researcher + Communicator (read-only, только строим планы, в Jira комментим, но в MM никому не пишем; команда видит планы в дашборде).
-- **Фаза 2** — первый Dev-агент (bellingshausen backend) на отобранных "чистых" тикетах с полным DoD. Код + MR, но без ревью-цикла.
-- **Фаза 3** — Reviewer + DevOps, общение с людьми в тестовом канале, полный цикл.
+- ✅ **Фаза 0** — скелет, Jira polling, task list в дашборде.
+- ✅ **Фаза 1** — Analyst + Researcher + Communicator (read-only). Планы через Claude Agent SDK, Jira-комменты, injection-фильтр, durable message bus.
+- ⏳ **Фаза 2** (следующая) — первый Dev-агент (bellingshausen backend) на отобранных "чистых" тикетах с полным DoD. Код + MR, но без ревью-цикла. Включает:
+  - `VcsPort` реализация для GitLab (clone/branch/commit/push + API для create/list MR).
+  - `DevAgent` подписан на `plan.ready`, запускает `claude-agent-sdk` с полным набором Read/Edit/Write/Bash/Glob/Grep в cwd репо, submit_mr-тул в конце.
+  - Analyst публикует `plan.ready` когда план READY.
+  - Rules-файлы `config/rules/<agent>.md` подкладываются в system prompt Dev-агента.
+  - RAG по истории MR (в Researcher) — индексация прошлых MR + embeddings + tool `search_mr_history`; если в базовом цикле хватит grep'а — делаем после того как базовый цикл прозеленится.
+- **Фаза 3** — Reviewer + DevOps + запись в Mattermost через Communicator. Полный цикл: бот пингует ревьюеров, реагирует на комменты, собирает апрувы, просит смержить.
 - **Фаза 4** — обкатка на реальных задачах всей команды.
 - **Фаза 5** — автопилот, все репо, фронт-агенты.
 
