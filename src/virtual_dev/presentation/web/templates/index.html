@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Задачи — Virtual Dev{% endblock %}
+{% block content %}
+    <h1>Задачи</h1>
+    <p>
+        Scheduler:
+        {% if orchestrator_running %}
+            <span class="badge badge-ok">running</span>
+        {% else %}
+            <span class="badge badge-warn">stopped</span>
+        {% endif %}
+        · Jira:
+        {% if jira_configured %}
+            <span class="badge badge-ok">подключена</span>
+        {% else %}
+            <span class="badge badge-warn">не настроена</span>
+        {% endif %}
+    </p>
+
+    {% if not tasks %}
+        <div class="empty">
+            Задач пока нет.
+            {% if not jira_configured %}Пропиши токены Jira в <code>.env</code> и перезапусти.{% endif %}
+        </div>
+    {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Key</th>
+                    <th>Title</th>
+                    <th>Internal</th>
+                    <th>External</th>
+                    <th>Priority</th>
+                    <th>Repo</th>
+                    <th>Updated</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for t in tasks %}
+                    <tr>
+                        <td><a href="/tasks/{{ t.id }}">{{ t.external_id }}</a></td>
+                        <td>{{ t.title }}</td>
+                        <td><span class="status status-{{ t.internal_status }}">{{ t.internal_status }}</span></td>
+                        <td>{{ t.external_status }}</td>
+                        <td>{{ t.priority }}</td>
+                        <td>{{ t.target_repo_key or "—" }}</td>
+                        <td>{{ t.updated_at.strftime("%Y-%m-%d %H:%M") if t.updated_at else "—" }}</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+{% endblock %}

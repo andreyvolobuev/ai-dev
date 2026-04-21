@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>{% block title %}Virtual Dev{% endblock %}</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+               margin: 2rem; color: #222; }
+        h1 { margin-top: 0; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #e5e5e5;
+                 text-align: left; vertical-align: top; font-size: 0.9rem; }
+        th { background: #fafafa; }
+        .status { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 0.75rem;
+                  font-size: 0.75rem; background: #eee; }
+        .status-discovered { background: #e3f2fd; color: #1565c0; }
+        .status-coding     { background: #fff3e0; color: #e65100; }
+        .status-mr_open    { background: #e8f5e9; color: #2e7d32; }
+        .status-done       { background: #ede7f6; color: #4527a0; }
+        .status-failed     { background: #ffebee; color: #c62828; }
+        .badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 0.25rem;
+                 font-size: 0.8rem; background: #f0f0f0; }
+        .badge-ok { background: #e8f5e9; color: #2e7d32; }
+        .badge-warn { background: #fff3e0; color: #e65100; }
+        a { color: #1565c0; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        header nav a { margin-right: 1rem; }
+        .empty { padding: 2rem; text-align: center; color: #888; }
+    </style>
+</head>
+<body>
+    <header>
+        <nav>
+            <a href="/">Задачи</a>
+            <a href="/healthz">healthz</a>
+        </nav>
+    </header>
+    {% block content %}{% endblock %}
+</body>
+</html>

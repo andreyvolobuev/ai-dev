@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}{{ task.external_id }} — Virtual Dev{% endblock %}
+{% block content %}
+    <p><a href="/">← все задачи</a></p>
+    <h1>{{ task.external_id }}: {{ task.title }}</h1>
+    <p>
+        <span class="status status-{{ task.internal_status }}">{{ task.internal_status }}</span>
+        · external: <strong>{{ task.external_status or "—" }}</strong>
+        · priority: <strong>{{ task.priority }}</strong>
+        {% if task.url %}· <a href="{{ task.url }}">открыть в трекере</a>{% endif %}
+    </p>
+
+    <h3>Описание</h3>
+    <pre style="white-space: pre-wrap; background: #fafafa; padding: 1rem; border-radius: 4px;">{{ task.description or "—" }}</pre>
+
+    <h3>Метаданные</h3>
+    <table>
+        <tr><th>assignee</th><td>{{ task.assignee_id or "—" }}</td></tr>
+        <tr><th>reporter</th><td>{{ task.reporter_id or "—" }}</td></tr>
+        <tr><th>components</th><td>{{ task.components_json | join(", ") or "—" }}</td></tr>
+        <tr><th>labels</th><td>{{ task.labels_json | join(", ") or "—" }}</td></tr>
+        <tr><th>target repo</th><td>{{ task.target_repo_key or "—" }}</td></tr>
+        <tr><th>DoR</th><td>{{ "yes" if task.dor_satisfied else "no" }}</td></tr>
+        <tr><th>discovered</th><td>{{ task.discovered_at.strftime("%Y-%m-%d %H:%M") if task.discovered_at else "—" }}</td></tr>
+        <tr><th>updated</th><td>{{ task.updated_at.strftime("%Y-%m-%d %H:%M") if task.updated_at else "—" }}</td></tr>
+    </table>
+{% endblock %}

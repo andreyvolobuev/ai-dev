@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Virtual envs / uv
+.venv/
+venv/
+env/
+
+# Distribution
+build/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Project-local config / secrets
+.env
+.env.*
+!.env.example
+config/local.yaml
+
+# Runtime state
+data/
+var/
+logs/
+workspaces/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3

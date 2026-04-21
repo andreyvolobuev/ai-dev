@@ -1,0 +1,135 @@
+"""Pydantic schemas for YAML config files.
+
+Kept separate from :mod:`virtual_dev.infrastructure.config.settings` (env-based)
+because YAML describes *what we work on* (repos, agents, mappings) while env
+holds *how we connect to them* (URLs, tokens).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class _StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=False)
+
+
+# --- repositories.yaml ---
+
+
+class RepoAgentsCfg(_StrictModel):
+    backend: bool = False
+    frontend: bool = False
+    devops: bool = False
+
+
+class RepositoryCfg(_StrictModel):
+    key: str
+    url: str
+    description: str = ""
+    local_path: str | None = None
+    default_branch: str = "main"
+    jira_components: list[str] = Field(default_factory=list)
+    agents: RepoAgentsCfg = Field(default_factory=RepoAgentsCfg)
+    primary_language: str | None = None
+    frontend_stack: str | None = None
+    tests_cmd: str | None = None
+    lint_cmd: str | None = None
+    ci_provider: str = "gitlab_ci"
+
+
+class RepositoriesCfg(_StrictModel):
+    repositories: list[RepositoryCfg] = Field(default_factory=list)
+
+
+# --- agents.yaml ---
+
+
+class ModelsCfg(_StrictModel):
+    default: str = "claude-sonnet-4-5"
+    lightweight: str = "claude-haiku-4-5"
+
+
+class TaskSourceCfg(_StrictModel):
+    jql: str
+    poll_interval_seconds: int = 120
+
+
+class JiraTransitionsCfg(_StrictModel):
+    to_in_progress: str = "In Progress"
+    to_review: str = "Review"
+    to_testing: str = "Testing"
+    to_done: str = "Done"
+
+
+class WorkingHoursCfg(_StrictModel):
+    timezone: str = "Europe/Moscow"
+    start_hour: int = 10
+    end_hour: int = 20
+    weekdays_only: bool = True
+
+
+class AgentCfg(_StrictModel):
+    model: str = "default"                  # reference into ModelsCfg
+    max_tokens_per_turn: int = 4000
+    max_iterations_per_task: int | None = None
+    rate_limit_per_hour: int | None = None
+
+
+class ReviewPolicyCfg(_StrictModel):
+    required_approvals: int = 1
+    ping_reviewers_after_hours: int = 4
+    escalate_after_hours: int = 24
+
+
+class EscalationCfg(_StrictModel):
+    mattermost_user: str = ""
+
+
+class AgentsCfg(_StrictModel):
+    models: ModelsCfg = Field(default_factory=ModelsCfg)
+    task_source: TaskSourceCfg = Field(
+        default_factory=lambda: TaskSourceCfg(
+            jql='assignee = currentUser() AND labels = "ai-dev" AND status = "To Do"'
+        )
+    )
+    jira_transitions: JiraTransitionsCfg = Field(default_factory=JiraTransitionsCfg)
+    working_hours: WorkingHoursCfg = Field(default_factory=WorkingHoursCfg)
+    agents: dict[str, AgentCfg] = Field(default_factory=dict)
+    review_policy: ReviewPolicyCfg = Field(default_factory=ReviewPolicyCfg)
+    escalation: EscalationCfg = Field(default_factory=EscalationCfg)
+
+
+# --- mappings.yaml ---
+
+
+class MappingsCfg(_StrictModel):
+    email_to_mattermost: dict[str, str] = Field(default_factory=dict)
+    component_to_repo: dict[str, str] = Field(default_factory=dict)
+    team_channels: dict[str, str] = Field(default_factory=dict)
+    disclaimer_template: str = ""
+
+    @field_validator("email_to_mattermost", "component_to_repo", "team_channels", mode="before")
+    @classmethod
+    def _none_to_empty(cls, value: Any) -> Any:
+        # A YAML key with no children (`foo:`) parses to None; treat it as {}.
+        return {} if value is None else value
+
+
+# --- Aggregate ---
+
+
+class AppConfig(_StrictModel):
+    """All YAML config merged together."""
+
+    repositories: list[RepositoryCfg]
+    agents: AgentsCfg
+    mappings: MappingsCfg
+
+    def get_repository(self, key: str) -> RepositoryCfg | None:
+        for repo in self.repositories:
+            if repo.key == key:
+                return repo
+        return None
