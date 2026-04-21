@@ -154,8 +154,8 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
 
 - ✅ **Фаза 0** — скелет, Jira polling, task list в дашборде.
 - ✅ **Фаза 1** — Analyst + Researcher + Communicator (read-only). Планы через Claude Agent SDK, Jira-комменты, injection-фильтр, durable message bus.
-- ✅ **Фаза 2** — первый Dev-агент (bellingshausen backend) на отобранных "чистых" тикетах. GitLab VCS, workspace isolation, bot identity на коммитах, draft MR, human gate перед стартом.
-  - RAG по истории MR (в Researcher) — отложено на Phase 2.5. Индексация прошлых MR + embeddings + tool `search_mr_history`. Подключаем, если Dev в базовом цикле начнёт страдать от "без памяти".
+- ✅ **Фаза 2** — первый Dev-агент (bellingshausen backend) на отобранных "чистых" тикетах. GitLab VCS, workspace isolation, bot identity на коммитах, draft MR.
+- ✅ **Фаза 2.5** — RAG по истории MR. `EmbedderPort`+`FastembedEmbedder` (ONNX без torch) + `MrHistoryPort`+`LocalMrHistory` (SQLite blob + numpy cosine). Модель: `paraphrase-multilingual-MiniLM-L12-v2` (384 dim, ~220MB). Новая таблица `mr_history`, новый тул Researcher'а `search_mr_history` доступен Analyst'у и Dev'у. CLI: `virtual-dev index-mrs --repo <key>`.
 - **Фаза 3** — Reviewer + DevOps + запись в Mattermost через Communicator. Полный цикл: бот пингует ревьюеров, реагирует на комменты, собирает апрувы, просит смержить.
 - **Фаза 4** — обкатка на реальных задачах всей команды.
 - **Фаза 5** — автопилот, все репо, фронт-агенты.
