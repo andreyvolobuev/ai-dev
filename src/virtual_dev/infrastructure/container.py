@@ -8,13 +8,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from virtual_dev.adapters.message_bus import InMemoryMessageBus
+from virtual_dev.adapters.chat import MattermostChat
+from virtual_dev.adapters.code_agent import ClaudeAgentSdkCodeAgent
+from virtual_dev.adapters.knowledge_base import ConfluenceKb
+from virtual_dev.adapters.llm import ClaudeAgentSdkLlm
+from virtual_dev.adapters.message_bus import SqliteMessageBus
 from virtual_dev.adapters.secrets import EnvSecrets
 from virtual_dev.adapters.task_tracker import JiraTaskTracker
+from virtual_dev.application.services import (
+    CommunicatorService,
+    InjectionFilter,
+    ResearcherToolkit,
+)
+from virtual_dev.domain.ports.chat import ChatPort
+from virtual_dev.domain.ports.code_agent import CodeAgentPort
+from virtual_dev.domain.ports.knowledge_base import KnowledgeBasePort
+from virtual_dev.domain.ports.llm import LlmPort
 from virtual_dev.domain.ports.message_bus import MessageBusPort
 from virtual_dev.domain.ports.secrets import SecretsPort
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
@@ -26,9 +40,10 @@ from virtual_dev.infrastructure.db import Base, make_engine, make_session_factor
 class Container:
     """Bag of wired-up singletons.
 
-    ``task_tracker`` is optional because in Phase 0 we allow the dashboard and
-    ``db init`` to run without any third-party credentials. The orchestrator
-    logs a warning and no-ops when it's ``None``.
+    Third-party adapters (``task_tracker``, ``chat``, ``knowledge_base``) are
+    optional: we degrade gracefully when their credentials are absent so the
+    dashboard and ``db init`` can run on a fresh clone. The orchestrator and
+    analyst log a warning and no-op when a dependency is missing.
     """
 
     settings: Settings
@@ -38,6 +53,13 @@ class Container:
     secrets: SecretsPort
     message_bus: MessageBusPort
     task_tracker: TaskTrackerPort | None
+    chat: ChatPort | None
+    knowledge_base: KnowledgeBasePort | None
+    code_agent: CodeAgentPort
+    llm: LlmPort
+    injection_filter: InjectionFilter
+    researcher: ResearcherToolkit
+    communicator: CommunicatorService
 
     async def init_db(self) -> None:
         """Create all tables. Used by ``virtual-dev db init``."""
@@ -48,13 +70,26 @@ class Container:
     async def dispose(self) -> None:
         await self.engine.dispose()
 
+    # Host-only forms (for the link extractor).
+    @property
+    def confluence_host(self) -> str | None:
+        return _host(self.settings.confluence_url)
+
+    @property
+    def mattermost_host(self) -> str | None:
+        return _host(self.settings.mattermost_url)
+
+    @property
+    def gitlab_host(self) -> str | None:
+        return _host(self.settings.gitlab_url)
+
 
 def build_container(config_dir: Path | str = "config") -> Container:
     """Assemble a :class:`Container` from YAML configs + env.
 
-    Adapters whose env credentials are missing are skipped. In Phase 0 this
-    means the dashboard and ``db init`` work on a fresh clone without any
-    tokens set; the orchestrator simply has nothing to poll.
+    Adapters whose env credentials are missing are skipped. The core stack
+    (DB, message bus, code agent, injection filter, researcher, communicator)
+    is always built so agents can run offline in test/dev loops.
     """
     settings = Settings()
     config = load_config(config_dir)
@@ -63,7 +98,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
     session_factory = make_session_factory(engine)
 
     secrets = EnvSecrets()
-    message_bus = InMemoryMessageBus()
+    message_bus: MessageBusPort = SqliteMessageBus(session_factory)
 
     task_tracker: TaskTrackerPort | None = None
     if settings.jira_url and settings.jira_user and settings.jira_token:
@@ -77,6 +112,40 @@ def build_container(config_dir: Path | str = "config") -> Container:
             "Jira credentials are incomplete (URL/user/token) — task tracker disabled"
         )
 
+    chat: ChatPort | None = None
+    if settings.mattermost_url and settings.mattermost_token:
+        chat = MattermostChat(
+            url=settings.mattermost_url,
+            token=settings.mattermost_token,
+            bot_username=settings.mattermost_bot_username or None,
+        )
+    else:
+        logger.warning("Mattermost credentials missing — chat disabled")
+
+    knowledge_base: KnowledgeBasePort | None = None
+    if settings.confluence_url and settings.confluence_user and settings.confluence_token:
+        knowledge_base = ConfluenceKb(
+            url=settings.confluence_url,
+            user=settings.confluence_user,
+            token=settings.confluence_token,
+        )
+    else:
+        logger.warning("Confluence credentials missing — KB disabled")
+
+    code_agent: CodeAgentPort = ClaudeAgentSdkCodeAgent(
+        default_model=config.agents.models.default,
+    )
+    llm: LlmPort = ClaudeAgentSdkLlm()
+
+    injection_filter = InjectionFilter()
+    researcher = ResearcherToolkit(
+        config=config,
+        workspaces_dir=settings.workspaces_dir,
+        knowledge_base=knowledge_base,
+        injection_filter=injection_filter,
+    )
+    communicator = CommunicatorService(chat, injection_filter)
+
     return Container(
         settings=settings,
         config=config,
@@ -85,4 +154,17 @@ def build_container(config_dir: Path | str = "config") -> Container:
         secrets=secrets,
         message_bus=message_bus,
         task_tracker=task_tracker,
+        chat=chat,
+        knowledge_base=knowledge_base,
+        code_agent=code_agent,
+        llm=llm,
+        injection_filter=injection_filter,
+        researcher=researcher,
+        communicator=communicator,
     )
+
+
+def _host(url: str) -> str | None:
+    if not url:
+        return None
+    return urlparse(url).hostname

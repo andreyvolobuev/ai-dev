@@ -64,7 +64,12 @@ def run(
 
 @app.command("poll-once")
 def poll_once() -> None:
-    """Run one orchestrator iteration and exit. Useful for smoke-testing Jira creds."""
+    """Run one orchestrator iteration and exit.
+
+    Useful for smoke-testing Jira creds. Any newly created tasks are also
+    dispatched onto the message bus (task.discovered) so downstream agents
+    can pick them up on the next ``virtual-dev run``.
+    """
     _bootstrap()
     container = build_container()
 
@@ -74,6 +79,7 @@ def poll_once() -> None:
         task_tracker=container.task_tracker,
         session_factory=container.session_factory,
         config=container.config,
+        message_bus=container.message_bus,
     )
 
     async def _run() -> None:
@@ -81,10 +87,64 @@ def poll_once() -> None:
         await container.dispose()
         console.print(
             f"[green]OK[/green]  fetched={stats.fetched}  "
-            f"created={stats.created}  updated={stats.updated}"
+            f"created={stats.created}  updated={stats.updated}  "
+            f"dispatched={stats.dispatched}"
         )
 
     asyncio.run(_run())
+
+
+@app.command("plan-task")
+def plan_task(
+    external_id: str = typer.Argument(..., help="Tracker task id, e.g. DM-1234"),
+    tracker: str = typer.Option("jira", help="Tracker name"),
+    post_to_tracker: bool = typer.Option(
+        False, "--post/--no-post", help="If True, post the plan as a Jira comment."
+    ),
+) -> None:
+    """Run the Analyst on one ticket and exit.
+
+    Requires a Claude Code (Max) login for the `claude` CLI subprocess.
+    By default it does NOT touch Jira — pass ``--post`` to comment the plan.
+    """
+    _bootstrap()
+    container = build_container()
+
+    from virtual_dev.application.agents import AnalystAgent
+    from virtual_dev.runtime.workers import AnalystInbox
+
+    analyst = AnalystAgent(
+        code_agent=container.code_agent,
+        researcher=container.researcher,
+        communicator=container.communicator,
+        session_factory=container.session_factory,
+        config=container.config,
+        settings=container.settings,
+        confluence_host=container.confluence_host,
+        mattermost_host=container.mattermost_host,
+        gitlab_host=container.gitlab_host,
+    )
+    inbox = AnalystInbox(
+        analyst=analyst,
+        task_tracker=container.task_tracker if post_to_tracker else None,
+        agents_config=container.config.agents,
+        post_to_tracker=post_to_tracker,
+    )
+
+    async def _run() -> None:
+        from virtual_dev.domain.ports.message_bus import AgentMessage
+
+        await inbox.handle(AgentMessage(
+            id="cli",
+            from_agent="cli",
+            to_agent="analyst",
+            topic="task.discovered",
+            payload={"tracker": tracker, "external_id": external_id},
+        ))
+        await container.dispose()
+
+    asyncio.run(_run())
+    console.print(f"[green]Analyst done for {tracker}:{external_id}[/green]")
 
 
 if __name__ == "__main__":

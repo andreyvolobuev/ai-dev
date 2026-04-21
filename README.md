@@ -40,7 +40,7 @@ presentation  →  application (agents, workflows)  →  domain (models, ports)
 
 ## Быстрый старт
 
-Требования: Python 3.13+ (3.14 тоже работает), [uv](https://github.com/astral-sh/uv).
+Требования: Python 3.13+ (3.14 тоже работает), [uv](https://github.com/astral-sh/uv) и установленный Claude Code (`claude` CLI), в который ты уже залогинен через Claude Max. API-ключ Anthropic **не нужен** — бот работает через твою подписку.
 
 ```bash
 # Установка uv (если ещё нет)
@@ -51,13 +51,16 @@ uv sync
 
 # Конфиг
 cp .env.example .env
-# → вписать туда токены Jira/GitLab/Mattermost/Confluence/Anthropic
+# → вписать туда токены Jira/GitLab/Mattermost/Confluence
 
 cp config/local.example.yaml config/local.yaml
 # → проверить пути к репозиториям, JQL, рабочие часы
 
 # Инициализация БД
 uv run virtual-dev db init
+
+# Прогнать Analyst на одном тикете (ничего не пишет в Jira)
+uv run virtual-dev plan-task DM-1234
 
 # Запуск дашборда + воркеров
 uv run virtual-dev run

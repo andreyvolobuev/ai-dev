@@ -24,4 +24,54 @@
         <tr><th>discovered</th><td>{{ task.discovered_at.strftime("%Y-%m-%d %H:%M") if task.discovered_at else "—" }}</td></tr>
         <tr><th>updated</th><td>{{ task.updated_at.strftime("%Y-%m-%d %H:%M") if task.updated_at else "—" }}</td></tr>
     </table>
+
+    <h3>Планы</h3>
+    {% if not plans %}
+        <p><em>План ещё не построен.</em></p>
+    {% else %}
+        {% for plan in plans %}
+            <section style="border:1px solid #e5e5e5; border-radius:4px; padding:1rem; margin-bottom:1rem;">
+                <p>
+                    <span class="status status-{{ plan.status.value }}">{{ plan.status.value }}</span>
+                    · confidence: <strong>{{ "%.2f"|format(plan.confidence) }}</strong>
+                    · target repo: <strong>{{ plan.target_repo_key or "—" }}</strong>
+                    · {{ plan.created_at.strftime("%Y-%m-%d %H:%M") if plan.created_at else "—" }}
+                    · cost ${{ "%.4f"|format(plan.cost_usd) }}
+                    · turns {{ plan.iterations }}
+                </p>
+                <h4>Summary</h4>
+                <pre style="white-space: pre-wrap; background:#fafafa; padding:0.75rem; border-radius:4px;">{{ plan.summary }}</pre>
+                {% if plan.steps %}
+                    <h4>Steps</h4>
+                    <ol>
+                        {% for step in plan.steps %}
+                            <li>
+                                <strong>{{ step.summary }}</strong>
+                                {% if step.details %}<br><small>{{ step.details }}</small>{% endif %}
+                                {% if step.files_touched %}
+                                    <br><small>files: {{ step.files_touched | join(", ") }}</small>
+                                {% endif %}
+                            </li>
+                        {% endfor %}
+                    </ol>
+                {% endif %}
+                {% if plan.open_questions %}
+                    <h4>Open questions</h4>
+                    <ul>
+                        {% for q in plan.open_questions %}
+                            <li>
+                                <strong>{{ q.question }}</strong>
+                                {% if q.ask_whom %}<br><small>ask: {{ q.ask_whom }}</small>{% endif %}
+                                {% if q.why_it_matters %}<br><small>{{ q.why_it_matters }}</small>{% endif %}
+                            </li>
+                        {% endfor %}
+                    </ul>
+                {% endif %}
+                {% if plan.risks %}
+                    <h4>Risks</h4>
+                    <ul>{% for r in plan.risks %}<li>{{ r }}</li>{% endfor %}</ul>
+                {% endif %}
+            </section>
+        {% endfor %}
+    {% endif %}
 {% endblock %}

@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Планы — Virtual Dev{% endblock %}
+{% block content %}
+    <h1>Планы</h1>
+    {% if not plans %}
+        <div class="empty">Планов пока нет.</div>
+    {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Ticket</th>
+                    <th>Status</th>
+                    <th>Summary</th>
+                    <th>Confidence</th>
+                    <th>Repo</th>
+                    <th>Cost</th>
+                    <th>Turns</th>
+                    <th>When</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for p in plans %}
+                    <tr>
+                        <td>
+                            {% set task_id = task_lookup.get((p.tracker, p.task_external_id)) %}
+                            {% if task_id %}<a href="/tasks/{{ task_id }}">{{ p.task_external_id }}</a>
+                            {% else %}{{ p.task_external_id }}{% endif %}
+                        </td>
+                        <td><span class="status status-{{ p.status }}">{{ p.status }}</span></td>
+                        <td>{{ p.summary | truncate(140) }}</td>
+                        <td>{{ "%.2f"|format(p.confidence) }}</td>
+                        <td>{{ p.target_repo_key or "—" }}</td>
+                        <td>${{ "%.4f"|format(p.cost_usd) }}</td>
+                        <td>{{ p.iterations }}</td>
+                        <td>{{ p.created_at.strftime("%Y-%m-%d %H:%M") if p.created_at else "—" }}</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+{% endblock %}
