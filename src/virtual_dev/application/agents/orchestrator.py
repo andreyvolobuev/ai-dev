@@ -25,7 +25,13 @@ from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import task_to_row, update_row_from_task
 
 TOPIC_TASK_DISCOVERED = "task.discovered"
+TOPIC_PLAN_READY = "plan.ready"
 AGENT_ANALYST = "analyst"
+
+
+def dev_agent_key(repo_key: str, specialisation: str = "backend") -> str:
+    """Conventional agent-key used on the bus for Dev-agent routing."""
+    return f"dev-{repo_key}-{specialisation}"
 
 
 @dataclass
