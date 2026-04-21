@@ -25,6 +25,34 @@
         <tr><th>updated</th><td>{{ task.updated_at.strftime("%Y-%m-%d %H:%M") if task.updated_at else "—" }}</td></tr>
     </table>
 
+    <h3>MR</h3>
+    {% if not mrs %}
+        <p><em>MR пока нет.</em></p>
+    {% else %}
+        <ul>
+            {% for mr in mrs %}
+                <li>
+                    <a href="{{ mr.web_url }}">!{{ mr.iid }}</a>
+                    <span class="status status-{{ mr.status }}">{{ mr.status }}</span>
+                    — branch <code>{{ mr.source_branch }}</code>
+                    (pipeline: {{ mr.pipeline_status }})
+                </li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+
+    <h3>Отправка на кодинг</h3>
+    {% if task.dor_satisfied %}
+        <p><span class="badge badge-ok">DoR satisfied</span> — задача уже отправлена в Dev-агента.</p>
+    {% else %}
+        <form method="post" action="/tasks/{{ task.id }}/send-to-coding" style="display:inline">
+            <button type="submit" style="padding:0.6rem 1.2rem; background:#1565c0; color:white; border:none; border-radius:4px; cursor:pointer; font-size:0.95rem;">
+                ▶ Отправить в Dev-агента
+            </button>
+        </form>
+        <p><small>Проставит <code>dor_satisfied=true</code> и опубликует <code>plan.ready</code> на шину.</small></p>
+    {% endif %}
+
     <h3>Планы</h3>
     {% if not plans %}
         <p><em>План ещё не построен.</em></p>

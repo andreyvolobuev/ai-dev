@@ -127,16 +127,35 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
 - `MessageBusPort` — теперь durable SQLite, не in-memory (все агенты через шину — архитектурное требование).
 - Rule-файлы `config/rules/<agent>.md` — пока лежат как есть, но в system prompt агентов пока не подкладываются. Это делается в Phase 2 (для Dev-агента — обязательно).
 
+### Фаза 2 — СДЕЛАНО ✅
+- **VcsPort расширен** методами `current_branch`, `has_uncommitted_changes` (safety-хуки).
+- **`GitLabVcs` адаптер** (`adapters/vcs/gitlab.py`): локальные git-операции через `subprocess`, удалённые — через `python-gitlab`. Commits с bot identity через per-call `-c user.name/email` (никаких глобальных мутаций git config). Workspace: `{workspaces_dir}/{repo_key}/` — отдельный клон, не трогает твой `local_path`. `fetch_and_checkout` делает hard reset на `origin/<branch>` (защита от стрея от прошлых запусков).
+- **Bot identity** в `.env`: `DEV_GIT_AUTHOR_NAME="Virtual Dev"`, `DEV_GIT_AUTHOR_EMAIL`, `DEV_BRANCH_PREFIX="ai-dev"`, `DEV_MR_DRAFT=true`.
+- **`RulesLoader`** (`application/services/rules.py`): читает `config/rules/<agent_key>.md`, если нет — возвращает `""`. Splice'ится в system prompt Dev-агента.
+- **`DevAgent`** (`application/agents/dev.py`): подписан на `plan.ready` для конкретного `(repo, specialisation)` ключа. Pre-check: задача есть + READY план + `dor_satisfied` + `target_repo_key` совпадает. Готовит workspace (ensure_clone + create_branch). Запускает Claude Agent SDK в `cwd=workspace` с полным набором Read/Glob/Grep/Edit/Write/Bash + приватный MCP `submit_mr`. После submit: commit → push → create_merge_request (draft по дефолту). 4 исхода: `SKIPPED`, `NO_CHANGES`, `MR_OPENED`, `FAILED`. Каждый с переходом `TaskStatus` и записью в `MergeRequestRow`.
+- **AnalystInbox** теперь публикует `plan.ready` на шину для Dev-агента, если `plan.status == READY` и `target_repo_key` определён. Адресуется ключу `dev-<repo>-<specialisation>` (по умолчанию `backend`).
+- **`DevInbox`** (`runtime/workers/dev_inbox.py`): handler `plan.ready` per-Dev-agent. На `MR_OPENED`: Jira transition `In Progress → Review` + коммент с ссылкой на MR. На `FAILED`/`NO_CHANGES`: коммент с notes. На `SKIPPED`: тихо (info log).
+- **Human gate**: `POST /tasks/{id}/send-to-coding` — кнопка в дашборде ставит `dor_satisfied=True` и публикует `plan.ready`. Без неё Dev не стартует, даже если план READY.
+- **Dashboard**: секция MR на `/tasks/{id}`, список `/mrs`, в healthz — статусы всех Dev-раннеров.
+- **CLI**: `virtual-dev dev-task DM-1234 --repo bellingshausen [--post]` — прогнать Dev-агента локально.
+- **Тесты**: 65 unit. Новое: 6 GitLabVcs-локальных (на реальном tmp git-репо c `receive.denyCurrentBranch=updateInstead`), 9 DevAgent (все outcome'ы + rules injection + branch naming), 6 на handoff Analyst→Dev. `claude-agent-sdk` в тестах не запускается — фейковый CodeAgentPort.
+- **Docs**: `docs/ARCHITECTURE.md` обновлён (data flow Phase 2, safety rails с human gate, workspace isolation, bot identity).
+
+### Решения в Phase 2, которых не было в CONTEXT.md — утвердили с пользователем
+- DevAgent работает в `{workspaces_dir}/{repo_key}/` (отдельный клон), НЕ в пользовательском `local_path`. Твой `local_path` — это reference-checkout для Analyst/Researcher (read-only).
+- Коммиты: автор `Virtual Dev <virtual-dev@datamining.2gis.ru>`, push под твоим GitLab token.
+- Ветки: `ai-dev/<external_id>-<slug>`.
+- Task gate: `plan.status=READY` + `task.dor_satisfied=True` + `target_repo_key` — все три.
+- Тесты не зелёные → max_turns → FAILED, MR не открываем.
+- MR открывается как draft (`DEV_MR_DRAFT=true`).
+- RAG по истории MR — отложено на Phase 2.5 (не блокирует базовый цикл).
+
 ## Фазы
 
 - ✅ **Фаза 0** — скелет, Jira polling, task list в дашборде.
 - ✅ **Фаза 1** — Analyst + Researcher + Communicator (read-only). Планы через Claude Agent SDK, Jira-комменты, injection-фильтр, durable message bus.
-- ⏳ **Фаза 2** (следующая) — первый Dev-агент (bellingshausen backend) на отобранных "чистых" тикетах с полным DoD. Код + MR, но без ревью-цикла. Включает:
-  - `VcsPort` реализация для GitLab (clone/branch/commit/push + API для create/list MR).
-  - `DevAgent` подписан на `plan.ready`, запускает `claude-agent-sdk` с полным набором Read/Edit/Write/Bash/Glob/Grep в cwd репо, submit_mr-тул в конце.
-  - Analyst публикует `plan.ready` когда план READY.
-  - Rules-файлы `config/rules/<agent>.md` подкладываются в system prompt Dev-агента.
-  - RAG по истории MR (в Researcher) — индексация прошлых MR + embeddings + tool `search_mr_history`; если в базовом цикле хватит grep'а — делаем после того как базовый цикл прозеленится.
+- ✅ **Фаза 2** — первый Dev-агент (bellingshausen backend) на отобранных "чистых" тикетах. GitLab VCS, workspace isolation, bot identity на коммитах, draft MR, human gate перед стартом.
+  - RAG по истории MR (в Researcher) — отложено на Phase 2.5. Индексация прошлых MR + embeddings + tool `search_mr_history`. Подключаем, если Dev в базовом цикле начнёт страдать от "без памяти".
 - **Фаза 3** — Reviewer + DevOps + запись в Mattermost через Communicator. Полный цикл: бот пингует ревьюеров, реагирует на комменты, собирает апрувы, просит смержить.
 - **Фаза 4** — обкатка на реальных задачах всей команды.
 - **Фаза 5** — автопилот, все репо, фронт-агенты.

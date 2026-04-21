@@ -94,6 +94,75 @@ def poll_once() -> None:
     asyncio.run(_run())
 
 
+@app.command("dev-task")
+def dev_task(
+    external_id: str = typer.Argument(..., help="Tracker task id, e.g. DM-1234"),
+    tracker: str = typer.Option("jira", help="Tracker name"),
+    repo: str = typer.Option(
+        ..., "--repo", help="Target repo key (must be in repositories.yaml)"
+    ),
+    specialisation: str = typer.Option("backend", "--spec", help="backend|frontend|devops"),
+    post_to_tracker: bool = typer.Option(
+        False, "--post/--no-post",
+        help="If True, transition Jira + comment MR / failure.",
+    ),
+) -> None:
+    """Run the Dev-agent on one ticket locally and exit.
+
+    Requires VCS (GitLab token) configured. The task's latest READY plan
+    is used; task.dor_satisfied must be True (set via dashboard or
+    ``UPDATE tasks SET dor_satisfied = 1 ...``).
+    """
+    _bootstrap()
+    container = build_container()
+
+    if container.vcs is None:
+        console.print("[red]VCS (GitLab) is not configured — cannot run Dev agent[/red]")
+        raise typer.Exit(code=1)
+
+    from virtual_dev.application.agents import DevAgent
+    from virtual_dev.application.agents.orchestrator import dev_agent_key
+    from virtual_dev.runtime.workers import DevInbox
+
+    dev = DevAgent(
+        agent_key=dev_agent_key(repo, specialisation),
+        repo_key=repo,
+        specialisation=specialisation,
+        vcs=container.vcs,
+        code_agent=container.code_agent,
+        rules_loader=container.rules_loader,
+        session_factory=container.session_factory,
+        config=container.config,
+        settings=container.settings,
+    )
+    inbox = DevInbox(
+        dev_agent=dev,
+        task_tracker=container.task_tracker if post_to_tracker else None,
+        agents_config=container.config.agents,
+        post_to_tracker=post_to_tracker,
+    )
+
+    async def _run() -> None:
+        from virtual_dev.domain.ports.message_bus import AgentMessage
+        from virtual_dev.application.agents.orchestrator import TOPIC_PLAN_READY
+
+        await inbox.handle(AgentMessage(
+            id="cli",
+            from_agent="cli",
+            to_agent=dev.agent_key,
+            topic=TOPIC_PLAN_READY,
+            payload={
+                "tracker": tracker,
+                "external_id": external_id,
+                "repo_key": repo,
+            },
+        ))
+        await container.dispose()
+
+    asyncio.run(_run())
+    console.print(f"[green]Dev-agent done for {tracker}:{external_id}[/green]")
+
+
 @app.command("plan-task")
 def plan_task(
     external_id: str = typer.Argument(..., help="Tracker task id, e.g. DM-1234"),

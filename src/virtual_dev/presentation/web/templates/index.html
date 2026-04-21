@@ -9,6 +9,11 @@
         · Analyst:
         {% if analyst_running %}<span class="badge badge-ok">running</span>
         {% else %}<span class="badge badge-warn">stopped</span>{% endif %}
+        {% for dr in dev_runners %}
+            · {{ dr.key }}:
+            {% if dr.running %}<span class="badge badge-ok">running</span>
+            {% else %}<span class="badge badge-warn">stopped</span>{% endif %}
+        {% endfor %}
         · Jira:
         {% if jira_configured %}<span class="badge badge-ok">on</span>
         {% else %}<span class="badge badge-warn">off</span>{% endif %}
@@ -17,6 +22,9 @@
         {% else %}<span class="badge badge-warn">off</span>{% endif %}
         · KB:
         {% if kb_configured %}<span class="badge badge-ok">on</span>
+        {% else %}<span class="badge badge-warn">off</span>{% endif %}
+        · VCS:
+        {% if vcs_configured %}<span class="badge badge-ok">on</span>
         {% else %}<span class="badge badge-warn">off</span>{% endif %}
     </p>
 

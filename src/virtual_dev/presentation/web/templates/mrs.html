@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}MR — Virtual Dev{% endblock %}
+{% block content %}
+    <h1>Merge Requests</h1>
+    {% if not mrs %}
+        <div class="empty">MR пока нет.</div>
+    {% else %}
+        <table>
+            <thead>
+                <tr>
+                    <th>Ticket</th>
+                    <th>Repo</th>
+                    <th>!iid</th>
+                    <th>Title</th>
+                    <th>Branch</th>
+                    <th>Status</th>
+                    <th>Pipeline</th>
+                    <th>When</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for mr in mrs %}
+                    <tr>
+                        <td>
+                            {% set tid = task_lookup.get(mr.task_external_id) %}
+                            {% if tid %}<a href="/tasks/{{ tid }}">{{ mr.task_external_id or "—" }}</a>
+                            {% else %}{{ mr.task_external_id or "—" }}{% endif %}
+                        </td>
+                        <td>{{ mr.repo_key }}</td>
+                        <td><a href="{{ mr.web_url }}">!{{ mr.iid }}</a></td>
+                        <td>{{ mr.title | truncate(80) }}</td>
+                        <td><code>{{ mr.source_branch }}</code></td>
+                        <td><span class="status status-{{ mr.status }}">{{ mr.status }}</span></td>
+                        <td>{{ mr.pipeline_status }}</td>
+                        <td>{{ mr.created_at.strftime("%Y-%m-%d %H:%M") if mr.created_at else "—" }}</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% endif %}
+{% endblock %}

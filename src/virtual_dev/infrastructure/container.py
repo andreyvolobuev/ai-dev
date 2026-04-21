@@ -20,10 +20,12 @@ from virtual_dev.adapters.llm import ClaudeAgentSdkLlm
 from virtual_dev.adapters.message_bus import SqliteMessageBus
 from virtual_dev.adapters.secrets import EnvSecrets
 from virtual_dev.adapters.task_tracker import JiraTaskTracker
+from virtual_dev.adapters.vcs import GitIdentity, GitLabVcs
 from virtual_dev.application.services import (
     CommunicatorService,
     InjectionFilter,
     ResearcherToolkit,
+    RulesLoader,
 )
 from virtual_dev.domain.ports.chat import ChatPort
 from virtual_dev.domain.ports.code_agent import CodeAgentPort
@@ -32,6 +34,7 @@ from virtual_dev.domain.ports.llm import LlmPort
 from virtual_dev.domain.ports.message_bus import MessageBusPort
 from virtual_dev.domain.ports.secrets import SecretsPort
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
+from virtual_dev.domain.ports.vcs import VcsPort
 from virtual_dev.infrastructure.config import AppConfig, Settings, load_config
 from virtual_dev.infrastructure.db import Base, make_engine, make_session_factory
 
@@ -55,11 +58,13 @@ class Container:
     task_tracker: TaskTrackerPort | None
     chat: ChatPort | None
     knowledge_base: KnowledgeBasePort | None
+    vcs: VcsPort | None
     code_agent: CodeAgentPort
     llm: LlmPort
     injection_filter: InjectionFilter
     researcher: ResearcherToolkit
     communicator: CommunicatorService
+    rules_loader: RulesLoader
 
     async def init_db(self) -> None:
         """Create all tables. Used by ``virtual-dev db init``."""
@@ -132,6 +137,23 @@ def build_container(config_dir: Path | str = "config") -> Container:
     else:
         logger.warning("Confluence credentials missing — KB disabled")
 
+    vcs: VcsPort | None = None
+    if settings.gitlab_url and settings.gitlab_token:
+        vcs = GitLabVcs(
+            config=config,
+            gitlab_url=settings.gitlab_url,
+            gitlab_token=settings.gitlab_token,
+            workspaces_dir=settings.workspaces_dir,
+            identity=GitIdentity(
+                name=settings.dev_git_author_name,
+                email=settings.dev_git_author_email,
+            ),
+        )
+    else:
+        logger.warning(
+            "GitLab credentials missing — VCS disabled; Dev-agent will not run"
+        )
+
     code_agent: CodeAgentPort = ClaudeAgentSdkCodeAgent(
         default_model=config.agents.models.default,
     )
@@ -145,6 +167,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         injection_filter=injection_filter,
     )
     communicator = CommunicatorService(chat, injection_filter)
+    rules_loader = RulesLoader(Path(config_dir) / "rules")
 
     return Container(
         settings=settings,
@@ -156,11 +179,13 @@ def build_container(config_dir: Path | str = "config") -> Container:
         task_tracker=task_tracker,
         chat=chat,
         knowledge_base=knowledge_base,
+        vcs=vcs,
         code_agent=code_agent,
         llm=llm,
         injection_filter=injection_filter,
         researcher=researcher,
         communicator=communicator,
+        rules_loader=rules_loader,
     )
 
 

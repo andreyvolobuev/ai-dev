@@ -31,21 +31,23 @@ Virtual Dev is structured as a **hexagonal (ports-and-adapters) application** wi
 
 ### `application/`
 - `agents/orchestrator.py` — polls the tracker, upserts tasks, publishes `task.discovered`.
-- `agents/analyst.py` — consumes `task.discovered`, gathers context, plans.
+- `agents/analyst.py` — consumes `task.discovered`, gathers context, plans; on a READY plan publishes `plan.ready` addressed to the target Dev-agent.
+- `agents/dev.py` — consumes `plan.ready`, implements the plan in a dedicated workspace via Claude Code tools, commits + pushes a branch, opens a draft MR. Gated on `task.dor_satisfied`. Four terminal outcomes: `SKIPPED` / `NO_CHANGES` / `MR_OPENED` / `FAILED`.
 - `services/injection_filter.py` — wraps untrusted content in `<untrusted_content>`.
 - `services/link_extractor.py` — buckets URLs in free-form text.
-- `services/communicator.py` — Phase-1 read-only surface over `ChatPort`.
+- `services/communicator.py` — Phase-1-2 read-only surface over `ChatPort`.
 - `services/researcher.py` — exposes code grep / KB search as in-process MCP tools for the Analyst.
+- `services/rules.py` — loads `config/rules/<agent_key>.md` for the Dev-agent's system prompt.
 
 ### `adapters/`
 - `task_tracker/jira.py` — Jira (self-hosted) via `atlassian-python-api`.
-- `chat/mattermost.py` — Mattermost (self-hosted), **read-only** in Phase 1 (`send_*` raises).
+- `chat/mattermost.py` — Mattermost (self-hosted), **read-only** in Phase 1-2 (`send_*` raises).
 - `knowledge_base/confluence.py` — Confluence (self-hosted).
 - `code_agent/claude_sdk.py` — `CodeAgentPort` via `claude-agent-sdk` (reuses the logged-in Claude Max CLI, no API key).
 - `llm/claude_sdk.py` — single-shot `LlmPort` via the same SDK with tools disabled.
+- `vcs/gitlab.py` — `VcsPort` via `python-gitlab` for remote API + plain `git` subprocess for local operations. Commits are stamped with a bot `GitIdentity` via per-call `-c user.name=/user.email=` (never touches global git config). Workspaces live under `{workspaces_dir}/{repo_key}/`, separate from any `local_path` reference checkout the user may have.
 - `message_bus/sqlite.py` — durable SQLite-backed bus (production default). `message_bus/memory.py` — in-memory fallback for tests.
 - `secrets/env.py` — reads from the process env.
-- Stubs for `vcs/` — filled out in Phase 2.
 
 ### `infrastructure/`
 - `config/settings.py` — pydantic-settings, reads `.env`.
@@ -58,25 +60,26 @@ Virtual Dev is structured as a **hexagonal (ports-and-adapters) application** wi
 - `logging/` — loguru setup.
 
 ### `presentation/`
-- `web/app.py` — FastAPI app with `/` (task list), `/tasks/{id}` (detail), `/kill`, `/healthz`.
+- `web/app.py` — FastAPI app with `/` (task list), `/tasks/{id}` (detail with plans + MRs), `/plans`, `/mrs`, `/kill`, `/healthz`, and the `POST /tasks/{id}/send-to-coding` human gate that flips `dor_satisfied=True` and republishes `plan.ready`.
 - `web/templates/` — Jinja2 templates.
-- `cli/main.py` — typer commands: `db init`, `run`, `poll-once`.
+- `cli/main.py` — typer commands: `db init`, `run`, `poll-once`, `plan-task`, `dev-task`.
 
 ### `runtime/`
-Scheduler lives inside the FastAPI `lifespan` hook in Phase 1 — same event loop as the web server. Two tasks run in the background: the orchestrator poll loop and the Analyst agent runner (subscribed to the bus). A separate worker process will appear in Phase 2 when Dev-agents need long-running shell sessions.
+Scheduler lives inside the FastAPI `lifespan` hook. Tasks run in the background in the same event loop as the web server: the orchestrator poll loop, the Analyst agent runner, and one Dev-agent runner per (repo, specialisation) with `backend=True` in `repositories.yaml`. A separate worker process may appear later if long-running shell sessions become a problem.
 
 - `runtime/workers/agent_runner.py` — generic subscribe-and-dispatch loop for one agent key.
-- `runtime/workers/analyst_inbox.py` — `task.discovered` handler that runs AnalystAgent, then (optionally) transitions the Jira ticket to *In Progress* and comments the plan.
+- `runtime/workers/analyst_inbox.py` — `task.discovered` handler. Transitions the Jira ticket to *In Progress*, runs AnalystAgent, comments the plan, and publishes `plan.ready` when the plan is READY and has a target repo.
+- `runtime/workers/dev_inbox.py` — `plan.ready` handler per Dev-agent. On `MR_OPENED`: transitions to *Review* and comments the MR link. On `FAILED` / `NO_CHANGES`: comments the failure notes.
 
 ## Agents
 
 | Agent | Phase | Role |
 |---|---|---|
 | Orchestrator | 0 | Polls Jira, persists tasks, publishes `task.discovered` |
-| Analyst | 1 | Reads ticket + Confluence + MM threads, builds a plan |
+| Analyst | 1 | Reads ticket + Confluence + MM threads, builds a plan, publishes `plan.ready` |
 | Researcher | 1 | In-process MCP toolkit (code grep / KB search) used by the Analyst |
-| Communicator | 1 | Read-only MM access + injection filtering; no sends yet |
-| Dev (×N) | 2 | One per (repo, specialisation); writes code, opens MR |
+| Communicator | 1 | Read-only MM access + injection filtering; no sends yet (Phase 3 flips writes on) |
+| Dev (×N) | 2 | One per (repo, specialisation); consumes `plan.ready`, writes code, opens draft MR |
 | Reviewer | 3 | Handles comments on open MRs |
 | QA | 3 | Validates tests |
 | DevOps | 3 | CI/CD, red pipelines |
@@ -96,44 +99,59 @@ Two parallel sources, merged at startup:
 
 `local.yaml` beats all three base YAMLs. Env beats nothing — env values are pure secrets / infra.
 
-## Data flow (Phase 1)
+## Data flow (Phase 2)
 
 ```
 [Jira]
-   │ poll (every N seconds)
+   │ poll
    ▼
 Orchestrator ── upsert ──► tasks table
    │
-   │ publish "task.discovered"
+   │ publish "task.discovered" → dev: analyst
    ▼
-SqliteMessageBus ── subscribe ──► AnalystInbox
-                                      │
-                                      │ (transition → In Progress)
-                                      ▼
-                                 AnalystAgent
-                                      │
-                                      │ fetch Confluence / MM threads (read-only)
-                                      │ wrap via InjectionFilter
-                                      │ Claude Agent SDK session:
-                                      │   - researcher tools (grep, kb_search, ...)
-                                      │   - submit_plan tool → captures Plan
-                                      ▼
-                                   plans table
-                                      │
-                                      │ (comment plan summary)
-                                      ▼
-                                   [Jira]   &   [dashboard]
+AnalystInbox
+   │ (Jira: To Do → In Progress)
+   │ AnalystAgent:
+   │   - fetch Confluence / MM threads (read-only)
+   │   - wrap via InjectionFilter
+   │   - Claude Agent SDK: researcher tools + submit_plan tool
+   ▼
+plans table
+   │ (Jira: comment plan summary)
+   │
+   │ if plan.status == READY and target_repo:
+   │   publish "plan.ready" → dev: dev-<repo>-backend
+   ▼
+DevInbox
+   │ gate: task.dor_satisfied == True (human-set via dashboard)
+   │ DevAgent:
+   │   - vcs.ensure_clone(repo)
+   │   - vcs.create_branch("ai-dev/<id>-<slug>", base=default_branch)
+   │   - Claude Agent SDK in cwd=workspace with
+   │     Read/Glob/Grep/Edit/Write/Bash + submit_mr tool
+   │   - vcs.commit_all (bot identity)
+   │   - vcs.push
+   │   - vcs.create_merge_request (draft=True)
+   ▼
+merge_requests table
+   │ (Jira: In Progress → Review, comment MR link)
+   ▼
+[GitLab]   &   [dashboard]
 ```
 
-Writes in Phase 1: Jira transition + comment. **No MM writes.**
+Writes in Phase 2: Jira transition + comment, GitLab branch push + draft MR creation. **Still no MM writes** — Phase 3 flips the Communicator from read-only to write.
 
 ## Safety rails
 
 - Every message originating outside the bot is marked `trusted=False`. LLM-facing code runs untrusted data through `InjectionFilter` (Phase 1+). Untrusted content is wrapped in `<untrusted_content>` blocks; the system prompt instructs the model to treat them as data.
 - Repositories are gated through `config/repositories.yaml`: no allowlist hit → no Dev-agent.
+- **Human gate before Dev.** The Dev-agent only runs when `task.dor_satisfied == True`. Flipping that flag is a human-only action (dashboard "Отправить в Dev-агента" button or direct DB update). This is the operator's kill-switch between *plan* and *code*.
+- **Workspace isolation.** The Dev-agent writes to `{workspaces_dir}/{repo_key}/` — a bot-owned clone, never the user's hand-edited working copy.
+- **Bot identity on commits.** Commits are authored by `Virtual Dev <dev_git_author_email>` (per-call `-c user.name=/user.email=`, no global git config mutation). Push uses the user's GitLab token, but the commit author makes it obvious the code came from the bot.
+- **Draft MRs.** The Dev-agent opens MRs as draft by default so CI runs but humans see the WIP marker.
 - No billing caps — the project runs on a Claude Max subscription, not on API credits. The only loop guard is `max_iterations_per_task` in `config/agents.yaml`, which limits the number of agent turns (protection against runaway loops, not against spend).
 - `cost_usd` in the `plans` table is an informational estimate returned by `claude-agent-sdk`; nothing is enforced against it.
-- Kill-switch: `POST /kill` stops the orchestrator and the Analyst runner.
+- Kill-switch: `POST /kill` stops the orchestrator, the Analyst runner, and every Dev-agent runner.
 
 ## Testing strategy
 
