@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from loguru import logger
 from sqlalchemy import select
@@ -194,60 +194,6 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                 "mrs": mrs,
             },
         )
-
-    @app.post("/tasks/{task_id}/send-to-coding")
-    async def send_to_coding(task_id: int) -> RedirectResponse:
-        """Human gate: mark a task DoR-satisfied and re-publish plan.ready.
-
-        The Dev-agent only runs when ``task.dor_satisfied == True``. This
-        endpoint is the single place a human says "yes, this plan is good,
-        go code it".
-        """
-        async with session_scope(container.session_factory) as session:
-            row = (
-                await session.execute(select(TaskRow).where(TaskRow.id == task_id))
-            ).scalar_one_or_none()
-            if row is None:
-                return RedirectResponse("/", status_code=303)
-            row.dor_satisfied = True
-            tracker = row.tracker
-            external_id = row.external_id
-            target_repo = row.target_repo_key
-
-            # Prefer the plan's target_repo over the task's.
-            plan_target = (await session.execute(
-                select(PlanRow.target_repo_key)
-                .where(
-                    PlanRow.tracker == tracker,
-                    PlanRow.task_external_id == external_id,
-                    PlanRow.status == "ready",
-                )
-                .order_by(PlanRow.created_at.desc())
-                .limit(1)
-            )).scalar_one_or_none()
-            if plan_target:
-                target_repo = plan_target
-
-        if target_repo is not None:
-            from virtual_dev.domain.ports.message_bus import AgentMessage
-            import uuid
-
-            await container.message_bus.publish(AgentMessage(
-                id=uuid.uuid4().hex,
-                from_agent="dashboard",
-                to_agent=dev_agent_key(target_repo, "backend"),
-                topic=TOPIC_PLAN_READY,
-                payload={
-                    "tracker": tracker,
-                    "external_id": external_id,
-                    "repo_key": target_repo,
-                },
-            ))
-            logger.info(
-                "Dashboard: marked {} DoR-satisfied; published plan.ready to dev-{}-backend",
-                external_id, target_repo,
-            )
-        return RedirectResponse(f"/tasks/{task_id}", status_code=303)
 
     @app.get("/plans", response_class=HTMLResponse)
     async def plans_list(request: Request) -> HTMLResponse:

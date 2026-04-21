@@ -231,7 +231,7 @@ async def test_dev_inbox_silent_on_skipped() -> None:
 
     dev_result = DevResult(
         outcome=DevOutcome.SKIPPED,
-        skip_reason=DevSkipReason.NOT_DOR_SATISFIED,
+        skip_reason=DevSkipReason.NO_READY_PLAN,
     )
     inbox = DevInbox(
         dev_agent=_StubDev(dev_result),  # type: ignore[arg-type]

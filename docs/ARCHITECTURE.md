@@ -60,7 +60,7 @@ Virtual Dev is structured as a **hexagonal (ports-and-adapters) application** wi
 - `logging/` — loguru setup.
 
 ### `presentation/`
-- `web/app.py` — FastAPI app with `/` (task list), `/tasks/{id}` (detail with plans + MRs), `/plans`, `/mrs`, `/kill`, `/healthz`, and the `POST /tasks/{id}/send-to-coding` human gate that flips `dor_satisfied=True` and republishes `plan.ready`.
+- `web/app.py` — FastAPI app with `/` (task list), `/tasks/{id}` (detail with plans + MRs), `/plans`, `/mrs`, `/kill`, `/healthz`.
 - `web/templates/` — Jinja2 templates.
 - `cli/main.py` — typer commands: `db init`, `run`, `poll-once`, `plan-task`, `dev-task`.
 
@@ -145,7 +145,8 @@ Writes in Phase 2: Jira transition + comment, GitLab branch push + draft MR crea
 
 - Every message originating outside the bot is marked `trusted=False`. LLM-facing code runs untrusted data through `InjectionFilter` (Phase 1+). Untrusted content is wrapped in `<untrusted_content>` blocks; the system prompt instructs the model to treat them as data.
 - Repositories are gated through `config/repositories.yaml`: no allowlist hit → no Dev-agent.
-- **Human gate before Dev.** The Dev-agent only runs when `task.dor_satisfied == True`. Flipping that flag is a human-only action (dashboard "Отправить в Dev-агента" button or direct DB update). This is the operator's kill-switch between *plan* and *code*.
+- **Entry gate via Jira label.** Only tickets matching the configured JQL (default: `labels = "ai-dev"`) reach the orchestrator at all. Tagging a ticket in Jira is the sole "yes, take this one" signal from the operator; the rest of the pipeline is automatic. Un-tag (or remove the ticket from JQL scope) to stop future polls from rediscovering it.
+- **Exit gate via MR review.** MRs are opened as draft and humans merge them. The bot never pushes to default branches.
 - **Workspace isolation.** The Dev-agent writes to `{workspaces_dir}/{repo_key}/` — a bot-owned clone, never the user's hand-edited working copy.
 - **Bot identity on commits.** Commits are authored by `Virtual Dev <dev_git_author_email>` (per-call `-c user.name=/user.email=`, no global git config mutation). Push uses the user's GitLab token, but the commit author makes it obvious the code came from the bot.
 - **Draft MRs.** The Dev-agent opens MRs as draft by default so CI runs but humans see the WIP marker.

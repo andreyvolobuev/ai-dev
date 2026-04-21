@@ -184,7 +184,6 @@ def _cfg(repo_key: str = "bellingshausen") -> AppConfig:
 async def _insert_task(
     session_factory: async_sessionmaker[AsyncSession],
     *,
-    dor_satisfied: bool = True,
     target_repo_key: str | None = "bellingshausen",
     title: str = "Add users endpoint",
 ) -> int:
@@ -194,7 +193,7 @@ async def _insert_task(
             title=title, description="desc", url="https://jira/DM-7",
             components_json=[], labels_json=[], links_json=[],
             priority="medium", external_status="In Progress",
-            internal_status="ready", dor_satisfied=dor_satisfied,
+            internal_status="ready", dor_satisfied=False,
             target_repo_key=target_repo_key,
         )
         session.add(row)
@@ -304,28 +303,6 @@ async def test_dev_happy_path_opens_mr(
     assert mr_row.task_external_id == "DM-7"
     assert mr_row.source_branch == result.branch_name
     assert mr_row.status == MRStatus.DRAFT.value
-
-
-@pytest.mark.asyncio
-async def test_dev_skips_without_dor(
-    session_factory: async_sessionmaker[AsyncSession],
-    tmp_path: Path,
-) -> None:
-    await _insert_task(session_factory, dor_satisfied=False)
-    await _insert_plan(session_factory)
-
-    vcs = _FakeVcs(tmp_path / "workspace")
-    code_agent = _FakeCodeAgent(CodeAgentResult(
-        final_text="", turns=0, input_tokens=0, output_tokens=0,
-        cost_usd=0.0, stopped_reason="end_turn",
-    ))
-    dev = _make_dev(session_factory, vcs=vcs, code_agent=code_agent, preset_submission=None)
-    result = await dev.handle_plan("jira", "DM-7")
-
-    assert result.outcome is DevOutcome.SKIPPED
-    assert result.skip_reason is DevSkipReason.NOT_DOR_SATISFIED
-    assert vcs.calls == []
-    assert code_agent.requests == []
 
 
 @pytest.mark.asyncio

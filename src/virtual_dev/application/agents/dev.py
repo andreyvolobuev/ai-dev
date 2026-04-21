@@ -64,7 +64,6 @@ _SLUG_SAFE_RE = re.compile(r"[^a-z0-9]+")
 class DevSkipReason(str, Enum):
     NO_TASK = "no_task"
     NO_READY_PLAN = "no_ready_plan"
-    NOT_DOR_SATISFIED = "not_dor_satisfied"
     NO_TARGET_REPO = "no_target_repo"
     ALREADY_HAS_MR = "already_has_mr"
 
@@ -412,12 +411,23 @@ class DevAgent:
     def _precheck(
         self, task_row: TaskRow | None, plan_row: PlanRow | None
     ) -> DevSkipReason | None:
+        """Entry gates for the Dev-agent.
+
+        Three checks in order:
+            1. Task exists in our DB (orchestrator must have seen it).
+            2. A READY plan exists (Analyst judged the ticket actionable;
+               CLARIFYING plans wait for a human to answer open questions).
+            3. The plan's target_repo_key matches this Dev-agent's repo —
+               otherwise another Dev-agent will pick it up.
+
+        The human gate is at a higher level: a ticket only reaches the
+        orchestrator if it has the configured Jira label (`ai-dev` by
+        default). Once that's set, the rest of the pipeline is automatic.
+        """
         if task_row is None:
             return DevSkipReason.NO_TASK
         if plan_row is None:
             return DevSkipReason.NO_READY_PLAN
-        if not task_row.dor_satisfied:
-            return DevSkipReason.NOT_DOR_SATISFIED
         target = plan_row.target_repo_key or task_row.target_repo_key
         if target != self._repo_key:
             return DevSkipReason.NO_TARGET_REPO

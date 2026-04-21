@@ -135,7 +135,7 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
 - **`DevAgent`** (`application/agents/dev.py`): подписан на `plan.ready` для конкретного `(repo, specialisation)` ключа. Pre-check: задача есть + READY план + `dor_satisfied` + `target_repo_key` совпадает. Готовит workspace (ensure_clone + create_branch). Запускает Claude Agent SDK в `cwd=workspace` с полным набором Read/Glob/Grep/Edit/Write/Bash + приватный MCP `submit_mr`. После submit: commit → push → create_merge_request (draft по дефолту). 4 исхода: `SKIPPED`, `NO_CHANGES`, `MR_OPENED`, `FAILED`. Каждый с переходом `TaskStatus` и записью в `MergeRequestRow`.
 - **AnalystInbox** теперь публикует `plan.ready` на шину для Dev-агента, если `plan.status == READY` и `target_repo_key` определён. Адресуется ключу `dev-<repo>-<specialisation>` (по умолчанию `backend`).
 - **`DevInbox`** (`runtime/workers/dev_inbox.py`): handler `plan.ready` per-Dev-agent. На `MR_OPENED`: Jira transition `In Progress → Review` + коммент с ссылкой на MR. На `FAILED`/`NO_CHANGES`: коммент с notes. На `SKIPPED`: тихо (info log).
-- **Human gate**: `POST /tasks/{id}/send-to-coding` — кнопка в дашборде ставит `dor_satisfied=True` и публикует `plan.ready`. Без неё Dev не стартует, даже если план READY.
+- **Автономный цикл** от `ai-dev` метки в Jira до draft MR в GitLab — без ручного клика на каждый тикет. Единственный ручной шлюз на входе — наличие метки `labels = "ai-dev"` (это JQL-фильтр Orchestrator'а). Выходной шлюз — ревью и мёрж MR человеком.
 - **Dashboard**: секция MR на `/tasks/{id}`, список `/mrs`, в healthz — статусы всех Dev-раннеров.
 - **CLI**: `virtual-dev dev-task DM-1234 --repo bellingshausen [--post]` — прогнать Dev-агента локально.
 - **Тесты**: 65 unit. Новое: 6 GitLabVcs-локальных (на реальном tmp git-репо c `receive.denyCurrentBranch=updateInstead`), 9 DevAgent (все outcome'ы + rules injection + branch naming), 6 на handoff Analyst→Dev. `claude-agent-sdk` в тестах не запускается — фейковый CodeAgentPort.
@@ -145,7 +145,7 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
 - DevAgent работает в `{workspaces_dir}/{repo_key}/` (отдельный клон), НЕ в пользовательском `local_path`. Твой `local_path` — это reference-checkout для Analyst/Researcher (read-only).
 - Коммиты: автор `Virtual Dev <virtual-dev@datamining.2gis.ru>`, push под твоим GitLab token.
 - Ветки: `ai-dev/<external_id>-<slug>`.
-- Task gate: `plan.status=READY` + `task.dor_satisfied=True` + `target_repo_key` — все три.
+- Task gate для Dev: `plan.status=READY` + `target_repo_key` установлен. Человеческий гейт — только метка `ai-dev` в Jira (на входе) и ревью MR (на выходе). Поле `task.dor_satisfied` в доменной модели осталось на будущее, но как шлюз Dev'а **не используется** (автономная работа).
 - Тесты не зелёные → max_turns → FAILED, MR не открываем.
 - MR открывается как draft (`DEV_MR_DRAFT=true`).
 - RAG по истории MR — отложено на Phase 2.5 (не блокирует базовый цикл).
