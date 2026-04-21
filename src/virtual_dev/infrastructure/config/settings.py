@@ -20,9 +20,6 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # --- Anthropic ---
-    anthropic_api_key: str = ""
-
     # --- Jira ---
     jira_url: str = ""
     jira_user: str = ""

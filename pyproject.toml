@@ -16,7 +16,11 @@ dependencies = [
     "anyio>=4.6",
 
     # LLM / Agents
-    "anthropic>=0.39",
+    #
+    # Claude Agent SDK wraps the `claude` CLI (Claude Code) in a subprocess
+    # and reuses the logged-in Claude Max session. No API key required.
+    # Intentionally NOT depending on the `anthropic` SDK directly — the bot
+    # runs on the user's Max subscription, not on API credits.
     "claude-agent-sdk>=0.1.0",
 
     # Task tracker / VCS / Chat / KB

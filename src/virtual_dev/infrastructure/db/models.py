@@ -100,6 +100,33 @@ class AgentMessageRow(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class PlanRow(Base):
+    """Persistent projection of :class:`virtual_dev.domain.models.plan.Plan`."""
+
+    __tablename__ = "plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    tracker: Mapped[str] = mapped_column(String(32), index=True)
+    task_external_id: Mapped[str] = mapped_column(String(64), index=True)
+
+    summary: Mapped[str] = mapped_column(Text, default="")
+    steps_json: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
+    open_questions_json: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
+    risks_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    confidence: Mapped[float] = mapped_column(default=0.5)
+
+    status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
+    target_repo_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    cost_usd: Mapped[float] = mapped_column(default=0.0)
+    iterations: Mapped[int] = mapped_column(Integer, default=0)
+    model: Mapped[str] = mapped_column(String(128), default="")
+    agent_key: Mapped[str] = mapped_column(String(128), default="", index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
 class EventRow(Base):
     """Generic audit/event log (anything interesting that happened)."""
 

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from typing import Any, cast
 
+from virtual_dev.domain.models.plan import OpenQuestion, Plan, PlanStatus, PlanStep
 from virtual_dev.domain.models.task import Task, TaskLink, TaskPriority, TaskStatus
-from virtual_dev.infrastructure.db.models import TaskRow
+from virtual_dev.infrastructure.db.models import PlanRow, TaskRow
 
 
 def task_to_row(task: Task) -> TaskRow:
@@ -65,4 +67,46 @@ def row_to_task(row: TaskRow) -> Task:
         internal_status=TaskStatus(row.internal_status),
         target_repo_key=row.target_repo_key,
         dor_satisfied=row.dor_satisfied,
+    )
+
+
+# --- Plan ---
+
+
+def plan_to_row(plan: Plan) -> PlanRow:
+    return PlanRow(
+        tracker=plan.tracker,
+        task_external_id=plan.task_external_id,
+        summary=plan.summary,
+        steps_json=[asdict(step) for step in plan.steps],
+        open_questions_json=[asdict(q) for q in plan.open_questions],
+        risks_json=list(plan.risks),
+        confidence=plan.confidence,
+        status=plan.status.value,
+        target_repo_key=plan.target_repo_key,
+        cost_usd=plan.cost_usd,
+        iterations=plan.iterations,
+        model=plan.model,
+        agent_key=plan.agent_key,
+    )
+
+
+def row_to_plan(row: PlanRow) -> Plan:
+    steps_raw = cast(list[dict[str, Any]], row.steps_json or [])
+    questions_raw = cast(list[dict[str, Any]], row.open_questions_json or [])
+    return Plan(
+        task_external_id=row.task_external_id,
+        tracker=row.tracker,
+        summary=row.summary,
+        steps=[PlanStep(**step) for step in steps_raw],
+        open_questions=[OpenQuestion(**q) for q in questions_raw],
+        risks=list(row.risks_json or []),
+        confidence=row.confidence,
+        status=PlanStatus(row.status),
+        target_repo_key=row.target_repo_key,
+        cost_usd=row.cost_usd,
+        iterations=row.iterations,
+        model=row.model,
+        agent_key=row.agent_key,
+        created_at=row.created_at,
     )
