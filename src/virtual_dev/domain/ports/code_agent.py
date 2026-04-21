@@ -34,6 +34,10 @@ class CodeAgentRequest:
     max_turns: int = 30
     max_tokens_per_turn: int = 8000
     model: str | None = None             # override default model per run
+    # Adapter-specific escape hatch. Keeps the abstract signature clean while
+    # letting callers pass adapter knobs (e.g. MCP server handles for the
+    # Claude Agent SDK). Adapter implementations document the keys they read.
+    extras: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
