@@ -32,6 +32,7 @@ from loguru import logger
 
 from virtual_dev.application.services.injection_filter import InjectionFilter
 from virtual_dev.domain.ports.knowledge_base import KnowledgeBasePort
+from virtual_dev.domain.ports.mr_history import MrHistoryPort
 from virtual_dev.infrastructure.config import AppConfig
 
 
@@ -68,10 +69,12 @@ class ResearcherToolkit:
         workspaces_dir: str | Path,
         knowledge_base: KnowledgeBasePort | None,
         injection_filter: InjectionFilter,
+        mr_history: MrHistoryPort | None = None,
     ) -> None:
         self._repos = _build_repo_handles(config, workspaces_dir)
         self._kb = knowledge_base
         self._filter = injection_filter
+        self._mr_history = mr_history
 
     def build_mcp_server(self) -> McpSdkServerConfig:
         """Create an in-process MCP server with the research tools bound.
@@ -141,10 +144,29 @@ class ResearcherToolkit:
         async def _kb_fetch(args: dict[str, Any]) -> dict[str, Any]:
             return await self._run_kb_fetch(args)
 
+        @tool(
+            "search_mr_history",
+            "Search past merged MRs of this repository for ones similar to "
+            "`query`. Returns up to `k` hits (default 5) with title, "
+            "description, URL, author and a similarity score. Useful to see "
+            "how comparable changes were done before.",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "repo_key": {"type": "string"},
+                    "k": {"type": "integer"},
+                },
+                "required": ["query", "repo_key"],
+            },
+        )
+        async def _search_mr_history(args: dict[str, Any]) -> dict[str, Any]:
+            return await self._run_search_mr_history(args)
+
         return create_sdk_mcp_server(
             name="virtual_dev_researcher",
             version="0.1.0",
-            tools=[_search_code, _read_file, _kb_search, _kb_fetch],
+            tools=[_search_code, _read_file, _kb_search, _kb_fetch, _search_mr_history],
         )
 
     # --- tool implementations (public for testing) ---
@@ -212,6 +234,39 @@ class ResearcherToolkit:
         page = await self._kb.fetch_page_by_url(url)
         rendered = f"# {page.title}\n{page.url}\n\n{page.content_text}"
         wrapped = self._filter.wrap(rendered, source=f"kb:page:{page.id}")
+        return _text_result(wrapped.wrapped_text)
+
+    async def _run_search_mr_history(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self._mr_history is None:
+            return _error_text(
+                "MR history index is not configured. Run `virtual-dev index-mrs --repo <key>` first."
+            )
+        repo_key = str(args.get("repo_key") or "")
+        query = str(args.get("query") or "")
+        k = int(args.get("k") or 5)
+        if not repo_key:
+            return _error_text("repo_key is required")
+        if not query:
+            return _error_text("query is required")
+        if repo_key not in self._repos:
+            return _error_text(f"Unknown repo: {repo_key!r}")
+
+        hits = await self._mr_history.search(repo_key, query, k=k)
+        if not hits:
+            return _text_result(
+                f"(no MR-history matches for query {query!r}; "
+                f"index may be empty — run `virtual-dev index-mrs --repo {repo_key}`)"
+            )
+        parts: list[str] = []
+        for hit in hits:
+            parts.append(
+                f"## !{hit.iid} — {hit.title}\n"
+                f"score={hit.score:.3f}  author={hit.author_username}  "
+                f"merged_at={hit.merged_at.isoformat() if hit.merged_at else '—'}\n"
+                f"url: {hit.web_url}\n\n"
+                f"{(hit.description or '')[:1200]}"
+            )
+        wrapped = self._filter.wrap("\n\n---\n\n".join(parts), source=f"mr_history:{repo_key}")
         return _text_result(wrapped.wrapped_text)
 
 

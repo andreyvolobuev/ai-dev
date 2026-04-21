@@ -47,6 +47,12 @@ dependencies = [
     # Misc
     "httpx>=0.28",
     "tenacity>=9.0",
+
+    # RAG по истории MR (Phase 2.5). fastembed = ONNX-runtime, без torch —
+    # легче sentence-transformers примерно на 500MB. Модель грузится лениво
+    # при первом embed() и кэшируется в ~/.cache/fastembed.
+    "fastembed>=0.4",
+    "numpy>=1.26",
 ]
 
 [dependency-groups]

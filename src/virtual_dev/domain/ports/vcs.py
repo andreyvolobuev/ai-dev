@@ -73,6 +73,16 @@ class VcsPort(ABC):
         """List open MRs, optionally filtered by author."""
 
     @abstractmethod
+    async def list_merged_merge_requests(
+        self, repo_key: str, limit: int = 500
+    ) -> Sequence[MergeRequest]:
+        """List most-recently merged MRs for RAG indexing.
+
+        Ordered by ``merged_at`` descending; implementations may cap at
+        ``limit`` or use page-by-page iteration internally.
+        """
+
+    @abstractmethod
     async def list_review_comments(self, repo_key: str, iid: int) -> Sequence[ReviewComment]:
         """Return review comments on the MR (both inline and general)."""
 

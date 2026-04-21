@@ -87,6 +87,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                 session_factory=container.session_factory,
                 config=container.config,
                 settings=container.settings,
+                researcher=container.researcher if container.mr_history else None,
             )
             inbox = DevInbox(
                 dev_agent=dev,

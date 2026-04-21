@@ -174,6 +174,29 @@ class GitLabVcs(VcsPort):
 
         return await asyncio.to_thread(_run)
 
+    async def list_merged_merge_requests(
+        self, repo_key: str, limit: int = 500
+    ) -> list[MergeRequest]:
+        def _run() -> list[MergeRequest]:
+            project = self._client.projects.get(self._project_path(repo_key))
+            # GitLab orders by created_at by default; switch to updated_at
+            # descending which is the closest proxy for "recent merges".
+            raw = project.mergerequests.list(
+                state="merged",
+                order_by="updated_at",
+                sort="desc",
+                per_page=min(limit, 100),
+                iterator=True,
+            )
+            out: list[MergeRequest] = []
+            for mr in raw:
+                out.append(_mr_from_gitlab(mr))
+                if len(out) >= limit:
+                    break
+            return out
+
+        return await asyncio.to_thread(_run)
+
     async def list_review_comments(self, repo_key: str, iid: int) -> list[ReviewComment]:
         def _run() -> list[ReviewComment]:
             project = self._client.projects.get(self._project_path(repo_key))

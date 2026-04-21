@@ -94,6 +94,35 @@ def poll_once() -> None:
     asyncio.run(_run())
 
 
+@app.command("index-mrs")
+def index_mrs(
+    repo: str = typer.Option(..., "--repo", help="Repo key from repositories.yaml"),
+    limit: int = typer.Option(500, help="Max number of merged MRs to index"),
+) -> None:
+    """Build / refresh the MR-history RAG index for a repo.
+
+    Pulls the most recent merged MRs from GitLab, embeds title+description
+    with a local multilingual model, stores them in the `mr_history` table.
+    First run downloads the embedder model (~220MB) into
+    ``~/.cache/fastembed``; subsequent runs are fast.
+    """
+    _bootstrap()
+    container = build_container()
+    if container.mr_history is None:
+        console.print(
+            "[red]MR-history index requires VCS (GitLab token) to be configured[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    async def _run() -> int:
+        count = await container.mr_history.refresh(repo, limit=limit)
+        await container.dispose()
+        return count
+
+    count = asyncio.run(_run())
+    console.print(f"[green]Indexed {count} merged MRs for {repo}[/green]")
+
+
 @app.command("dev-task")
 def dev_task(
     external_id: str = typer.Argument(..., help="Tracker task id, e.g. DM-1234"),

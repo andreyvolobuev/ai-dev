@@ -42,7 +42,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from virtual_dev.application.services import RulesLoader
+from virtual_dev.application.services import ResearcherToolkit, RulesLoader
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus
 from virtual_dev.domain.models.plan import Plan, PlanStatus
 from virtual_dev.domain.models.task import TaskStatus
@@ -125,6 +125,7 @@ class DevAgent:
         session_factory: async_sessionmaker[AsyncSession],
         config: AppConfig,
         settings: Settings,
+        researcher: ResearcherToolkit | None = None,
         max_turns: int | None = None,
     ) -> None:
         self._agent_key = agent_key
@@ -133,6 +134,7 @@ class DevAgent:
         self._vcs = vcs
         self._code_agent = code_agent
         self._rules = rules_loader
+        self._researcher = researcher
         self._session_factory = session_factory
         self._config = config
         self._settings = settings
@@ -275,6 +277,11 @@ class DevAgent:
             # Full Claude Code tool surface in the workspace.
             "Read", "Glob", "Grep", "Edit", "Write", "Bash",
         ]
+        # MR-history search is the one piece the Dev doesn't get from
+        # built-in tools: let it peek at how similar changes were done before.
+        if self._researcher is not None:
+            mcp_servers["virtual_dev_researcher"] = self._researcher.build_mcp_server()
+            allowed_tool_names.append("mcp__virtual_dev_researcher__search_mr_history")
         request.extras["mcp_servers"] = mcp_servers
         request.extras["allowed_tool_names"] = allowed_tool_names
 

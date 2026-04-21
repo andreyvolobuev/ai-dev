@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, DateTime, Float, Integer, LargeBinary, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from virtual_dev.infrastructure.db.base import Base
@@ -125,6 +125,35 @@ class PlanRow(Base):
     agent_key: Mapped[str] = mapped_column(String(128), default="", index=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class MrHistoryRow(Base):
+    """One indexed MR in the RAG corpus.
+
+    Embedding is stored as a raw float32 little-endian blob (cheap,
+    no dependency on pickle). Dimensionality is implied by ``embed_dim``
+    so we can detect and drop rows if the embedding model changes.
+    """
+
+    __tablename__ = "mr_history"
+    __table_args__ = (UniqueConstraint("repo_key", "iid", name="uq_mr_history_repo_iid"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    repo_key: Mapped[str] = mapped_column(String(128), index=True)
+    iid: Mapped[int] = mapped_column(Integer, index=True)
+
+    title: Mapped[str] = mapped_column(String(512))
+    description: Mapped[str] = mapped_column(Text, default="")
+    author_username: Mapped[str] = mapped_column(String(128), default="")
+    web_url: Mapped[str] = mapped_column(String(1024), default="")
+    merged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    embed_model: Mapped[str] = mapped_column(String(256))
+    embed_dim: Mapped[int] = mapped_column(Integer)
+    embed_norm: Mapped[float] = mapped_column(Float)   # precomputed L2 norm
+    embedding_blob: Mapped[bytes] = mapped_column(LargeBinary)
+
+    indexed_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
 
 class EventRow(Base):

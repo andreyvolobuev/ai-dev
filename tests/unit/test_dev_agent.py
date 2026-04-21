@@ -106,6 +106,11 @@ class _FakeVcs(VcsPort):
     ) -> Sequence[MergeRequest]:  # pragma: no cover
         raise NotImplementedError
 
+    async def list_merged_merge_requests(
+        self, repo_key: str, limit: int = 500
+    ) -> Sequence[MergeRequest]:  # pragma: no cover
+        raise NotImplementedError
+
     async def list_review_comments(self, repo_key: str, iid: int) -> Sequence[Any]:  # pragma: no cover
         raise NotImplementedError
 

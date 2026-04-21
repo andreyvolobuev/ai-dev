@@ -244,6 +244,7 @@ class AnalystAgent:
             "mcp__virtual_dev_researcher__read_file",
             "mcp__virtual_dev_researcher__kb_search",
             "mcp__virtual_dev_researcher__kb_fetch_page_by_url",
+            "mcp__virtual_dev_researcher__search_mr_history",
             "Read", "Glob", "Grep",
         ]
         request.extras["mcp_servers"] = mcp_servers

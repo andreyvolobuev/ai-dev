@@ -15,9 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from virtual_dev.adapters.chat import MattermostChat
 from virtual_dev.adapters.code_agent import ClaudeAgentSdkCodeAgent
+from virtual_dev.adapters.embedder import FastembedEmbedder
 from virtual_dev.adapters.knowledge_base import ConfluenceKb
 from virtual_dev.adapters.llm import ClaudeAgentSdkLlm
 from virtual_dev.adapters.message_bus import SqliteMessageBus
+from virtual_dev.adapters.mr_history import LocalMrHistory
 from virtual_dev.adapters.secrets import EnvSecrets
 from virtual_dev.adapters.task_tracker import JiraTaskTracker
 from virtual_dev.adapters.vcs import GitIdentity, GitLabVcs
@@ -29,9 +31,11 @@ from virtual_dev.application.services import (
 )
 from virtual_dev.domain.ports.chat import ChatPort
 from virtual_dev.domain.ports.code_agent import CodeAgentPort
+from virtual_dev.domain.ports.embedder import EmbedderPort
 from virtual_dev.domain.ports.knowledge_base import KnowledgeBasePort
 from virtual_dev.domain.ports.llm import LlmPort
 from virtual_dev.domain.ports.message_bus import MessageBusPort
+from virtual_dev.domain.ports.mr_history import MrHistoryPort
 from virtual_dev.domain.ports.secrets import SecretsPort
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 from virtual_dev.domain.ports.vcs import VcsPort
@@ -59,6 +63,8 @@ class Container:
     chat: ChatPort | None
     knowledge_base: KnowledgeBasePort | None
     vcs: VcsPort | None
+    embedder: EmbedderPort
+    mr_history: MrHistoryPort | None
     code_agent: CodeAgentPort
     llm: LlmPort
     injection_filter: InjectionFilter
@@ -154,6 +160,17 @@ def build_container(config_dir: Path | str = "config") -> Container:
             "GitLab credentials missing — VCS disabled; Dev-agent will not run"
         )
 
+    # Embedder is always constructed (the ONNX model is loaded lazily on first
+    # embed call, so we pay no price if nobody indexes MRs).
+    embedder: EmbedderPort = FastembedEmbedder()
+    mr_history: MrHistoryPort | None = None
+    if vcs is not None:
+        mr_history = LocalMrHistory(
+            session_factory=session_factory, vcs=vcs, embedder=embedder,
+        )
+    else:
+        logger.info("MR-history index disabled (VCS not configured)")
+
     code_agent: CodeAgentPort = ClaudeAgentSdkCodeAgent(
         default_model=config.agents.models.default,
     )
@@ -165,6 +182,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         workspaces_dir=settings.workspaces_dir,
         knowledge_base=knowledge_base,
         injection_filter=injection_filter,
+        mr_history=mr_history,
     )
     communicator = CommunicatorService(chat, injection_filter)
     rules_loader = RulesLoader(Path(config_dir) / "rules")
@@ -180,6 +198,8 @@ def build_container(config_dir: Path | str = "config") -> Container:
         chat=chat,
         knowledge_base=knowledge_base,
         vcs=vcs,
+        embedder=embedder,
+        mr_history=mr_history,
         code_agent=code_agent,
         llm=llm,
         injection_filter=injection_filter,

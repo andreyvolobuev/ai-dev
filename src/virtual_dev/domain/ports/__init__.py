@@ -7,9 +7,11 @@ from virtual_dev.domain.ports.code_agent import (
     CodeAgentResult,
     CodeAgentTool,
 )
+from virtual_dev.domain.ports.embedder import EmbedderPort
 from virtual_dev.domain.ports.knowledge_base import KnowledgeBasePort
 from virtual_dev.domain.ports.llm import LlmMessage, LlmPort, LlmResponse
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
+from virtual_dev.domain.ports.mr_history import MrHistoryPort
 from virtual_dev.domain.ports.secrets import SecretsPort
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 from virtual_dev.domain.ports.vcs import VcsPort
@@ -21,11 +23,13 @@ __all__ = [
     "CodeAgentRequest",
     "CodeAgentResult",
     "CodeAgentTool",
+    "EmbedderPort",
     "KnowledgeBasePort",
     "LlmMessage",
     "LlmPort",
     "LlmResponse",
     "MessageBusPort",
+    "MrHistoryPort",
     "SecretsPort",
     "TaskTrackerPort",
     "VcsPort",
