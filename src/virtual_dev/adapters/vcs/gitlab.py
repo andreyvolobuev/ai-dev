@@ -268,7 +268,14 @@ class GitLabVcs(VcsPort):
         def _run() -> list[ReviewComment]:
             project = self._client.projects.get(self._project_path(repo_key))
             mr = project.mergerequests.get(iid)
-            return [_comment_from_gitlab(n, iid) for n in mr.notes.list(all=True)]
+            # Oldest-first — Reviewer's diff against last_seen_comment_id walks
+            # the list in that order. GitLab defaults to desc, which breaks
+            # the cutoff (new comments come before the cutoff id, so the
+            # "passed cutoff" flag never flips to True on them).
+            return [
+                _comment_from_gitlab(n, iid)
+                for n in mr.notes.list(all=True, order_by="created_at", sort="asc")
+            ]
 
         return await asyncio.to_thread(_run)
 
