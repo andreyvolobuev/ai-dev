@@ -303,41 +303,36 @@ class ReviewerAgent:
     def _new_comments(
         self, row: MergeRequestRow, comments: list[ReviewComment],
     ) -> list[ReviewComment]:
-        """Filter out bot's own comments + everything up to last_seen_comment_id.
+        """Return comments the Reviewer hasn't seen yet.
 
-        Bot identity on GitLab ≠ bot identity on Mattermost. The MR was
-        opened by us, so ``row.author_username`` IS the bot's GitLab
-        handle — any comment with that author is our own
-        ``submit_mr``-comment / our own reply and must not round-trip
-        back through the Reviewer.
+        We do **not** filter by MR author: under the current setup the
+        GitLab token belongs to a single human, so MR author == reviewer ==
+        everyone. Filtering would suppress every comment during smoke
+        tests. Once a separate bot account exists, set
+        ``bot_username`` in the constructor — then the bot's own
+        ``reply_to_comment`` output won't round-trip back in.
         """
         filtered: list[ReviewComment] = []
         seen_cutoff = row.last_seen_comment_id or ""
         passed_cutoff = not seen_cutoff
         for comment in comments:
-            # API returns oldest first; advance through until we pass last_seen.
+            # API returns oldest first; advance until we pass last_seen.
             if not passed_cutoff:
                 if comment.id == seen_cutoff:
                     passed_cutoff = True
                 continue
-            if self._is_bot_author(comment.author_username, row.author_username):
+            if self._is_bot_author(comment.author_username):
                 continue
             filtered.append(comment)
-        # First call ever (no cutoff yet): skip bot-authored ones anyway.
-        if not seen_cutoff:
-            filtered = [
-                c for c in filtered
-                if not self._is_bot_author(c.author_username, row.author_username)
-            ]
         return filtered
 
-    def _is_bot_author(self, username: str, mr_author_username: str) -> bool:
-        """A comment is ours if its author matches either the MR author
-        (primary signal — the bot opened this MR) or the configured
-        ``bot_username`` (secondary, in case a different bot account
-        replies on our behalf)."""
-        if mr_author_username and username.lower() == mr_author_username.lower():
-            return True
+    def _is_bot_author(self, username: str) -> bool:
+        """True iff the comment is from an explicit ``bot_username``.
+
+        Without a dedicated bot GitLab account (current state), this is
+        always False and we process every comment — including our own
+        test comments.
+        """
         if self._bot_username and username.lower() == self._bot_username.lower():
             return True
         return False
