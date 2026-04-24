@@ -41,16 +41,36 @@ def _parse_host_port_scheme(url: str) -> tuple[str, int, str]:
 class MattermostChat(ChatPort):
     """``ChatPort`` backed by Mattermost (self-hosted), read-only for Phase 1."""
 
-    def __init__(self, *, url: str, token: str, bot_username: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        url: str,
+        token: str,
+        bot_username: str | None = None,
+        ssl_verify: bool = True,
+        ssl_ca_file: str | None = None,
+    ) -> None:
         if not url or not token:
             raise ValueError("Mattermost URL and token must be provided")
         host, port, scheme = _parse_host_port_scheme(url)
+        # Corporate MMs often sit behind a self-signed cert or a CA the
+        # machine doesn't know about. Callers can disable verify or point
+        # at a CA bundle explicitly.
+        verify: bool | str
+        if not ssl_verify:
+            verify = False
+        elif ssl_ca_file:
+            verify = ssl_ca_file
+        else:
+            verify = True
         self._driver = Driver(
             {
                 "url": host,
                 "port": port,
                 "scheme": scheme,
+                "basepath": "/api/v4",
                 "token": token,
+                "verify": verify,
                 "timeout": 30,
             }
         )

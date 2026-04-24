@@ -133,6 +133,8 @@ def build_container(config_dir: Path | str = "config") -> Container:
             url=settings.mattermost_url,
             token=settings.mattermost_token,
             bot_username=settings.mattermost_bot_username or None,
+            ssl_verify=settings.mattermost_ssl_verify,
+            ssl_ca_file=settings.mattermost_ssl_ca_file or None,
         )
     else:
         logger.warning("Mattermost credentials missing — chat disabled")

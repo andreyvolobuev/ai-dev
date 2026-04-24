@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     mattermost_url: str = ""
     mattermost_token: str = ""
     mattermost_bot_username: str = ""
+    # Корпоративный MM часто за self-signed / чужим CA — requests по дефолту
+    # отдаёт SSLError. Выключение verify возвращает прежнее поведение; для
+    # правильного пути укажи путь до корпоративного CA-bundle в CA_FILE.
+    mattermost_ssl_verify: bool = True
+    mattermost_ssl_ca_file: str = ""
 
     # --- Confluence ---
     confluence_url: str = ""
