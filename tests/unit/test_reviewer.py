@@ -50,15 +50,27 @@ class _StubVcs(VcsPort):
         *,
         comments: dict[tuple[str, int], list[ReviewComment]],
         approvals: dict[tuple[str, int], ApprovalInfo],
+        mr_status: MRStatus = MRStatus.OPEN,
     ) -> None:
         self._comments = comments
         self._approvals = approvals
+        self._mr_status = mr_status
 
     async def list_review_comments(self, repo_key: str, iid: int) -> list[ReviewComment]:
         return list(self._comments.get((repo_key, iid), []))
 
     async def get_mr_approvals(self, repo_key: str, iid: int) -> ApprovalInfo:
         return self._approvals.get((repo_key, iid), ApprovalInfo())
+
+    async def get_merge_request(self, repo_key: str, iid: int) -> MergeRequest:
+        return MergeRequest(
+            id=str(iid), iid=iid, project_id="p",
+            title="t", description="",
+            source_branch=f"feat/{iid}", target_branch="master",
+            author_username="virtual-dev",
+            web_url=f"https://gitlab/x/merge_requests/{iid}",
+            status=self._mr_status,
+        )
 
     # unused methods raise
     async def ensure_clone(self, repo_key: str) -> str:  # pragma: no cover
@@ -86,9 +98,6 @@ class _StubVcs(VcsPort):
         self, repo_key: str, source_branch: str, target_branch: str,
         title: str, description: str, draft: bool = False,
     ) -> MergeRequest:  # pragma: no cover
-        raise NotImplementedError
-
-    async def get_merge_request(self, repo_key: str, iid: int) -> MergeRequest:  # pragma: no cover
         raise NotImplementedError
 
     async def list_open_merge_requests(
@@ -190,6 +199,8 @@ async def _insert_mr(
     last_seen: str | None = None,
     last_activity_at: datetime | None = None,
     created_at: datetime | None = None,
+    status: str = "open",
+    review_ping_sent: bool = True,   # default: past the initial review ping
 ) -> int:
     async with session_scope(session_factory) as session:
         row = MergeRequestRow(
@@ -199,9 +210,10 @@ async def _insert_mr(
             source_branch=f"ai-dev/dm-1-{iid}", target_branch="master",
             author_username="virtual-dev",
             web_url=f"https://gitlab/x/merge_requests/{iid}",
-            status="open", approvals_count=0, approvals_required=1,
+            status=status, approvals_count=0, approvals_required=1,
             last_seen_comment_id=last_seen,
             last_activity_at=last_activity_at,
+            review_ping_sent=review_ping_sent,
             created_at=created_at or datetime.now(timezone.utc),
         )
         session.add(row)
@@ -250,9 +262,15 @@ def test_classify_chatter() -> None:
 
 
 @pytest.mark.asyncio
-async def test_new_human_comment_is_relayed_and_last_seen_updated(
+async def test_new_human_comments_advance_last_seen_without_forwarding(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """Phase 3 rule: comments never round-trip to Mattermost.
+
+    Reviewer detects the new comment, advances ``last_seen_comment_id``
+    so the next tick ignores it, and emits an ``mr.comment`` event on the
+    bus — but does NOT DM/channel-post the content.
+    """
     mr_id = await _insert_mr(session_factory, last_activity_at=datetime.now(timezone.utc))
     comments = [
         ReviewComment(id="c-1", mr_id="42", author_username="virtual-dev", body="MR opened"),
@@ -269,13 +287,10 @@ async def test_new_human_comment_is_relayed_and_last_seen_updated(
     stats = await agent.tick()
 
     assert stats.mrs_checked == 1
-    assert stats.new_comments == 1
-    # Bot comment filtered; only alice's ping relayed.
-    assert len(chat.sent_channels) == 1
-    ch, body = chat.sent_channels[0]
-    assert ch == "team-chan"
-    assert "alice" in body
-    # last_seen advanced to latest comment id.
+    assert stats.new_comments == 1  # virtual-dev's own filtered out
+    # No channel / DM traffic for comments.
+    assert chat.sent_channels == []
+    assert chat.sent_dms == []
     async with session_factory() as session:
         row = (await session.execute(
             select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
@@ -306,8 +321,52 @@ async def test_already_seen_comments_not_re_emitted(
 
     stats = await agent.tick()
     assert stats.new_comments == 1
-    assert len(chat.sent_channels) == 1
-    assert "bob" in chat.sent_channels[0][1]
+    # No MM traffic — comment observation only updates last_activity_at.
+    assert chat.sent_channels == []
+
+
+@pytest.mark.asyncio
+async def test_review_ping_fires_once_on_first_observation(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _insert_mr(session_factory, review_ping_sent=False)
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        mr_status=MRStatus.OPEN,
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    stats = await agent.tick()
+    assert stats.review_pings_sent == 1
+    assert any("ready for review" in body for _, body in chat.sent_channels)
+
+    # Second tick: flag persisted, no repeat.
+    chat.sent_channels.clear()
+    stats2 = await agent.tick()
+    assert stats2.review_pings_sent == 0
+    assert chat.sent_channels == []
+
+
+@pytest.mark.asyncio
+async def test_review_ping_not_sent_while_draft(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _insert_mr(session_factory, review_ping_sent=False, status="draft")
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        mr_status=MRStatus.DRAFT,
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    stats = await agent.tick()
+    assert stats.review_pings_sent == 0
+    assert chat.sent_channels == []
 
 
 @pytest.mark.asyncio

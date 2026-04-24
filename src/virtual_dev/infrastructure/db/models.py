@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, DateTime, Float, Integer, LargeBinary, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    Integer,
+    LargeBinary,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from virtual_dev.infrastructure.db.base import Base
@@ -90,6 +100,9 @@ class MergeRequestRow(Base):
     last_pipeline_notified_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     last_escalation_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     ping_reviewers_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Whether we've already posted "please review" to the team channel for
+    # this MR. Sent once when the MR transitions out of draft.
+    review_ping_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
