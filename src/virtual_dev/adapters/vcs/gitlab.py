@@ -67,12 +67,38 @@ class GitLabVcs(VcsPort):
         self._client = Gitlab(url=gitlab_url, private_token=gitlab_token)
         self._workspaces_dir = Path(workspaces_dir).resolve()
         self._identity = identity
+        # Repos whose local_path we've already verified clean this process —
+        # so ensure_clone stays idempotent after the Dev-agent starts dirtying
+        # the tree with its own edits.
+        self._verified_local_path: set[str] = set()
 
     # --- Local checkout ---
 
     async def ensure_clone(self, repo_key: str) -> str:
         repo_cfg = self._repo(repo_key)
         dest = self._workspace_path(repo_key)
+
+        # If repositories.yaml pins a local_path, reuse the user's existing
+        # checkout instead of re-cloning. On the FIRST call this process:
+        # refuse if the tree is dirty — the Dev-agent will do reset --hard /
+        # branch switches that would clobber uncommitted work. Subsequent
+        # calls skip the check, because the Dev-agent itself dirties the
+        # tree as it edits files before commit_all.
+        if repo_cfg.local_path:
+            if not (dest / ".git").is_dir():
+                raise VcsError(
+                    f"local_path for {repo_key!r} ({dest}) is not a git repo — "
+                    f"fix repositories.yaml or clone it yourself"
+                )
+            if repo_key not in self._verified_local_path:
+                if await self._has_uncommitted_changes_at(dest):
+                    raise VcsError(
+                        f"local_path for {repo_key!r} ({dest}) has uncommitted "
+                        f"changes; stash or commit before running the Dev-agent "
+                        f"(it would reset --hard / switch branches and wipe them)"
+                    )
+                self._verified_local_path.add(repo_key)
+            return str(dest)
 
         if (dest / ".git").is_dir():
             return str(dest)
@@ -81,6 +107,10 @@ class GitLabVcs(VcsPort):
         logger.info("Cloning {} into {}", repo_cfg.url, dest)
         await self._run_git(None, "clone", repo_cfg.url, str(dest))
         return str(dest)
+
+    async def _has_uncommitted_changes_at(self, path: Path) -> bool:
+        output = await self._run_git(path, "status", "--porcelain")
+        return bool(output.strip())
 
     async def fetch_and_checkout(self, repo_key: str, branch: str) -> None:
         path = await self._ensure_local(repo_key)
@@ -241,6 +271,15 @@ class GitLabVcs(VcsPort):
         return repo
 
     def _workspace_path(self, repo_key: str) -> Path:
+        """Resolve the local checkout for a repo.
+
+        Honours ``local_path`` from ``repositories.yaml`` (same as the
+        Researcher) so the Dev-agent reuses the user's existing clone
+        instead of fetching a second copy into ``workspaces/``.
+        """
+        repo_cfg = self._repo(repo_key)
+        if repo_cfg.local_path:
+            return Path(repo_cfg.local_path).expanduser().resolve()
         return self._workspaces_dir / repo_key
 
     def _project_path(self, repo_key: str) -> str:

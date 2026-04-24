@@ -43,7 +43,10 @@ agents:
 
   analyst:
     model: default
-    max_iterations_per_task: 15    # plan-building rarely needs more turns
+    # Анализ — разведка в репе: grep → read_file → снова grep ... + финальный
+    # submit_plan. На реальном репо уходит 20–30 turns. 15 было мало — CLI
+    # валился с exit 1 на `stop=tool_use`, не дав дойти до submit_plan.
+    max_iterations_per_task: 40
 
   researcher:
     model: default
@@ -54,7 +57,7 @@ agents:
 
   developer:
     model: default
-    max_iterations_per_task: 30    # coding может долго грести по тестам
+    max_iterations_per_task: 80    # coding + правки по тестам — turns быстро уходят
 
   reviewer:
     model: default

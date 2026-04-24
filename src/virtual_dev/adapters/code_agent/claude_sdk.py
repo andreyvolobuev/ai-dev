@@ -21,6 +21,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     TextBlock,
+    ToolUseBlock,
     query,
 )
 from claude_agent_sdk.types import (
@@ -56,7 +57,10 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
     async def run_task(self, request: CodeAgentRequest) -> CodeAgentResult:
         mcp_servers = _as_mcp_servers(request.extras.get("mcp_servers"))
         allowed_tool_names = _as_allowed_tools(request.extras.get("allowed_tool_names"))
-        options = self._build_options(request, mcp_servers, allowed_tool_names)
+        stderr_lines: list[str] = []
+        options = self._build_options(
+            request, mcp_servers, allowed_tool_names, stderr_lines,
+        )
 
         final_text_parts: list[str] = []
         cost_usd = 0.0
@@ -64,25 +68,69 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
         input_tokens = 0
         output_tokens = 0
         stop_reason = "unknown"
+        got_result = False
 
-        async for event in query(prompt=request.user_prompt, options=options):
-            if isinstance(event, AssistantMessage):
-                for block in event.content:
-                    if isinstance(block, TextBlock):
-                        final_text_parts.append(block.text)
-            elif isinstance(event, ResultMessage):
-                cost_usd = float(event.total_cost_usd or 0.0)
-                turns = int(event.num_turns or 0)
-                stop_reason = event.stop_reason or ("error" if event.is_error else "end_turn")
-                usage = cast(dict[str, Any], event.usage or {})
-                input_tokens = int(usage.get("input_tokens") or 0)
-                output_tokens = int(usage.get("output_tokens") or 0)
-                if event.is_error:
-                    logger.warning(
-                        "Claude Agent SDK reported error for agent={} stop={}",
+        tool_use_count = 0
+        try:
+            async for event in query(prompt=request.user_prompt, options=options):
+                if isinstance(event, AssistantMessage):
+                    for block in event.content:
+                        if isinstance(block, TextBlock):
+                            final_text_parts.append(block.text)
+                        elif isinstance(block, ToolUseBlock):
+                            tool_use_count += 1
+                            logger.info(
+                                "[{}] tool_use #{}: {} {}",
+                                request.agent_key,
+                                tool_use_count,
+                                block.name,
+                                _tool_input_preview(block.input),
+                            )
+                elif isinstance(event, ResultMessage):
+                    got_result = True
+                    cost_usd = float(event.total_cost_usd or 0.0)
+                    turns = int(event.num_turns or 0)
+                    stop_reason = event.stop_reason or ("error" if event.is_error else "end_turn")
+                    usage = cast(dict[str, Any], event.usage or {})
+                    input_tokens = int(usage.get("input_tokens") or 0)
+                    output_tokens = int(usage.get("output_tokens") or 0)
+                    if event.is_error:
+                        logger.warning(
+                            "Claude Agent SDK reported error for agent={} stop={}",
+                            request.agent_key,
+                            stop_reason,
+                        )
+        except Exception as exc:
+            # When the CLI hits max_turns mid-tool-use, it emits a final
+            # ResultMessage and THEN exits with code 1 — which the SDK surfaces
+            # as a generic "Command failed with exit code 1" exception with no
+            # stderr content. We've already captured the ResultMessage above,
+            # so this trailing exit is a soft timeout, not a crash: swallow it
+            # and let the caller see stop_reason=max_turns.
+            if got_result:
+                logger.info(
+                    "claude CLI exited after ResultMessage for agent={} "
+                    "(likely max_turns soft-timeout; stop={}): {}",
+                    request.agent_key, stop_reason, exc,
+                )
+                if stop_reason in ("tool_use", "unknown"):
+                    stop_reason = "max_turns"
+            else:
+                if stderr_lines:
+                    logger.error(
+                        "claude CLI stderr for agent={} (last {} lines):\n{}",
                         request.agent_key,
-                        stop_reason,
+                        len(stderr_lines),
+                        "\n".join(stderr_lines[-200:]),
                     )
+                raise
+        finally:
+            if stderr_lines:
+                logger.debug(
+                    "claude CLI stderr for agent={} ({} lines captured)",
+                    request.agent_key,
+                    len(stderr_lines),
+                )
 
         return CodeAgentResult(
             final_text="\n".join(final_text_parts),
@@ -96,7 +144,7 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
     def stream_task(self, request: CodeAgentRequest) -> AsyncIterator[str]:
         mcp_servers = _as_mcp_servers(request.extras.get("mcp_servers"))
         allowed_tool_names = _as_allowed_tools(request.extras.get("allowed_tool_names"))
-        options = self._build_options(request, mcp_servers, allowed_tool_names)
+        options = self._build_options(request, mcp_servers, allowed_tool_names, None)
 
         async def _iter() -> AsyncIterator[str]:
             async for event in query(prompt=request.user_prompt, options=options):
@@ -114,6 +162,7 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
         request: CodeAgentRequest,
         mcp_servers: dict[str, McpSdkServerConfig] | None,
         allowed_tool_names: Iterable[str] | None,
+        stderr_sink: list[str] | None,
     ) -> ClaudeAgentOptions:
         kwargs: dict[str, Any] = {
             "system_prompt": request.system_prompt or None,
@@ -129,7 +178,32 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
             kwargs["allowed_tools"] = list(allowed_tool_names)
         if self._cli_path:
             kwargs["cli_path"] = self._cli_path
+        if stderr_sink is not None:
+            # Capture CLI subprocess stderr line-by-line. Surfaced in logs on
+            # failure so "Command failed with exit code 1 — check stderr" is
+            # actually actionable.
+            def _on_stderr(line: str) -> None:
+                stderr_sink.append(line)
+            kwargs["stderr"] = _on_stderr
         return ClaudeAgentOptions(**kwargs)
+
+
+def _tool_input_preview(tool_input: Any) -> str:
+    """One-line preview of tool args for progress logs.
+
+    Trims long values so a grep pattern or a file path is readable but a
+    full ``read_file`` result payload doesn't explode a log line.
+    """
+    if not isinstance(tool_input, dict):
+        return str(tool_input)[:120]
+    parts: list[str] = []
+    for key, value in tool_input.items():
+        text = str(value)
+        if len(text) > 80:
+            text = text[:80] + "…"
+        parts.append(f"{key}={text!r}")
+    joined = " ".join(parts)
+    return joined[:240] + ("…" if len(joined) > 240 else "")
 
 
 def _as_mcp_servers(value: object) -> dict[str, McpSdkServerConfig] | None:

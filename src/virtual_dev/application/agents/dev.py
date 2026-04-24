@@ -107,7 +107,39 @@ _DEV_SYSTEM_BASE = (
     "  5. If you cannot make progress (e.g. the plan is unworkable, or "
     "external prerequisites are missing), still call `submit_mr` but set "
     "`status=\"failed\"` and explain in `notes`.\n"
+    "\n"
+    "Coding style (always enforced):\n"
+    "  * Comments explain WHY, not WHAT. A well-named identifier already "
+    "tells the reader what the code does; only write a comment when the "
+    "reason is non-obvious (hidden constraint, workaround, invariant).\n"
+    "  * Default is NO comment. Before writing one, ask: would a competent "
+    "reader need this to avoid a wrong assumption? If no — drop it.\n"
+    "  * Do not reference the ticket / this session / \"added for X\" in "
+    "code comments — that belongs in the MR description.\n"
+    "  * Do not add error handling, fallbacks or validation for scenarios "
+    "that can't happen. Trust internal code.\n"
+    "\n"
+    "MR submission:\n"
+    "  * The runtime prepends the ticket key to your title (e.g. "
+    "\"DM-123: ...\"); do NOT include the key yourself.\n"
+    "  * Title is a concise one-liner (<70 chars). Put details in "
+    "description.\n"
 )
+
+
+def _strip_ticket_prefix(title: str, external_id: str) -> str:
+    """Remove a leading ticket key the model might have prepended.
+
+    Models love echoing ``[DM-123]`` / ``DM-123:`` into the MR title even
+    when told not to; we strip it so the final MR title isn't doubled after
+    the runtime's own ``{key}: `` prefix.
+    """
+    stripped = title.strip()
+    for candidate in (f"[{external_id}]", f"{external_id}:", external_id):
+        if stripped.lower().startswith(candidate.lower()):
+            stripped = stripped[len(candidate):].lstrip(" :")
+            break
+    return stripped
 
 
 class DevAgent:
@@ -233,6 +265,10 @@ class DevAgent:
             description=self._render_mr_description(task_row, plan, captured),
             draft=self._settings.dev_mr_draft,
         )
+        logger.info(
+            "Dev[{}] opened MR !{} for {}: {}",
+            self._agent_key, mr.iid, external_id, mr.web_url,
+        )
 
         await self._persist_mr(task_row=task_row, mr=mr, branch=branch_name)
         await self._set_internal_status(task_row.id, TaskStatus.MR_OPEN)
@@ -357,11 +393,17 @@ class DevAgent:
         return "\n".join(parts)
 
     def _render_commit_message(self, task_row: TaskRow, submission: dict[str, Any]) -> str:
-        title = str(submission.get("title") or task_row.title)
+        title = _strip_ticket_prefix(
+            str(submission.get("title") or task_row.title),
+            task_row.external_id,
+        )
         return f"[{task_row.external_id}] {title}"
 
     def _render_mr_title(self, task_row: TaskRow, submission: dict[str, Any]) -> str:
-        title = str(submission.get("title") or task_row.title)
+        title = _strip_ticket_prefix(
+            str(submission.get("title") or task_row.title),
+            task_row.external_id,
+        )
         return f"{task_row.external_id}: {title}"
 
     def _render_mr_description(

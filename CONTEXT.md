@@ -129,7 +129,7 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
 
 ### Фаза 2 — СДЕЛАНО ✅
 - **VcsPort расширен** методами `current_branch`, `has_uncommitted_changes` (safety-хуки).
-- **`GitLabVcs` адаптер** (`adapters/vcs/gitlab.py`): локальные git-операции через `subprocess`, удалённые — через `python-gitlab`. Commits с bot identity через per-call `-c user.name/email` (никаких глобальных мутаций git config). Workspace: `{workspaces_dir}/{repo_key}/` — отдельный клон, не трогает твой `local_path`. `fetch_and_checkout` делает hard reset на `origin/<branch>` (защита от стрея от прошлых запусков).
+- **`GitLabVcs` адаптер** (`adapters/vcs/gitlab.py`): локальные git-операции через `subprocess`, удалённые — через `python-gitlab`. Commits с bot identity через per-call `-c user.name/email` (никаких глобальных мутаций git config). Workspace: если в `repositories.yaml` указан `local_path` — используется он (reuse пользовательского чекаута), иначе `{workspaces_dir}/{repo_key}/`. При использовании `local_path` — safety-check на чистоту дерева на входе (один раз за процесс), чтобы `reset --hard` / `checkout -B` не затёр несохранённые изменения. `fetch_and_checkout` делает hard reset на `origin/<branch>`.
 - **Bot identity** в `.env`: `DEV_GIT_AUTHOR_NAME="Virtual Dev"`, `DEV_GIT_AUTHOR_EMAIL`, `DEV_BRANCH_PREFIX="ai-dev"`, `DEV_MR_DRAFT=true`.
 - **`RulesLoader`** (`application/services/rules.py`): читает `config/rules/<agent_key>.md`, если нет — возвращает `""`. Splice'ится в system prompt Dev-агента.
 - **`DevAgent`** (`application/agents/dev.py`): подписан на `plan.ready` для конкретного `(repo, specialisation)` ключа. Pre-check: задача есть + READY план + `dor_satisfied` + `target_repo_key` совпадает. Готовит workspace (ensure_clone + create_branch). Запускает Claude Agent SDK в `cwd=workspace` с полным набором Read/Glob/Grep/Edit/Write/Bash + приватный MCP `submit_mr`. После submit: commit → push → create_merge_request (draft по дефолту). 4 исхода: `SKIPPED`, `NO_CHANGES`, `MR_OPENED`, `FAILED`. Каждый с переходом `TaskStatus` и записью в `MergeRequestRow`.
@@ -142,7 +142,7 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
 - **Docs**: `docs/ARCHITECTURE.md` обновлён (data flow Phase 2, safety rails с human gate, workspace isolation, bot identity).
 
 ### Решения в Phase 2, которых не было в CONTEXT.md — утвердили с пользователем
-- DevAgent работает в `{workspaces_dir}/{repo_key}/` (отдельный клон), НЕ в пользовательском `local_path`. Твой `local_path` — это reference-checkout для Analyst/Researcher (read-only).
+- DevAgent **уважает** `local_path` из `repositories.yaml` (как Researcher). Если указан — работает в пользовательском чекауте (с safety-check на uncommitted changes). Иначе клонирует в `{workspaces_dir}/{repo_key}/`. Было иначе (отдельный клон всегда), поменяли в ходе smoke-теста.
 - Коммиты: автор `Virtual Dev <virtual-dev@datamining.2gis.ru>`, push под твоим GitLab token.
 - Ветки: `ai-dev/<external_id>-<slug>`.
 - Task gate для Dev: `plan.status=READY` + `target_repo_key` установлен. Человеческий гейт — только метка `ai-dev` в Jira (на входе) и ревью MR (на выходе). Поле `task.dor_satisfied` в доменной модели осталось на будущее, но как шлюз Dev'а **не используется** (автономная работа).
@@ -156,6 +156,16 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
 - ✅ **Фаза 1** — Analyst + Researcher + Communicator (read-only). Планы через Claude Agent SDK, Jira-комменты, injection-фильтр, durable message bus.
 - ✅ **Фаза 2** — первый Dev-агент (bellingshausen backend) на отобранных "чистых" тикетах. GitLab VCS, workspace isolation, bot identity на коммитах, draft MR.
 - ✅ **Фаза 2.5** — RAG по истории MR. `EmbedderPort`+`FastembedEmbedder` (ONNX без torch) + `MrHistoryPort`+`LocalMrHistory` (SQLite blob + numpy cosine). Модель: `paraphrase-multilingual-MiniLM-L12-v2` (384 dim, ~220MB). Новая таблица `mr_history`, новый тул Researcher'а `search_mr_history` доступен Analyst'у и Dev'у. CLI: `virtual-dev index-mrs --repo <key>`.
+- ✅ **Phase 2 smoke-test стабилизация (2026-04-24)** — первый успешный end-to-end прогон `DM-3287 → MR !1000 в bellingshausen`. Разобрали пачку проблем:
+  1. `plan-task` / `dev-task` падали, если задача не в БД — добавили `_ensure_task_in_db` (auto-fetch из Jira).
+  2. Jira 401 — переключили с Basic на Bearer (PAT).
+  3. `claude` CLI exit code 1 при превышении `max_turns` в `tool_use` → SDK бросает generic Exception без stderr. Починили в адаптере `ClaudeAgentSdkCodeAgent`: capture stderr через callback + если ResultMessage уже получен — swallow exit-1 как soft-timeout (stop_reason=max_turns).
+  4. Бампнули лимиты: `analyst` 15→40, `developer` 30→80. 15 turns не хватало даже на разведку.
+  5. Прогресс-лог каждого `tool_use` в Claude-адаптере — видно чем занята модель.
+  6. VCS уважает `local_path` (раньше всегда клонил в workspaces), но с safety-check на dirty tree **один раз на входе**.
+  7. Double ticket prefix в MR title / commit msg (`Draft: DM-3287: [DM-3287] ...`) — `_strip_ticket_prefix` снимает ведущий `[KEY]`/`KEY:` с модели + инструкция в system prompt "не ставь префикс".
+  8. MR URL не логировался нигде → добавили `logger.info("opened MR !{iid}: {url}")` в `dev.py`.
+  9. Правила по комментариям ("зачем, а не что") — в `_DEV_SYSTEM_BASE` + `config/rules/dev-bellingshausen-{backend,frontend}.md`.
 - **Фаза 3** — Reviewer + DevOps + запись в Mattermost через Communicator. Полный цикл: бот пингует ревьюеров, реагирует на комменты, собирает апрувы, просит смержить.
 - **Фаза 4** — обкатка на реальных задачах всей команды.
 - **Фаза 5** — автопилот, все репо, фронт-агенты.
