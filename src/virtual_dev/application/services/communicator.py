@@ -167,8 +167,15 @@ class CommunicatorService:
                 message = await self._chat.send_to_channel(
                     channel_id, text, thread_root_id=thread_root_id,
                 )
-        except Exception:
-            logger.exception("Communicator: {} send failed to {!r}", kind, target_key)
+        except Exception as exc:
+            # Keep it terse: MM connect errors produce 100+ line urllib3
+            # tracebacks that drown the log. Debug builds can turn it back
+            # on via LOG_LEVEL=DEBUG.
+            logger.warning(
+                "Communicator: {} send failed to {!r}: {}: {}",
+                kind, target_key, type(exc).__name__, _short_cause(exc),
+            )
+            logger.debug("Communicator: full traceback", exc_info=True)
             return SendOutcome(sent=False, skip_reason="send_error")
 
         return SendOutcome(sent=True, message=message)
@@ -238,6 +245,24 @@ def _extract_root_id(url: str) -> str | None:
     if root:
         return root[0]
     return None
+
+
+def _short_cause(exc: BaseException) -> str:
+    """Walk the ``__cause__`` chain and return the innermost message.
+
+    Makes DNS / connection failures readable: the top-level exception is
+    usually ``requests.ConnectionError: HTTPSConnectionPool...`` and the
+    useful root is the ``gaierror`` a few frames deep.
+    """
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if cur.__cause__ is None and cur.__context__ is None:
+            break
+        cur = cur.__cause__ or cur.__context__
+    text = str(cur or exc)
+    return text.splitlines()[0][:200] if text else type(exc).__name__
 
 
 def _is_within_working_hours(now: datetime, cfg: "WorkingHoursCfg") -> bool:
