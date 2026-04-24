@@ -1,14 +1,40 @@
 # Локальные переопределения для твоей машины.
 # Этот файл НЕ в git (см. .gitignore). Скопируй в config/local.yaml и правь.
 #
-# Любое поле из repositories.yaml / agents.yaml / mappings.yaml можно переопределить здесь.
-# Приоритет: local.yaml > agents.yaml / repositories.yaml / mappings.yaml.
+# Три секции:
+#   repositories_patch  — точечные правки в отдельных репах из repositories.yaml,
+#                          матчинг по key. Используй для local_path и т.п.
+#   agents_override     — deep-merge поверх agents.yaml (любой раздел).
+#   mappings_override   — deep-merge поверх mappings.yaml.
+#
+# _deep_merge: словари мержит рекурсивно, списки ЗАМЕНЯЕТ целиком. Поэтому
+# для правки одной репы из списка используется repositories_patch, а не
+# repositories_override.
 
-# Пример: у меня локально другой путь к репо
-# repositories:
-#   - key: bellingshausen
-#     local_path: /Users/andreyvolobuev/Documents/2gis/bellingshausen
+# --- Машино-зависимые пути к клонам.
+# repositories_patch:
+#   bellingshausen:
+#     local_path: /home/you/code/bellingshausen
+#   rainbow:
+#     local_path: /home/you/code/rainbow
 
-# Пример: для тестов хочу смотреть только один тикет
-# task_source:
-#   jql: 'key = "DM-1234"'
+# --- Персональные настройки поведения агентов.
+# agents_override:
+#   # Твой MM-хендл для эскалаций (Reviewer шлёт DM при простое MR).
+#   escalation:
+#     mattermost_user: your.handle
+#
+#   # Для отладки на одной задаче без JQL-фильтра на assignee:
+#   task_source:
+#     jql: 'key = "DM-1234"'
+
+# --- Куда бот постит уведомления.
+# mappings_override:
+#   # MM channel id (не имя!). Как узнать: в MM ⓘ → Copy channel link или
+#   # GET /api/v4/channels/name/<team>/<channel> → поле "id".
+#   team_channels:
+#     bellingshausen: "c8xxxxxxxxxxxxxxxxxxxxxxxx"
+#     default: "c8xxxxxxxxxxxxxxxxxxxxxxxx"
+#   # Резолв email → MM-handle для "спроси автора коммита".
+#   email_to_mattermost:
+#     "ivan.ivanov@example.com": "ivanov"

@@ -16,9 +16,14 @@ component_to_repo:
   # "Bellingshausen API": bellingshausen
   # "Rainbow": rainbow
 
-# Команда → канал в Mattermost (куда писать "ребята, подскажите").
-team_channels:
-  datamining: "datamining-general"  # замени на реальное имя канала
+# repo_key → MM channel id (куда Reviewer / DevOps шлют пинги про этот репо).
+# Лукап: сначала <repo_key>, потом <default>. Значения — **channel id**, не имя.
+# Как получить id: открой канал в MM → ⓘ → Copy channel link, либо
+# curl /api/v4/channels/name/<team-id>/<channel-name>.
+#
+# Каналы — персональные данные; держи их в config/local.yaml (gitignored),
+# а не здесь. Этот файл в git видят все.
+team_channels: {}
 
 # Шаблон сообщения-дисклеймера бота (первое сообщение в треде / в личке).
 disclaimer_template: |

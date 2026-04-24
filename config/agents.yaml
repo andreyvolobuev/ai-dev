@@ -76,4 +76,4 @@ review_policy:
 
 # Эскалация: куда писать, когда бот застрял.
 escalation:
-  mattermost_user: your.name  # твой mm-username, замени
+  mattermost_user: ""  # твой MM-хендл — переопредели в config/local.yaml (gitignored)

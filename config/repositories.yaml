@@ -25,7 +25,7 @@
 repositories:
   - key: bellingshausen
     url: git@gitlab.2gis.ru:sd-data-mining/bellingshausen.git
-    local_path: /Users/andreyvolobuev/Documents/2gis/bellingshausen
+    # local_path — машино-зависимо; задаётся в config/local.yaml (gitignored).
     description: "Монорепа (бэкенд + фронтенд)."
     jira_components: []  # заполнишь позже
     default_branch: master   # проверь, возможно main
