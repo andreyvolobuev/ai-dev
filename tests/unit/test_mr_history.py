@@ -106,6 +106,14 @@ class _FakeVcsWithMergedMrs(VcsPort):
     async def merge(self, repo_key: str, iid: int) -> None:  # pragma: no cover
         raise NotImplementedError
 
+    async def get_mr_approvals(self, repo_key: str, iid: int):  # pragma: no cover
+        raise NotImplementedError
+
+    async def get_latest_pipeline_jobs(
+        self, repo_key: str, iid: int, *, log_tail_lines: int = 80
+    ):  # pragma: no cover
+        raise NotImplementedError
+
 
 def _mr(iid: int, title: str, description: str = "") -> MergeRequest:
     return MergeRequest(

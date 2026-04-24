@@ -30,8 +30,10 @@ from gitlab import Gitlab
 from loguru import logger
 
 from virtual_dev.domain.models.merge_request import (
+    ApprovalInfo,
     MergeRequest,
     MRStatus,
+    PipelineJob,
     PipelineStatus,
     ReviewComment,
 )
@@ -262,6 +264,72 @@ class GitLabVcs(VcsPort):
 
         await asyncio.to_thread(_run)
 
+    async def get_mr_approvals(self, repo_key: str, iid: int) -> ApprovalInfo:
+        def _run() -> ApprovalInfo:
+            project = self._client.projects.get(self._project_path(repo_key))
+            mr = project.mergerequests.get(iid)
+            try:
+                approvals = mr.approvals.get()
+            except Exception:
+                logger.exception("get_mr_approvals: failed for {}!{}", repo_key, iid)
+                return ApprovalInfo()
+            raw = getattr(approvals, "approved_by", None) or []
+            approved_by: list[str] = []
+            for item in raw:
+                # GitLab shape: [{"user": {"username": "..."}}, ...]
+                if isinstance(item, dict):
+                    user = item.get("user") or {}
+                    name = str(user.get("username") or "")
+                    if name:
+                        approved_by.append(name)
+            required = int(getattr(approvals, "approvals_required", 0) or 0) or 1
+            return ApprovalInfo(approved_by=approved_by, required=required)
+
+        return await asyncio.to_thread(_run)
+
+    async def get_latest_pipeline_jobs(
+        self, repo_key: str, iid: int, *, log_tail_lines: int = 80
+    ) -> list[PipelineJob]:
+        def _run() -> list[PipelineJob]:
+            project = self._client.projects.get(self._project_path(repo_key))
+            mr = project.mergerequests.get(iid)
+            try:
+                pipelines = mr.pipelines.list(per_page=1, get_all=False)
+            except Exception:
+                logger.exception(
+                    "get_latest_pipeline_jobs: list pipelines failed {}!{}", repo_key, iid,
+                )
+                return []
+            if not pipelines:
+                return []
+            pipeline_raw = pipelines[0]
+            try:
+                pipeline = project.pipelines.get(pipeline_raw.id)
+                raw_jobs = pipeline.jobs.list(all=True)
+            except Exception:
+                logger.exception(
+                    "get_latest_pipeline_jobs: fetch jobs failed {}!{}", repo_key, iid,
+                )
+                return []
+            out: list[PipelineJob] = []
+            for job in raw_jobs:
+                attrs = getattr(job, "attributes", None) or {}
+                job_id = int(attrs.get("id") or getattr(job, "id", 0))
+                name = str(attrs.get("name") or "")
+                stage = str(attrs.get("stage") or "")
+                status = str(attrs.get("status") or "")
+                web_url = str(attrs.get("web_url") or "")
+                tail = ""
+                if log_tail_lines > 0 and status == "failed":
+                    tail = _fetch_job_log_tail(project, job_id, log_tail_lines)
+                out.append(PipelineJob(
+                    id=job_id, name=name, stage=stage, status=status,
+                    web_url=web_url, log_excerpt=tail,
+                ))
+            return out
+
+        return await asyncio.to_thread(_run)
+
     # --- helpers ---
 
     def _repo(self, repo_key: str) -> RepositoryCfg:
@@ -391,3 +459,25 @@ def _comment_from_gitlab(note: Any, iid: int) -> ReviewComment:
         body=str(getattr(note, "body", "")),
         resolved=bool(getattr(note, "resolvable", False) and getattr(note, "resolved", False)),
     )
+
+
+def _fetch_job_log_tail(project: Any, job_id: int, tail_lines: int) -> str:
+    """Pull the last ``tail_lines`` of a failing job's trace.
+
+    GitLab jobs.trace() streams bytes; we keep only the tail so the
+    DevOpsAgent's log doesn't blow up for a 20MB build log.
+    """
+    try:
+        job = project.jobs.get(job_id)
+        raw = job.trace()
+    except Exception:
+        logger.exception("fetch_job_log_tail: job={} failed", job_id)
+        return ""
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        text = str(raw)
+    lines = text.splitlines()
+    if len(lines) > tail_lines:
+        lines = lines[-tail_lines:]
+    return "\n".join(lines)

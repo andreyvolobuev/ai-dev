@@ -156,6 +156,20 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
 - ✅ **Фаза 1** — Analyst + Researcher + Communicator (read-only). Планы через Claude Agent SDK, Jira-комменты, injection-фильтр, durable message bus.
 - ✅ **Фаза 2** — первый Dev-агент (bellingshausen backend) на отобранных "чистых" тикетах. GitLab VCS, workspace isolation, bot identity на коммитах, draft MR.
 - ✅ **Фаза 2.5** — RAG по истории MR. `EmbedderPort`+`FastembedEmbedder` (ONNX без torch) + `MrHistoryPort`+`LocalMrHistory` (SQLite blob + numpy cosine). Модель: `paraphrase-multilingual-MiniLM-L12-v2` (384 dim, ~220MB). Новая таблица `mr_history`, новый тул Researcher'а `search_mr_history` доступен Analyst'у и Dev'у. CLI: `virtual-dev index-mrs --repo <key>`.
+- ✅ **Фаза 3 — СДЕЛАНО (2026-04-24)** — Reviewer + DevOps + write-side Communicator. Теперь бот не только открывает MR, но и ведёт его до мержа: поллит комменты, считает апрувы, пингует ревьюеров, эскалирует тимлиду при простое, замечает красный CI и сигналит в MM.
+  - **Mattermost write-side** (`adapters/chat/mattermost.py`): `send_direct` (через `create_direct_message_channel`) и `send_to_channel`. WebSocket `subscribe` пока `NotImplementedError` — Phase 3 работает на polling'е, MM-входящие не нужны.
+  - **Communicator расширен** (`application/services/communicator.py`): `send_dm`, `send_channel` (с rate-limit: sliding window per target по `rate_limit_per_hour` из конфига) + working-hours gate (`WorkingHoursCfg`, tz Europe/Moscow, 10–20 пн–пт; отключается `COMMUNICATOR_RESPECT_WORKING_HOURS=false` в env). `resolve_user_id(username|email)` — единая точка lookup'a. Новый DTO `SendOutcome(sent, skip_reason)` — агенты видят, почему сообщение не ушло.
+  - **VcsPort расширен**: `get_mr_approvals` → `ApprovalInfo(approved_by, required, count)`, `get_latest_pipeline_jobs` → `list[PipelineJob]` с tail'ом лога для failing-job'ов. В `GitLabVcs` — реализация через `mr.approvals.get()` и `project.pipelines.get(id).jobs.list(all=True)` + `job.trace()` для N последних строк лога.
+  - **`ReviewerAgent`** (`application/agents/reviewer.py`): на каждый tick проходит по открытым MR из БД, diff'ит комменты против `last_seen_comment_id`, классифицирует эвристиками (`classify_comment` → approval_hint / question / change_request / chatter). Новые human-комменты релеит в MM (канал `mappings.team_channels[repo_key]` или DM `escalation.mattermost_user`). При достижении порога апрувов (`review_policy.required_approvals`) — публикует `mr.approved` + пинг "please merge". Escalation policy: `ping_reviewers_after_hours` → один пинг в канал, `escalate_after_hours` → DM тимлиду. Учёт состояния в `MergeRequestRow.{last_seen_comment_id, last_activity_at, ping_reviewers_at, last_escalation_at}`.
+  - **`DevOpsAgent`** (`application/agents/devops.py`): опрашивает `get_latest_pipeline_jobs` для всех открытых MR. Detect: transition "any-state → failed" — постит в MM summary с failing-job логами. Idempotent: `last_pipeline_notified_status="failed"` блокирует повторное уведомление; recovery (→ success) очищает флаг. Авто-фикса нет (осознанно — оставлено на будущее).
+  - **`PollerWorker`** (`runtime/workers/poller.py`): простая "каждые N секунд вызови список tick-callables" обёртка; мы запускаем под ней `reviewer.tick` и `devops.tick` из web lifespan. Интервалы в `.env`: `REVIEW_POLL_INTERVAL_SECONDS=180`, `PIPELINE_POLL_INTERVAL_SECONDS=120`.
+  - **Новые topic'и на шине** (`application/agents/orchestrator.py`): `mr.comment`, `mr.approved`, `mr.stuck`, `pipeline.failed`. Использование — информационное (события для будущего Reviewer-LLM-inbox), шина не блокирующая.
+  - **Новые колонки MR**: `last_seen_comment_id`, `last_activity_at`, `last_pipeline_notified_status`, `last_escalation_at`, `ping_reviewers_at`. Старую БД пришлось пересоздать: `rm data/virtual_dev.db && virtual-dev db init`.
+  - **Container / web app**: `Container.reviewer / .devops`, в web lifespan поднимаются 2 дополнительные `PollerWorker`-таски, `/healthz` показывает их статусы + статы.
+  - **CLI**: `virtual-dev review-mrs` и `virtual-dev watch-ci` — one-shot тики для smoke-теста.
+  - **Тесты**: 91 unit (было 72). Новое — 19: `test_communicator_write` (6), `test_reviewer` (9), `test_devops` (4). Фейки SDK / GitLab API не поднимаются — тесты дергают `.tick()` со стабом `VcsPort` и recording-Chat'ом.
+  - **Побочный фикс**: убрали eager `from .container import ...` в `infrastructure/__init__.py`, иначе `application.services` → `container` → `application.services` циркуляр бьёт при `from virtual_dev.application.agents import ...`. Теперь тесты / CLI импортируют из `virtual_dev.infrastructure.container` явно.
+
 - ✅ **Phase 2 smoke-test стабилизация (2026-04-24)** — первый успешный end-to-end прогон `DM-3287 → MR !1000 в bellingshausen`. Разобрали пачку проблем:
   1. `plan-task` / `dev-task` падали, если задача не в БД — добавили `_ensure_task_in_db` (auto-fetch из Jira).
   2. Jira 401 — переключили с Basic на Bearer (PAT).
@@ -166,9 +180,9 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
   7. Double ticket prefix в MR title / commit msg (`Draft: DM-3287: [DM-3287] ...`) — `_strip_ticket_prefix` снимает ведущий `[KEY]`/`KEY:` с модели + инструкция в system prompt "не ставь префикс".
   8. MR URL не логировался нигде → добавили `logger.info("opened MR !{iid}: {url}")` в `dev.py`.
   9. Правила по комментариям ("зачем, а не что") — в `_DEV_SYSTEM_BASE` + `config/rules/dev-bellingshausen-{backend,frontend}.md`.
-- **Фаза 3** — Reviewer + DevOps + запись в Mattermost через Communicator. Полный цикл: бот пингует ревьюеров, реагирует на комменты, собирает апрувы, просит смержить.
+- ✅ **Фаза 3** — Reviewer + DevOps + запись в Mattermost. Полный цикл: бот пингует ревьюеров, классифицирует комменты, собирает апрувы, замечает красный CI, эскалирует тимлиду при простое. Мерж — ручной (человек).
 - **Фаза 4** — обкатка на реальных задачах всей команды.
-- **Фаза 5** — автопилот, все репо, фронт-агенты.
+- **Фаза 5** — автопилот, все репо, фронт-агенты, auto-fix CI DevOps-агентом, LLM-классификация комментов (замена эвристик из Phase 3).
 
 ## Стиль работы
 - Пиши по-русски в ответах, в коде — английский (docstrings тоже английский, но допустимы русские комментарии для бизнес-контекста).

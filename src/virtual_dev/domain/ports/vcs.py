@@ -5,7 +5,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
-from virtual_dev.domain.models.merge_request import MergeRequest, ReviewComment
+from virtual_dev.domain.models.merge_request import (
+    ApprovalInfo,
+    MergeRequest,
+    PipelineJob,
+    ReviewComment,
+)
 
 
 class VcsPort(ABC):
@@ -99,3 +104,17 @@ class VcsPort(ABC):
     @abstractmethod
     async def merge(self, repo_key: str, iid: int) -> None:
         """Merge an MR. In production rarely used by the bot — humans merge."""
+
+    @abstractmethod
+    async def get_mr_approvals(self, repo_key: str, iid: int) -> ApprovalInfo:
+        """Return the current approval state for an MR."""
+
+    @abstractmethod
+    async def get_latest_pipeline_jobs(
+        self, repo_key: str, iid: int, *, log_tail_lines: int = 80
+    ) -> Sequence[PipelineJob]:
+        """Return jobs of the MR's latest pipeline.
+
+        ``log_tail_lines`` controls how much trailing log DevOpsAgent pulls
+        per failing job (0 disables log fetching).
+        """

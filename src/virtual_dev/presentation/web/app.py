@@ -26,11 +26,16 @@ from virtual_dev.application.agents.orchestrator import (
     TOPIC_TASK_DISCOVERED,
     dev_agent_key,
 )
-from virtual_dev.infrastructure import Container
+from virtual_dev.infrastructure.container import Container
 from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow, TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
-from virtual_dev.runtime.workers import AgentRunner, AnalystInbox, DevInbox
+from virtual_dev.runtime.workers import (
+    AgentRunner,
+    AnalystInbox,
+    DevInbox,
+    PollerWorker,
+)
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
@@ -102,6 +107,17 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             dev_agents.append(dev)
             dev_runners.append(runner)
 
+    reviewer_poller = PollerWorker(
+        name="reviewer",
+        interval_seconds=container.settings.review_poll_interval_seconds,
+        ticks={"reviewer": container.reviewer.tick},
+    )
+    devops_poller = PollerWorker(
+        name="devops",
+        interval_seconds=container.settings.pipeline_poll_interval_seconds,
+        ticks={"devops": container.devops.tick},
+    )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         background: list[asyncio.Task[None]] = []
@@ -110,8 +126,15 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             background.append(asyncio.create_task(analyst_runner.run_forever(), name="analyst-runner"))
             for runner in dev_runners:
                 background.append(asyncio.create_task(runner.run_forever(), name=runner.agent_key))
+            if container.vcs is not None:
+                background.append(asyncio.create_task(
+                    reviewer_poller.run_forever(), name="reviewer-poller",
+                ))
+                background.append(asyncio.create_task(
+                    devops_poller.run_forever(), name="devops-poller",
+                ))
             logger.info(
-                "Started: orchestrator + analyst-runner + {} dev runner(s)",
+                "Started: orchestrator + analyst-runner + {} dev runner(s) + reviewer/devops pollers",
                 len(dev_runners),
             )
         try:
@@ -121,6 +144,8 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             await analyst_runner.stop()
             for runner in dev_runners:
                 await runner.stop()
+            await reviewer_poller.stop()
+            await devops_poller.stop()
             for task in background:
                 try:
                     await asyncio.wait_for(task, timeout=5)
@@ -141,6 +166,10 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             "dev_runners": [
                 {"key": r.agent_key, "running": r.is_running} for r in dev_runners
             ],
+            "reviewer_poller_running": reviewer_poller.is_running,
+            "devops_poller_running": devops_poller.is_running,
+            "reviewer_stats": reviewer_poller.stats.__dict__,
+            "devops_stats": devops_poller.stats.__dict__,
             "jira_configured": container.task_tracker is not None,
             "chat_configured": container.chat is not None,
             "kb_configured": container.knowledge_base is not None,
@@ -241,6 +270,8 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         await analyst_runner.stop()
         for runner in dev_runners:
             await runner.stop()
+        await reviewer_poller.stop()
+        await devops_poller.stop()
         logger.warning("Kill-switch pressed via web")
         return {"status": "stopping"}
 

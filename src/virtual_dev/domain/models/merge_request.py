@@ -38,6 +38,35 @@ class ReviewComment:
 
 
 @dataclass
+class ApprovalInfo:
+    """State of approvals on one MR.
+
+    Flat list of usernames because our reviewer workflow asks simple
+    questions: "how many approved", "did `foo` approve". We don't need
+    the per-approval metadata (timestamps, etc.).
+    """
+
+    approved_by: list[str] = field(default_factory=list)
+    required: int = 1
+
+    @property
+    def count(self) -> int:
+        return len(self.approved_by)
+
+
+@dataclass
+class PipelineJob:
+    """One CI job in an MR's latest pipeline (for DevOpsAgent diagnosis)."""
+
+    id: int
+    name: str
+    stage: str
+    status: str               # raw GitLab status ("failed", "success", ...)
+    web_url: str
+    log_excerpt: str = ""     # trailing N lines of the job log, populated on demand
+
+
+@dataclass
 class MergeRequest:
     """Merge Request / Pull Request."""
 

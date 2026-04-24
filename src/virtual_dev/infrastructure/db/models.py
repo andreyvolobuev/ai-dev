@@ -80,6 +80,16 @@ class MergeRequestRow(Base):
     approvals_required: Mapped[int] = mapped_column(Integer, default=1)
     pipeline_status: Mapped[str] = mapped_column(String(16), default="unknown")
     pipeline_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # Review bookkeeping (Phase 3). last_seen_comment_id is the id of the last
+    # comment we processed; last_activity_at is the last time anything
+    # happened (new comment, approval, pipeline flip) — used by the
+    # escalation policy. last_pipeline_notified_status lets DevOps avoid
+    # re-posting when a red pipeline reruns and stays red.
+    last_seen_comment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_activity_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_pipeline_notified_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_escalation_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    ping_reviewers_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 

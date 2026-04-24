@@ -124,6 +124,14 @@ class _FakeVcs(VcsPort):
     async def merge(self, repo_key: str, iid: int) -> None:  # pragma: no cover
         raise NotImplementedError
 
+    async def get_mr_approvals(self, repo_key: str, iid: int) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+    async def get_latest_pipeline_jobs(
+        self, repo_key: str, iid: int, *, log_tail_lines: int = 80
+    ) -> Sequence[Any]:  # pragma: no cover
+        raise NotImplementedError
+
     # --- test helpers ---
 
     def simulate_edit(self, path: str) -> None:

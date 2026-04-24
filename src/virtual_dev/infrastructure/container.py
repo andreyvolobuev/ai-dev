@@ -23,6 +23,8 @@ from virtual_dev.adapters.mr_history import LocalMrHistory
 from virtual_dev.adapters.secrets import EnvSecrets
 from virtual_dev.adapters.task_tracker import JiraTaskTracker
 from virtual_dev.adapters.vcs import GitIdentity, GitLabVcs
+from virtual_dev.application.agents.devops import DevOpsAgent
+from virtual_dev.application.agents.reviewer import ReviewerAgent
 from virtual_dev.application.services import (
     CommunicatorService,
     InjectionFilter,
@@ -71,6 +73,8 @@ class Container:
     researcher: ResearcherToolkit
     communicator: CommunicatorService
     rules_loader: RulesLoader
+    reviewer: ReviewerAgent
+    devops: DevOpsAgent
 
     async def init_db(self) -> None:
         """Create all tables. Used by ``virtual-dev db init``."""
@@ -184,8 +188,36 @@ def build_container(config_dir: Path | str = "config") -> Container:
         injection_filter=injection_filter,
         mr_history=mr_history,
     )
-    communicator = CommunicatorService(chat, injection_filter)
+    communicator_cfg = config.agents.agents.get("communicator")
+    communicator_rate = (
+        communicator_cfg.rate_limit_per_hour
+        if communicator_cfg and communicator_cfg.rate_limit_per_hour
+        else 20
+    )
+    communicator = CommunicatorService(
+        chat,
+        injection_filter,
+        working_hours=config.agents.working_hours,
+        rate_limit_per_hour=communicator_rate,
+        respect_working_hours=settings.communicator_respect_working_hours,
+    )
     rules_loader = RulesLoader(Path(config_dir) / "rules")
+
+    reviewer = ReviewerAgent(
+        vcs=vcs,
+        communicator=communicator,
+        session_factory=session_factory,
+        config=config,
+        message_bus=message_bus,
+        bot_username=settings.mattermost_bot_username or settings.dev_git_author_name,
+    )
+    devops = DevOpsAgent(
+        vcs=vcs,
+        communicator=communicator,
+        session_factory=session_factory,
+        config=config,
+        message_bus=message_bus,
+    )
 
     return Container(
         settings=settings,
@@ -206,6 +238,8 @@ def build_container(config_dir: Path | str = "config") -> Container:
         researcher=researcher,
         communicator=communicator,
         rules_loader=rules_loader,
+        reviewer=reviewer,
+        devops=devops,
     )
 
 

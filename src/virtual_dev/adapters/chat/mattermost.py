@@ -1,8 +1,14 @@
-"""Mattermost adapter — Phase 1 is **read-only**.
+"""Mattermost adapter.
 
-``send_direct`` / ``send_to_channel`` / ``subscribe`` intentionally raise so
-we never leak a bot-authored message into a human channel before the review
-cycle around the Communicator agent is in place (Phase 3).
+Reads (``read_thread``, ``find_user_by_*``) — always enabled.
+
+Writes (``send_direct``, ``send_to_channel``) — enabled from Phase 3 for
+the Communicator agent to ping reviewers / escalate / answer questions.
+Rate-limiting and working-hours policy live in
+:class:`virtual_dev.application.services.CommunicatorService`, not here.
+
+``subscribe`` (websocket listener) stays unimplemented: Phase 3 uses
+polling of GitLab MR comments instead of MM incoming.
 
 The underlying library ``mattermostdriver`` is synchronous; calls are wrapped
 in ``asyncio.to_thread``.
@@ -56,6 +62,14 @@ class MattermostChat(ChatPort):
             self._driver.login()
             self._logged_in = True
 
+    def _bot_user_id(self) -> str:
+        """Return the authenticated user's id (our bot token → bot account)."""
+        self._ensure_login()
+        me = self._driver.users.get_user("me")
+        if not isinstance(me, dict) or not me.get("id"):
+            raise RuntimeError("Could not resolve Mattermost bot user id from /users/me")
+        return str(me["id"])
+
     # --- Phase-1 allowed methods ---
 
     async def read_thread(self, thread_root_id: str) -> Sequence[ChatMessage]:
@@ -96,25 +110,44 @@ class MattermostChat(ChatPort):
 
         return await asyncio.to_thread(_fetch)
 
-    # --- Phase-1 forbidden methods ---
+    # --- Writes (Phase 3) ---
 
-    async def send_direct(self, user_id: str, text: str) -> ChatMessage:  # pragma: no cover
-        raise NotImplementedError(
-            "Mattermost writes are disabled in Phase 1 — the Communicator agent "
-            "does not send messages yet."
-        )
+    async def send_direct(self, user_id: str, text: str) -> ChatMessage:
+        def _run() -> ChatMessage:
+            self._ensure_login()
+            bot_id = self._bot_user_id()
+            channel = self._driver.channels.create_direct_message_channel(
+                options=[bot_id, user_id]
+            )
+            if not isinstance(channel, dict) or not channel.get("id"):
+                raise RuntimeError(
+                    f"create_direct_message_channel returned unexpected: {channel!r}"
+                )
+            post = self._driver.posts.create_post(
+                options={"channel_id": str(channel["id"]), "message": text}
+            )
+            return self._post_to_message(cast(dict[str, Any], post))
+
+        return await asyncio.to_thread(_run)
 
     async def send_to_channel(
         self, channel_id: str, text: str, thread_root_id: str | None = None
-    ) -> ChatMessage:  # pragma: no cover
-        raise NotImplementedError(
-            "Mattermost writes are disabled in Phase 1 — the Communicator agent "
-            "does not send messages yet."
-        )
+    ) -> ChatMessage:
+        def _run() -> ChatMessage:
+            self._ensure_login()
+            options: dict[str, Any] = {"channel_id": channel_id, "message": text}
+            if thread_root_id:
+                options["root_id"] = thread_root_id
+            post = self._driver.posts.create_post(options=options)
+            return self._post_to_message(cast(dict[str, Any], post))
+
+        return await asyncio.to_thread(_run)
 
     def subscribe(self) -> AsyncIterator[ChatMessage]:  # pragma: no cover
+        # Phase 3 polls GitLab for MR comments; MM inbound is not needed yet.
         raise NotImplementedError(
-            "Mattermost websocket subscription will be wired up in Phase 3."
+            "Mattermost websocket subscription is not wired up — Phase 3 uses "
+            "polling of GitLab MR comments."
         )
 
     # --- helpers ---

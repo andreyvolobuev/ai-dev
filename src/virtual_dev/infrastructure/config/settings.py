@@ -56,3 +56,12 @@ class Settings(BaseSettings):
     web_port: int = 8080
 
     log_level: str = Field(default="INFO")
+
+    # --- Phase 3 ---
+    # How often Reviewer / DevOps scan open MRs. Tight enough for feedback,
+    # loose enough not to hammer the GitLab API.
+    review_poll_interval_seconds: int = 180
+    pipeline_poll_interval_seconds: int = 120
+    # When False, Communicator sends messages outside working hours anyway.
+    # Useful for demos / manual smoke tests; production should keep True.
+    communicator_respect_working_hours: bool = False

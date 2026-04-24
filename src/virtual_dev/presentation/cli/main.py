@@ -8,7 +8,7 @@ import typer
 import uvicorn
 from rich.console import Console
 
-from virtual_dev.infrastructure import build_container
+from virtual_dev.infrastructure.container import build_container
 from virtual_dev.infrastructure.logging import configure_logging
 from virtual_dev.presentation.web import create_app
 
@@ -121,6 +121,58 @@ def index_mrs(
 
     count = asyncio.run(_run())
     console.print(f"[green]Indexed {count} merged MRs for {repo}[/green]")
+
+
+@app.command("review-mrs")
+def review_mrs() -> None:
+    """Run one ReviewerAgent tick against all open MRs in the DB.
+
+    Fetches new human comments, checks approval counts, applies the
+    escalation policy. Writes to Mattermost via Communicator (subject
+    to rate-limit + working-hours policy).
+    """
+    _bootstrap()
+    container = build_container()
+    if container.vcs is None:
+        console.print("[red]Reviewer requires VCS (GitLab token) to be configured[/red]")
+        raise typer.Exit(code=1)
+
+    async def _run() -> None:
+        stats = await container.reviewer.tick()
+        await container.dispose()
+        console.print(
+            f"[green]Reviewer tick[/green]  mrs={stats.mrs_checked}  "
+            f"new_comments={stats.new_comments}  approvals_sent={stats.approvals_sent}  "
+            f"pings={stats.pings_sent}  escalations={stats.escalations_sent}"
+        )
+
+    asyncio.run(_run())
+
+
+@app.command("watch-ci")
+def watch_ci() -> None:
+    """Run one DevOpsAgent tick against all open MRs in the DB.
+
+    Polls latest pipeline jobs; when a pipeline flips red, pings MM via
+    Communicator. Idempotent: stays quiet on subsequent ticks with the
+    same red status.
+    """
+    _bootstrap()
+    container = build_container()
+    if container.vcs is None:
+        console.print("[red]DevOps requires VCS (GitLab token) to be configured[/red]")
+        raise typer.Exit(code=1)
+
+    async def _run() -> None:
+        stats = await container.devops.tick()
+        await container.dispose()
+        console.print(
+            f"[green]DevOps tick[/green]  mrs={stats.mrs_checked}  "
+            f"failures_detected={stats.failures_detected}  "
+            f"notifications_sent={stats.notifications_sent}"
+        )
+
+    asyncio.run(_run())
 
 
 @app.command("dev-task")
