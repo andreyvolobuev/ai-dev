@@ -150,8 +150,43 @@ class GitLabVcs(VcsPort):
         return sha
 
     async def push(self, repo_key: str, branch: str) -> None:
+        """Push with limited retry.
+
+        GitLab occasionally answers ``Internal API unreachable`` or
+        similar transient errors on otherwise-healthy clusters. We've
+        already invested turns into the commit by this point — a quick
+        retry loop avoids throwing the whole Dev-agent run away.
+        """
         path = await self._ensure_local(repo_key)
-        await self._run_git(path, "push", "--set-upstream", "origin", branch)
+        last_exc: VcsError | None = None
+        for attempt in range(1, 4):
+            try:
+                await self._run_git(path, "push", "--set-upstream", "origin", branch)
+                if attempt > 1:
+                    logger.info("git push succeeded on attempt {}/3", attempt)
+                return
+            except VcsError as exc:
+                message = str(exc)
+                transient = any(
+                    marker in message for marker in (
+                        "Internal API unreachable",
+                        "could not resolve host",
+                        "Connection reset",
+                        "early EOF",
+                        "HTTP 5",
+                    )
+                )
+                if not transient or attempt == 3:
+                    raise
+                last_exc = exc
+                wait = 2 * attempt
+                logger.warning(
+                    "git push failed (attempt {}/3): {}. Retrying in {}s",
+                    attempt, message.splitlines()[0][:160], wait,
+                )
+                await asyncio.sleep(wait)
+        assert last_exc is not None
+        raise last_exc
 
     async def current_branch(self, repo_key: str) -> str:
         path = await self._ensure_local(repo_key)
