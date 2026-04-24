@@ -44,6 +44,12 @@ class _RecordingChat(ChatPort):
             return ChatUser(id="uid-alice", username="alice")
         return None
 
+    async def add_reaction(self, post_id: str, emoji_name: str) -> None:  # pragma: no cover
+        return None
+
+    async def get_post(self, post_id: str) -> ChatMessage | None:  # pragma: no cover
+        return None
+
     def subscribe(self) -> AsyncIterator[ChatMessage]:  # pragma: no cover
         raise NotImplementedError
 

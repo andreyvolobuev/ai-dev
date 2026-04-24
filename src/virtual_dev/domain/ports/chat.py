@@ -11,8 +11,9 @@ from virtual_dev.domain.models.chat import ChatMessage, ChatUser
 class ChatPort(ABC):
     """Abstraction over a team chat.
 
-    Only ``send_*`` and ``subscribe`` are considered side-effects that can
-    reach humans — the Communicator agent is the only caller in Phases 0-1.
+    ``send_*`` and ``subscribe`` are side-effects that reach humans —
+    gate them through :class:`~virtual_dev.application.services.CommunicatorService`
+    where rate limits and working-hours policy apply.
     """
 
     @abstractmethod
@@ -38,5 +39,17 @@ class ChatPort(ABC):
         """Resolve a user by username. Returns ``None`` if not found."""
 
     @abstractmethod
+    async def add_reaction(self, post_id: str, emoji_name: str) -> None:
+        """Add an emoji reaction (by name, e.g. ``white_check_mark``) to a post.
+
+        Used as an idempotency marker so the bot doesn't re-process a
+        thread reply it has already handled.
+        """
+
+    @abstractmethod
+    async def get_post(self, post_id: str) -> ChatMessage | None:
+        """Fetch a single post by id, including its reactions."""
+
+    @abstractmethod
     def subscribe(self) -> AsyncIterator[ChatMessage]:
-        """Stream incoming chat messages (websocket-backed in real adapters)."""
+        """Stream incoming chat messages (WebSocket-backed in real adapters)."""

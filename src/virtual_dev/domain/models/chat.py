@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 
@@ -42,3 +42,5 @@ class ChatMessage:
     timestamp: datetime
     thread_root_id: str | None = None  # id корневого сообщения треда, если это ответ
     trusted: bool = False              # True только для наших собственных сообщений
+    reactions: list[str] = field(default_factory=list)  # emoji names кем-то проставленные
+    bot_reactions: list[str] = field(default_factory=list)  # emoji, которые поставил именно наш бот

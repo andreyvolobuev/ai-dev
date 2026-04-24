@@ -33,6 +33,12 @@ class _FakeChat(ChatPort):
     async def find_user_by_username(self, username: str) -> ChatUser | None:
         return None
 
+    async def add_reaction(self, post_id: str, emoji_name: str) -> None:  # pragma: no cover
+        return None
+
+    async def get_post(self, post_id: str) -> ChatMessage | None:  # pragma: no cover
+        return None
+
     def subscribe(self) -> AsyncIterator[ChatMessage]:  # pragma: no cover
         raise NotImplementedError
 

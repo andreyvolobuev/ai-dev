@@ -103,6 +103,11 @@ class MergeRequestRow(Base):
     # Whether we've already posted "please review" to the team channel for
     # this MR. Sent once when the MR transitions out of draft.
     review_ping_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # When we post the "please review" ping, we remember the MM channel +
+    # post id so the thread listener knows which thread roots belong to us
+    # and can route replies back to the Reviewer / Dev iteration path.
+    review_thread_channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    review_thread_root_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 

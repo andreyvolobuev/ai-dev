@@ -17,6 +17,8 @@ in ``asyncio.to_thread``.
 from __future__ import annotations
 
 import asyncio
+import json
+import ssl
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timezone
 from typing import Any, cast
@@ -24,9 +26,64 @@ from urllib.parse import urlparse
 
 from loguru import logger
 from mattermostdriver import Driver
+from mattermostdriver.websocket import Websocket
 
 from virtual_dev.domain.models.chat import ChatMessage, ChatUser
 from virtual_dev.domain.ports.chat import ChatPort
+
+
+class _ServerAuthSSLWebsocket(Websocket):
+    """``Websocket`` with the SSL context fixed for client-side WSS.
+
+    ``mattermostdriver`` builds an ``ssl.Purpose.CLIENT_AUTH`` context, which
+    is the *server*-side role. Modern Python then refuses to use it for an
+    outgoing connection with:
+    "Cannot create a client socket with a PROTOCOL_TLS_SERVER context".
+
+    We replicate the poker-planning-bot fix: build a ``SERVER_AUTH`` context
+    (meaning: authenticate the server) and honour ``verify`` / CA-file.
+    """
+
+    async def connect(self, event_handler: Any) -> None:
+        import websockets
+        from mattermostdriver.websocket import log as ws_log
+
+        context: ssl.SSLContext | None
+        if self.options["scheme"] == "https":
+            verify = self.options.get("verify", True)
+            context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+            if verify is False:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            elif isinstance(verify, str):
+                context.load_verify_locations(cafile=verify)
+        else:
+            context = None
+
+        scheme = "wss://" if self.options["scheme"] == "https" else "ws://"
+        url = "{scheme}{url}:{port}{basepath}/websocket".format(
+            scheme=scheme,
+            url=self.options["url"],
+            port=str(self.options["port"]),
+            basepath=self.options["basepath"],
+        )
+
+        self._alive = True
+        kw_args: dict[str, Any] = dict(self.options.get("websocket_kw_args") or {})
+        while True:
+            try:
+                websocket = await websockets.connect(url, ssl=context, **kw_args)
+                await self._authenticate_websocket(websocket, event_handler)
+                while self._alive:
+                    try:
+                        await self._start_loop(websocket, event_handler)
+                    except websockets.ConnectionClosedError:
+                        break
+                if (not self.options.get("keepalive")) or (not self._alive):
+                    break
+            except Exception as exc:
+                ws_log.warning("websocket connect failed: %s", exc)
+                await asyncio.sleep(self.options.get("keepalive_delay", 3))
 
 
 def _parse_host_port_scheme(url: str) -> tuple[str, int, str]:
@@ -76,6 +133,7 @@ class MattermostChat(ChatPort):
         )
         self._bot_username = bot_username
         self._logged_in = False
+        self._bot_id_cached: str = ""
 
     def _ensure_login(self) -> None:
         if not self._logged_in:
@@ -85,16 +143,24 @@ class MattermostChat(ChatPort):
     def _bot_user_id(self) -> str:
         """Return the authenticated user's id (our bot token → bot account)."""
         self._ensure_login()
+        if self._bot_id_cached:
+            return self._bot_id_cached
         me = self._driver.users.get_user("me")
         if not isinstance(me, dict) or not me.get("id"):
             raise RuntimeError("Could not resolve Mattermost bot user id from /users/me")
-        return str(me["id"])
+        self._bot_id_cached = str(me["id"])
+        return self._bot_id_cached
+
+    async def bot_user_id(self) -> str:
+        """Async accessor, used by agents that need to compare post authors."""
+        return await asyncio.to_thread(self._bot_user_id)
 
     # --- Phase-1 allowed methods ---
 
     async def read_thread(self, thread_root_id: str) -> Sequence[ChatMessage]:
         def _fetch() -> list[ChatMessage]:
             self._ensure_login()
+            bot_id = self._bot_user_id()
             raw = self._driver.posts.get_thread(thread_root_id)
             if not isinstance(raw, dict):
                 raise RuntimeError(
@@ -102,9 +168,59 @@ class MattermostChat(ChatPort):
                 )
             posts = cast(dict[str, dict[str, Any]], raw.get("posts") or {})
             order = cast(list[str], raw.get("order") or list(posts.keys()))
-            return [self._post_to_message(posts[post_id]) for post_id in order if post_id in posts]
+            reactions = self._reactions_for_posts(list(order))
+            out: list[ChatMessage] = []
+            for post_id in order:
+                post = posts.get(post_id)
+                if post is None:
+                    continue
+                message = self._post_to_message(post)
+                all_reactions, bot_reactions = reactions.get(post_id, (set(), set()))
+                message.reactions = sorted(all_reactions)
+                message.bot_reactions = sorted(bot_reactions)
+                # If the bot itself authored this post, mark it trusted.
+                if post.get("user_id") == bot_id:
+                    message.trusted = True
+                out.append(message)
+            return out
 
         return await asyncio.to_thread(_fetch)
+
+    def _reactions_for_posts(
+        self, post_ids: list[str],
+    ) -> dict[str, tuple[set[str], set[str]]]:
+        """Fetch reactions for a batch of posts.
+
+        Returns ``{post_id: (all_emoji_names, bot_emoji_names)}``. On
+        permission errors / 4xx we swallow and return empty sets — missing
+        reactions just mean "not yet processed", which is the safe default.
+        """
+        if not post_ids:
+            return {}
+        bot_id = self._bot_user_id()
+        out: dict[str, tuple[set[str], set[str]]] = {}
+        for pid in post_ids:
+            try:
+                raw = self._driver.posts.client.get(f"/posts/{pid}/reactions")
+            except Exception:
+                out[pid] = (set(), set())
+                continue
+            if not isinstance(raw, list):
+                out[pid] = (set(), set())
+                continue
+            all_names: set[str] = set()
+            bot_names: set[str] = set()
+            for r in raw:
+                if not isinstance(r, dict):
+                    continue
+                name = str(r.get("emoji_name") or "")
+                if not name:
+                    continue
+                all_names.add(name)
+                if r.get("user_id") == bot_id:
+                    bot_names.add(name)
+            out[pid] = (all_names, bot_names)
+        return out
 
     async def find_user_by_email(self, email: str) -> ChatUser | None:
         def _fetch() -> ChatUser | None:
@@ -163,12 +279,114 @@ class MattermostChat(ChatPort):
 
         return await asyncio.to_thread(_run)
 
-    def subscribe(self) -> AsyncIterator[ChatMessage]:  # pragma: no cover
-        # Phase 3 polls GitLab for MR comments; MM inbound is not needed yet.
-        raise NotImplementedError(
-            "Mattermost websocket subscription is not wired up — Phase 3 uses "
-            "polling of GitLab MR comments."
-        )
+    async def add_reaction(self, post_id: str, emoji_name: str) -> None:
+        """Stick an emoji reaction (as the bot user) on a post."""
+        def _run() -> None:
+            self._ensure_login()
+            bot_id = self._bot_user_id()
+            try:
+                self._driver.reactions.create_reaction({
+                    "user_id": bot_id,
+                    "post_id": post_id,
+                    "emoji_name": emoji_name,
+                })
+            except Exception as exc:
+                # Reactions endpoint returns 4xx if the reaction already
+                # exists — treat as success.
+                msg = str(exc)
+                if "already exists" in msg or "400" in msg:
+                    return
+                raise
+
+        await asyncio.to_thread(_run)
+
+    async def get_post(self, post_id: str) -> ChatMessage | None:
+        def _run() -> ChatMessage | None:
+            self._ensure_login()
+            try:
+                raw = self._driver.posts.get_post(post_id)
+            except Exception:
+                return None
+            if not isinstance(raw, dict):
+                return None
+            message = self._post_to_message(raw)
+            reactions = self._reactions_for_posts([post_id])
+            all_r, bot_r = reactions.get(post_id, (set(), set()))
+            message.reactions = sorted(all_r)
+            message.bot_reactions = sorted(bot_r)
+            return message
+
+        return await asyncio.to_thread(_run)
+
+    def subscribe(self) -> AsyncIterator[ChatMessage]:
+        """Stream incoming MM posts via WebSocket.
+
+        Bridges the driver's callback-based WebSocket to an async iterator:
+        a background task drives the ``connect`` coroutine and drops parsed
+        ``ChatMessage`` objects onto a queue that the iterator drains.
+        """
+        queue: asyncio.Queue[ChatMessage] = asyncio.Queue()
+
+        async def _handler(raw: str) -> None:
+            parsed = self._parse_posted_event(raw)
+            if parsed is not None:
+                await queue.put(parsed)
+
+        options = dict(self._driver.options)
+        options.setdefault("keepalive", True)
+        options.setdefault("keepalive_delay", 3)
+        options.setdefault("websocket_kw_args", None)
+        ws = _ServerAuthSSLWebsocket(options, self._driver.client.token)
+        ws_task = asyncio.create_task(ws.connect(_handler), name="mm-ws-connect")
+
+        async def _iter() -> AsyncIterator[ChatMessage]:
+            try:
+                while True:
+                    msg = await queue.get()
+                    yield msg
+            finally:
+                ws._alive = False
+                ws_task.cancel()
+
+        return _iter()
+
+    def _parse_posted_event(self, raw: str) -> ChatMessage | None:
+        """Extract a ChatMessage from a ``posted``-style WebSocket event.
+
+        Returns ``None`` for any other event type so the iterator stays a
+        stream of real user messages.
+        """
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(event, dict) or event.get("event") != "posted":
+            return None
+        data = event.get("data")
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                return None
+        if not isinstance(data, dict):
+            return None
+        post_raw = data.get("post")
+        if isinstance(post_raw, str):
+            try:
+                post = json.loads(post_raw)
+            except json.JSONDecodeError:
+                return None
+        elif isinstance(post_raw, dict):
+            post = post_raw
+        else:
+            return None
+        if not isinstance(post, dict):
+            return None
+        message = self._post_to_message(post)
+        # Mark trusted if the bot authored it.
+        if self._bot_id_cached and post.get("user_id") == self._bot_id_cached:
+            message.trusted = True
+        return message
 
     # --- helpers ---
 

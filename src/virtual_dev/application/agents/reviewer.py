@@ -252,9 +252,9 @@ class ReviewerAgent:
     async def _notify_ready_for_review(self, row: MergeRequestRow) -> bool:
         """Post a one-off "please review" into the team channel.
 
-        Returns True if the ping was accepted by Communicator (regardless of
-        whether MM actually delivered it — SendOutcome.sent) so the flag
-        flips and we don't retry forever on delivery hiccups.
+        Returns True if the ping was sent (persist the flag) and records the
+        resulting post id + channel on the MR so the MM thread listener can
+        route replies back to us. Returns False if the ping was skipped.
         """
         channel_id = self._team_channel_for(row.repo_key)
         if not channel_id:
@@ -268,6 +268,16 @@ class ReviewerAgent:
             f"{row.title}\n{row.web_url}"
         )
         outcome = await self._communicator.send_channel(channel_id, body)
+        if outcome.sent and outcome.message is not None:
+            # Persist thread metadata immediately so a reply that lands
+            # before the next tick can still be routed back to this MR.
+            async with session_scope(self._session_factory) as session:
+                fresh = (await session.execute(
+                    select(MergeRequestRow).where(MergeRequestRow.id == row.id)
+                )).scalar_one_or_none()
+                if fresh is not None:
+                    fresh.review_thread_channel_id = outcome.message.channel_id
+                    fresh.review_thread_root_id = outcome.message.id
         return outcome.sent
 
     async def _notify_ready_to_merge(self, row: MergeRequestRow) -> None:
