@@ -203,13 +203,17 @@ def build_container(config_dir: Path | str = "config") -> Container:
     )
     rules_loader = RulesLoader(Path(config_dir) / "rules")
 
+    # bot_username here is the GitLab username — comments authored by that
+    # user on our MRs are our own. Primary signal inside the agent is still
+    # the per-MR author_username (which matches by definition); this is a
+    # secondary safety net for cases where another bot account replies.
     reviewer = ReviewerAgent(
         vcs=vcs,
         communicator=communicator,
         session_factory=session_factory,
         config=config,
         message_bus=message_bus,
-        bot_username=settings.mattermost_bot_username or settings.dev_git_author_name,
+        bot_username=None,   # relying on the MR.author_username signal
     )
     devops = DevOpsAgent(
         vcs=vcs,

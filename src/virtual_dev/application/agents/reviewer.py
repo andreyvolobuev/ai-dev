@@ -303,7 +303,14 @@ class ReviewerAgent:
     def _new_comments(
         self, row: MergeRequestRow, comments: list[ReviewComment],
     ) -> list[ReviewComment]:
-        """Filter out bot's own comments + everything up to last_seen_comment_id."""
+        """Filter out bot's own comments + everything up to last_seen_comment_id.
+
+        Bot identity on GitLab ≠ bot identity on Mattermost. The MR was
+        opened by us, so ``row.author_username`` IS the bot's GitLab
+        handle — any comment with that author is our own
+        ``submit_mr``-comment / our own reply and must not round-trip
+        back through the Reviewer.
+        """
         filtered: list[ReviewComment] = []
         seen_cutoff = row.last_seen_comment_id or ""
         passed_cutoff = not seen_cutoff
@@ -313,18 +320,26 @@ class ReviewerAgent:
                 if comment.id == seen_cutoff:
                     passed_cutoff = True
                 continue
-            if self._is_bot_author(comment.author_username):
+            if self._is_bot_author(comment.author_username, row.author_username):
                 continue
             filtered.append(comment)
         # First call ever (no cutoff yet): skip bot-authored ones anyway.
         if not seen_cutoff:
-            filtered = [c for c in filtered if not self._is_bot_author(c.author_username)]
+            filtered = [
+                c for c in filtered
+                if not self._is_bot_author(c.author_username, row.author_username)
+            ]
         return filtered
 
-    def _is_bot_author(self, username: str) -> bool:
+    def _is_bot_author(self, username: str, mr_author_username: str) -> bool:
+        """A comment is ours if its author matches either the MR author
+        (primary signal — the bot opened this MR) or the configured
+        ``bot_username`` (secondary, in case a different bot account
+        replies on our behalf)."""
+        if mr_author_username and username.lower() == mr_author_username.lower():
+            return True
         if self._bot_username and username.lower() == self._bot_username.lower():
             return True
-        # Fallback: treat MR author as bot (the MR was opened by us).
         return False
 
     def _team_channel_for(self, repo_key: str) -> str | None:
