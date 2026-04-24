@@ -175,6 +175,14 @@ def dev_task(
         from virtual_dev.domain.ports.message_bus import AgentMessage
         from virtual_dev.application.agents.orchestrator import TOPIC_PLAN_READY
 
+        ok = await _ensure_task_in_db(container, tracker, external_id)
+        if not ok:
+            console.print(
+                f"[red]Task {external_id} not found in DB and Jira is not configured "
+                f"— run `virtual-dev poll-once` first or set Jira credentials.[/red]"
+            )
+            return
+
         await inbox.handle(AgentMessage(
             id="cli",
             from_agent="cli",
@@ -202,8 +210,9 @@ def plan_task(
 ) -> None:
     """Run the Analyst on one ticket and exit.
 
-    Requires a Claude Code (Max) login for the `claude` CLI subprocess.
-    By default it does NOT touch Jira — pass ``--post`` to comment the plan.
+    Fetches the ticket from Jira (if configured) and stores it locally
+    before running the Analyst — no need to run poll-once first.
+    By default does NOT write to Jira; pass ``--post`` to comment the plan.
     """
     _bootstrap()
     container = build_container()
@@ -232,6 +241,14 @@ def plan_task(
     async def _run() -> None:
         from virtual_dev.domain.ports.message_bus import AgentMessage
 
+        ok = await _ensure_task_in_db(container, tracker, external_id)
+        if not ok:
+            console.print(
+                f"[red]Task {external_id} not found in DB and Jira is not configured "
+                f"— run `virtual-dev poll-once` first or set Jira credentials.[/red]"
+            )
+            return
+
         await inbox.handle(AgentMessage(
             id="cli",
             from_agent="cli",
@@ -243,6 +260,57 @@ def plan_task(
 
     asyncio.run(_run())
     console.print(f"[green]Analyst done for {tracker}:{external_id}[/green]")
+
+
+async def _ensure_task_in_db(
+    container: "Container",  # type: ignore[name-defined]  # imported lazily below
+    tracker: str,
+    external_id: str,
+) -> bool:
+    """Make sure the task is in the DB.
+
+    If it is already there — great, nothing to do.
+    If not and Jira is configured — fetch from Jira and upsert.
+    If not and Jira is absent — return False so the caller can bail out.
+    """
+    from sqlalchemy import select
+
+    from virtual_dev.infrastructure.db import TaskRow
+    from virtual_dev.infrastructure.db.mappers import task_to_row, update_row_from_task
+    from virtual_dev.infrastructure.db.base import session_scope
+
+    async with container.session_factory() as session:
+        existing = (await session.execute(
+            select(TaskRow).where(
+                TaskRow.tracker == tracker,
+                TaskRow.external_id == external_id,
+            )
+        )).scalar_one_or_none()
+
+    if existing is not None:
+        return True
+
+    if container.task_tracker is None:
+        return False
+
+    console.print(f"Task {external_id} not in DB, fetching from Jira...")
+    task = await container.task_tracker.get_task(external_id)
+
+    async with session_scope(container.session_factory) as session:
+        # Double-check in case a concurrent run inserted it.
+        current = (await session.execute(
+            select(TaskRow).where(
+                TaskRow.tracker == tracker,
+                TaskRow.external_id == external_id,
+            )
+        )).scalar_one_or_none()
+        if current is None:
+            session.add(task_to_row(task))
+        else:
+            update_row_from_task(current, task)
+
+    console.print(f"[green]Fetched {external_id} from Jira and stored locally[/green]")
+    return True
 
 
 if __name__ == "__main__":
