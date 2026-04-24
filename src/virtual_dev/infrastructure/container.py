@@ -112,15 +112,15 @@ def build_container(config_dir: Path | str = "config") -> Container:
     message_bus: MessageBusPort = SqliteMessageBus(session_factory)
 
     task_tracker: TaskTrackerPort | None = None
-    if settings.jira_url and settings.jira_user and settings.jira_token:
+    if settings.jira_url and settings.jira_token:
         task_tracker = JiraTaskTracker(
             url=settings.jira_url,
-            user=settings.jira_user,
             token=settings.jira_token,
+            user=settings.jira_user,   # kept for reference; not used for Bearer auth
         )
     else:
         logger.warning(
-            "Jira credentials are incomplete (URL/user/token) — task tracker disabled"
+            "Jira credentials are incomplete (JIRA_URL or JIRA_TOKEN missing) — task tracker disabled"
         )
 
     chat: ChatPort | None = None

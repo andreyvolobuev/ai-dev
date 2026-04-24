@@ -51,13 +51,17 @@ class JiraTaskTracker(TaskTrackerPort):
         self,
         *,
         url: str,
-        user: str,
         token: str,
+        user: str = "",          # kept for backward-compat; not used for PAT auth
         browse_base_url: str | None = None,
     ) -> None:
-        if not url or not user or not token:
-            raise ValueError("Jira URL/user/token must be provided")
-        self._client = Jira(url=url, username=user, password=token, cloud=False)
+        if not url or not token:
+            raise ValueError("Jira URL and token must be provided")
+        # PAT (Personal Access Token) authentication — sends
+        # ``Authorization: Bearer <token>`` which is what Jira Server/DC
+        # expects. The old ``username=user, password=token`` form sent Basic
+        # Auth which PATs don't support in most Jira Server configurations.
+        self._client = Jira(url=url, token=token, cloud=False)
         # For building web URLs to tickets.
         self._browse_base_url = (browse_base_url or url).rstrip("/")
 
