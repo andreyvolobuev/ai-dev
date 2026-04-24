@@ -64,6 +64,10 @@ class _FakeVcs(VcsPort):
         self.calls.append(("create_branch", (repo_key, branch, base)))
         self._branch = branch
 
+    async def checkout_existing_branch(self, repo_key: str, branch: str) -> None:
+        self.calls.append(("checkout_existing_branch", (repo_key, branch)))
+        self._branch = branch
+
     async def commit_all(self, repo_key: str, message: str) -> str:
         self.calls.append(("commit_all", (repo_key, message)))
         if not self._dirty_files:

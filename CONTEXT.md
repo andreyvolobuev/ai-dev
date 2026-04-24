@@ -181,6 +181,7 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
   8. MR URL не логировался нигде → добавили `logger.info("opened MR !{iid}: {url}")` в `dev.py`.
   9. Правила по комментариям ("зачем, а не что") — в `_DEV_SYSTEM_BASE` + `config/rules/dev-bellingshausen-{backend,frontend}.md`.
 - ✅ **Фаза 3** — Reviewer + DevOps + запись в Mattermost. Полный цикл: бот пингует ревьюеров, классифицирует комменты, собирает апрувы, замечает красный CI, эскалирует тимлиду при простое. Мерж — ручной (человек).
+- ✅ **Фаза 3.5** — MM-тред как канал ревью. Бот слушает WebSocket (с SSL-фиксом от poker-planning-bot), при каждом реплае в "please review"-треде спрашивает у `ThreadResponderAgent` (LLM через claude-agent-sdk): ответить текстом / внести правку / молча проигнорировать. Агент знает про injection-фильтр, может послать коллег "погуляй" если фидбек бредовый. Для правок: `DevAgent.handle_iteration` — checkout существующей ветки (`VcsPort.checkout_existing_branch`), новый коммит поверх, push. GitLab автоматически обновляет MR. Идемпотентность через реакцию ✅ (`white_check_mark`) на обработанном посте. Новые колонки `MergeRequestRow.review_thread_{channel_id,root_id}`. Новый worker `MmThreadListener` в web lifespan. 97 unit-тестов.
 - **Фаза 4** — обкатка на реальных задачах всей команды.
 - **Фаза 5** — автопилот, все репо, фронт-агенты, auto-fix CI DevOps-агентом, LLM-классификация комментов (замена эвристик из Phase 3).
 

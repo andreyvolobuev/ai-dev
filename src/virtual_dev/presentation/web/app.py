@@ -34,6 +34,7 @@ from virtual_dev.runtime.workers import (
     AgentRunner,
     AnalystInbox,
     DevInbox,
+    MmThreadListener,
     PollerWorker,
 )
 
@@ -118,6 +119,21 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         ticks={"devops": container.devops.tick},
     )
 
+    mm_listener: MmThreadListener | None = None
+    if container.chat is not None and container.vcs is not None:
+        dev_by_repo: dict[str, DevAgent] = {}
+        # Dev agents were already built above per (repo, specialisation).
+        # Phase 3.5 routes MM-thread iteration to the backend agent only.
+        for d in dev_agents:
+            dev_by_repo.setdefault(d._repo_key, d)   # type: ignore[attr-defined]
+        mm_listener = MmThreadListener(
+            chat=container.chat,
+            communicator=container.communicator,
+            responder=container.thread_responder,
+            dev_agents=dev_by_repo,
+            session_factory=container.session_factory,
+        )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         background: list[asyncio.Task[None]] = []
@@ -133,9 +149,14 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                 background.append(asyncio.create_task(
                     devops_poller.run_forever(), name="devops-poller",
                 ))
+            if mm_listener is not None:
+                background.append(asyncio.create_task(
+                    mm_listener.run_forever(), name="mm-thread-listener",
+                ))
             logger.info(
-                "Started: orchestrator + analyst-runner + {} dev runner(s) + reviewer/devops pollers",
-                len(dev_runners),
+                "Started: orchestrator + analyst-runner + {} dev runner(s) "
+                "+ reviewer/devops pollers + mm-thread-listener={}",
+                len(dev_runners), mm_listener is not None,
             )
         try:
             yield
@@ -146,6 +167,8 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                 await runner.stop()
             await reviewer_poller.stop()
             await devops_poller.stop()
+            if mm_listener is not None:
+                await mm_listener.stop()
             for task in background:
                 try:
                     await asyncio.wait_for(task, timeout=5)
@@ -170,6 +193,8 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             "devops_poller_running": devops_poller.is_running,
             "reviewer_stats": reviewer_poller.stats.__dict__,
             "devops_stats": devops_poller.stats.__dict__,
+            "mm_listener_running": bool(mm_listener and mm_listener.is_running),
+            "mm_listener_stats": mm_listener.stats.__dict__ if mm_listener else {},
             "jira_configured": container.task_tracker is not None,
             "chat_configured": container.chat is not None,
             "kb_configured": container.knowledge_base is not None,
@@ -272,6 +297,8 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             await runner.stop()
         await reviewer_poller.stop()
         await devops_poller.stop()
+        if mm_listener is not None:
+            await mm_listener.stop()
         logger.warning("Kill-switch pressed via web")
         return {"status": "stopping"}
 

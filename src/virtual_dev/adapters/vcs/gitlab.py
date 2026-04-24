@@ -124,6 +124,17 @@ class GitLabVcs(VcsPort):
             await self._run_git(path, "checkout", branch)
         await self._run_git(path, "reset", "--hard", f"origin/{branch}")
 
+    async def checkout_existing_branch(self, repo_key: str, branch: str) -> None:
+        path = await self._ensure_local(repo_key)
+        await self._run_git(path, "fetch", "--prune", "origin")
+        # -B ensures we move/recreate the local branch to the remote's tip
+        # *without* losing the remote's commits — it's `checkout -b` if the
+        # branch doesn't exist locally, `reset --hard origin/...` effectively
+        # if it does. The local uncommitted state is the caller's
+        # responsibility (Dev iteration already did ensure_clone with the
+        # safety check).
+        await self._run_git(path, "checkout", "-B", branch, f"origin/{branch}")
+
     async def create_branch(self, repo_key: str, branch: str, base: str) -> None:
         path = await self._ensure_local(repo_key)
         await self._run_git(path, "fetch", "--prune", "origin")

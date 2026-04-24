@@ -25,6 +25,7 @@ from virtual_dev.adapters.task_tracker import JiraTaskTracker
 from virtual_dev.adapters.vcs import GitIdentity, GitLabVcs
 from virtual_dev.application.agents.devops import DevOpsAgent
 from virtual_dev.application.agents.reviewer import ReviewerAgent
+from virtual_dev.application.agents.thread_responder import ThreadResponderAgent
 from virtual_dev.application.services import (
     CommunicatorService,
     InjectionFilter,
@@ -75,6 +76,7 @@ class Container:
     rules_loader: RulesLoader
     reviewer: ReviewerAgent
     devops: DevOpsAgent
+    thread_responder: ThreadResponderAgent
 
     async def init_db(self) -> None:
         """Create all tables. Used by ``virtual-dev db init``."""
@@ -224,6 +226,11 @@ def build_container(config_dir: Path | str = "config") -> Container:
         config=config,
         message_bus=message_bus,
     )
+    thread_responder = ThreadResponderAgent(
+        code_agent=code_agent,
+        config=config,
+        injection_filter=injection_filter,
+    )
 
     return Container(
         settings=settings,
@@ -246,6 +253,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         rules_loader=rules_loader,
         reviewer=reviewer,
         devops=devops,
+        thread_responder=thread_responder,
     )
 
 

@@ -82,6 +82,9 @@ class _StubVcs(VcsPort):
     async def create_branch(self, repo_key: str, branch: str, base: str) -> None:  # pragma: no cover
         raise NotImplementedError
 
+    async def checkout_existing_branch(self, repo_key: str, branch: str) -> None:  # pragma: no cover
+        raise NotImplementedError
+
     async def commit_all(self, repo_key: str, message: str) -> str:  # pragma: no cover
         raise NotImplementedError
 

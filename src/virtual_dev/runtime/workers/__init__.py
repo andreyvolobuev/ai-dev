@@ -3,6 +3,7 @@
 from virtual_dev.runtime.workers.agent_runner import AgentRunner, AgentRunnerStats
 from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
 from virtual_dev.runtime.workers.dev_inbox import DevInbox
+from virtual_dev.runtime.workers.mm_thread_listener import MmListenerStats, MmThreadListener
 from virtual_dev.runtime.workers.poller import PollerStats, PollerWorker
 
 __all__ = [
@@ -10,6 +11,8 @@ __all__ = [
     "AgentRunnerStats",
     "AnalystInbox",
     "DevInbox",
+    "MmListenerStats",
+    "MmThreadListener",
     "PollerStats",
     "PollerWorker",
 ]

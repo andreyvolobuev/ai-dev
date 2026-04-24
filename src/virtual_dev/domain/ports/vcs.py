@@ -35,6 +35,15 @@ class VcsPort(ABC):
         """Create a new branch off ``base`` and check it out."""
 
     @abstractmethod
+    async def checkout_existing_branch(self, repo_key: str, branch: str) -> None:
+        """Fetch and check out an existing remote branch without destroying it.
+
+        Used for Dev-agent iteration mode: the branch already has the bot's
+        previous commit, we want to add a new one on top. No reset-hard to
+        base, no re-creation.
+        """
+
+    @abstractmethod
     async def commit_all(self, repo_key: str, message: str) -> str:
         """Stage everything and commit. Returns the commit SHA.
 
