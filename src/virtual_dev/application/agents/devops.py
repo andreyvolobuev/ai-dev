@@ -271,6 +271,20 @@ class DevOpsAgent:
             row.pipeline_autofix_attempts = (row.pipeline_autofix_attempts or 0) + 1
 
 
+_PASSING_JOB_STATUSES = frozenset({
+    # Job ran and produced its expected outcome.
+    "success", "skipped",
+    # `manual` and `created` are not "running" — they're idle, waiting for
+    # someone to click (typical for deploy / approval gates, downstream of
+    # merge). For the "ready for review" gate they don't block: review is
+    # about code quality, not about whether a deploy gate has been
+    # triggered. DevOps treats them as green.
+    "manual", "created",
+})
+
+_RUNNING_JOB_STATUSES = frozenset({"running", "pending", "preparing", "scheduled"})
+
+
 def _collapse_status(jobs: list[PipelineJob]) -> str:
     """Derive a single pipeline state from job statuses."""
     if not jobs:
@@ -278,9 +292,9 @@ def _collapse_status(jobs: list[PipelineJob]) -> str:
     statuses = {j.status for j in jobs}
     if "failed" in statuses:
         return "failed"
-    if statuses <= {"success", "skipped", "manual"}:
+    if statuses <= _PASSING_JOB_STATUSES:
         return "success"
-    if "running" in statuses or "pending" in statuses or "created" in statuses:
+    if statuses & _RUNNING_JOB_STATUSES:
         return "running"
     return "unknown"
 
