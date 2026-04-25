@@ -111,6 +111,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             dev_agents=container.dev_agents,
             session_factory=container.session_factory,
             config=container.config,
+            settings=container.settings,
         )
 
     @asynccontextmanager

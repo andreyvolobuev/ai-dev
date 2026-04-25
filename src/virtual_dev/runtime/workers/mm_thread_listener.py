@@ -36,7 +36,9 @@ from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
 from virtual_dev.domain.ports.chat import ChatPort
-from virtual_dev.infrastructure.config import AppConfig
+from pathlib import Path
+
+from virtual_dev.infrastructure.config import AppConfig, Settings
 from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
@@ -65,6 +67,7 @@ class MmThreadListener:
         dev_agents: dict[str, DevAgent],     # repo_key → DevAgent
         session_factory: async_sessionmaker[AsyncSession],
         config: AppConfig,
+        settings: Settings,
     ) -> None:
         self._chat = chat
         self._communicator = communicator
@@ -72,6 +75,7 @@ class MmThreadListener:
         self._dev_agents = dev_agents
         self._session_factory = session_factory
         self._config = config
+        self._settings = settings
         self._stop_event = asyncio.Event()
         self._running = False
         self.stats = MmListenerStats()
@@ -167,7 +171,7 @@ class MmThreadListener:
             plan=plan,
             thread=transcript,
             latest_reply=event,
-            repo_workspace=None,      # responder reads via Read/Grep from cwd=None → relies on Glob with abs paths; not ideal for now
+            repo_workspace=self._resolve_repo_workspace(row.repo_key),
         )
         logger.info(
             "MmThreadListener: decision={} reasoning={!r}",
@@ -241,6 +245,20 @@ class MmThreadListener:
             await self._post_reply(
                 channel_id, root_id, templates.thread_reply_iteration_no_changes,
             )
+
+    def _resolve_repo_workspace(self, repo_key: str) -> str | None:
+        """Resolve the on-disk workspace for a repo so ThreadResponder's
+        Read/Glob/Grep tools actually look at the right code.
+
+        Honours ``repositories.yaml.local_path`` first (re-uses the user's
+        existing checkout), falls back to ``settings.workspaces_dir/<key>``.
+        """
+        repo_cfg = self._config.get_repository(repo_key)
+        if repo_cfg is None:
+            return None
+        if repo_cfg.local_path:
+            return str(Path(repo_cfg.local_path).expanduser().resolve())
+        return str(Path(self._settings.workspaces_dir).resolve() / repo_key)
 
     async def _post_reply(self, channel_id: str, root_id: str, text: str) -> None:
         await self._communicator.send_channel(channel_id, text, thread_root_id=root_id)

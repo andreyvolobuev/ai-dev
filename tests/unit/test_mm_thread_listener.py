@@ -24,6 +24,7 @@ from virtual_dev.infrastructure.config import (
     MappingsCfg,
     MmTemplatesCfg,
     NotificationsCfg,
+    Settings,
 )
 from virtual_dev.infrastructure.db import MergeRequestRow
 from virtual_dev.infrastructure.db.base import session_scope
@@ -186,7 +187,7 @@ async def test_routes_reply_to_responder_and_posts_in_thread(
         responder=responder,   # type: ignore[arg-type]
         dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
         session_factory=session_factory,
-        config=_test_config(),
+        config=_test_config(), settings=Settings(),
     )
 
     # Drive one-shot by running run_forever briefly.
@@ -233,7 +234,7 @@ async def test_iterate_triggers_dev_and_reports_back(
         responder=responder,   # type: ignore[arg-type]
         dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
         session_factory=session_factory,
-        config=_test_config(),
+        config=_test_config(), settings=Settings(),
     )
 
     task = asyncio.create_task(listener.run_forever())
@@ -273,7 +274,7 @@ async def test_skips_already_reacted_post(
         responder=responder,   # type: ignore[arg-type]
         dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
         session_factory=session_factory,
-        config=_test_config(),
+        config=_test_config(), settings=Settings(),
     )
 
     task = asyncio.create_task(listener.run_forever())
@@ -301,7 +302,7 @@ async def test_skips_posts_without_thread_root(
         responder=responder,   # type: ignore[arg-type]
         dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
         session_factory=session_factory,
-        config=_test_config(),
+        config=_test_config(), settings=Settings(),
     )
 
     task = asyncio.create_task(listener.run_forever())
