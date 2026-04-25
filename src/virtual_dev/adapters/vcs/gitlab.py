@@ -381,7 +381,11 @@ class GitLabVcs(VcsPort):
                 status = str(attrs.get("status") or "")
                 web_url = str(attrs.get("web_url") or "")
                 tail = ""
-                if log_tail_lines > 0 and status == "failed":
+                # log_tail_lines semantics:
+                #   > 0  — fetch + keep last N lines
+                #   < 0  — fetch full log (no truncation; DevOps auto-fix path)
+                #   == 0 — skip log fetch entirely (Reviewer's status probe)
+                if log_tail_lines != 0 and status == "failed":
                     tail = _fetch_job_log_tail(project, job_id, log_tail_lines)
                 out.append(PipelineJob(
                     id=job_id, name=name, stage=stage, status=status,

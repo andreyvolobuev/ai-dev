@@ -91,9 +91,11 @@ class DevOpsAgent:
 
     async def _check_one(self, row: MergeRequestRow, stats: DevOpsTickStats) -> None:
         assert self._vcs is not None
-        # log_tail_lines=0 → full log; auto-fix needs the whole picture.
+        # log_tail_lines=-1 → full untruncated log per failing job; auto-fix
+        # needs the whole traceback (not just trailing frames) to find the
+        # real cause. (=0 means "skip log fetch entirely" — used by Reviewer.)
         jobs = list(await self._vcs.get_latest_pipeline_jobs(
-            row.repo_key, row.iid, log_tail_lines=0,
+            row.repo_key, row.iid, log_tail_lines=-1,
         ))
         pipeline_status = _collapse_status(jobs)
 

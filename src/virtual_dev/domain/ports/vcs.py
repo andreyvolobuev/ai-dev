@@ -120,10 +120,15 @@ class VcsPort(ABC):
 
     @abstractmethod
     async def get_latest_pipeline_jobs(
-        self, repo_key: str, iid: int, *, log_tail_lines: int = 80
+        self, repo_key: str, iid: int, *, log_tail_lines: int = 0,
     ) -> Sequence[PipelineJob]:
         """Return jobs of the MR's latest pipeline.
 
-        ``log_tail_lines`` controls how much trailing log DevOpsAgent pulls
-        per failing job (0 disables log fetching).
+        ``log_tail_lines`` for failing jobs:
+
+        * ``> 0`` — fetch and keep the last N lines.
+        * ``< 0`` — fetch the **full** log (no truncation). DevOps
+          auto-fix uses this so Dev sees the real traceback, not just
+          the trailing frames.
+        * ``== 0`` — skip fetching the log entirely (status-only).
         """
