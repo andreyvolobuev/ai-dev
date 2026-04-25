@@ -38,7 +38,8 @@ from virtual_dev.application.agents.orchestrator import (
     TOPIC_MR_STUCK,
 )
 from virtual_dev.application.services.communicator import CommunicatorService
-from virtual_dev.domain.models.merge_request import MRStatus, PipelineStatus, ReviewComment
+from virtual_dev.application.agents.devops import _collapse_status
+from virtual_dev.domain.models.merge_request import MRStatus, ReviewComment
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
 from virtual_dev.domain.ports.vcs import VcsPort
 from virtual_dev.infrastructure.config import AppConfig
@@ -191,25 +192,33 @@ class ReviewerAgent:
             touched = True
 
         # "Please review" ping — once, when MR is no longer a draft AND
-        # the CI pipeline is green (or unconfigured). Calling reviewers
-        # while CI is red is bad form: humans expect "I think it's done"
-        # to mean "tests pass". On red, we wait — when the developer
-        # (the bot itself, via thread iteration, or a human) pushes a
-        # fix and CI flips green, the next tick fires the ping.
+        # the CI pipeline of the latest commit is green (or there's no
+        # CI at all). ``live.pipeline_status`` from get_merge_request is
+        # a head-pipeline snapshot that briefly desynchronises right
+        # after a push (mr.pipeline may be None or still point at the
+        # previous run). We instead pull the latest pipeline's jobs and
+        # derive status from them — same source DevOps uses, so both
+        # agents see the world the same way.
         review_ping_sent = row.review_ping_sent
-        pipeline_blocks_ping = live.pipeline_status in (
-            PipelineStatus.FAILED, PipelineStatus.PENDING, PipelineStatus.RUNNING,
-        )
         if not review_ping_sent and live.status == MRStatus.OPEN:
-            if pipeline_blocks_ping:
+            ci_state = await self._derive_ci_state(row.repo_key, row.iid)
+            if ci_state == "no-ci":
+                # Repo has no pipeline configured for this branch; nothing
+                # to wait for, ping right away.
+                if await self._notify_ready_for_review(row, live.title):
+                    review_ping_sent = True
+                    stats.review_pings_sent += 1
+                    touched = True
+            elif ci_state == "success":
+                if await self._notify_ready_for_review(row, live.title):
+                    review_ping_sent = True
+                    stats.review_pings_sent += 1
+                    touched = True
+            else:
                 logger.info(
-                    "Reviewer: {}!{} — pipeline {!r}, holding 'please review' ping",
-                    row.repo_key, row.iid, live.pipeline_status.value,
+                    "Reviewer: {}!{} — CI state {!r}, holding 'please review' ping",
+                    row.repo_key, row.iid, ci_state,
                 )
-            elif await self._notify_ready_for_review(row, live.title):
-                review_ping_sent = True
-                stats.review_pings_sent += 1
-                touched = True
 
         # Approvals threshold check.
         required = self._config.agents.review_policy.required_approvals
@@ -408,6 +417,29 @@ class ReviewerAgent:
         if self._bot_username and username.lower() == self._bot_username.lower():
             return True
         return False
+
+    async def _derive_ci_state(self, repo_key: str, iid: int) -> str:
+        """Return one of: ``"success"``, ``"failed"``, ``"running"``,
+        ``"unknown"``, ``"no-ci"``.
+
+        Pulls the actual job list from the latest pipeline and collapses
+        their statuses (same logic DevOps uses), so the result reflects
+        ground truth instead of the brief desync window in mr.pipeline
+        right after a push.
+        """
+        assert self._vcs is not None
+        try:
+            jobs = list(
+                await self._vcs.get_latest_pipeline_jobs(repo_key, iid, log_tail_lines=0)
+            )
+        except Exception:
+            logger.exception(
+                "Reviewer: get_latest_pipeline_jobs failed for {}!{}", repo_key, iid,
+            )
+            return "unknown"
+        if not jobs:
+            return "no-ci"
+        return _collapse_status(jobs)
 
     def _team_channel_for(self, repo_key: str) -> str | None:
         mapping = self._config.mappings.team_channels or {}

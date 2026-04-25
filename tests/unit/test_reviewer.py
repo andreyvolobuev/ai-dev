@@ -52,11 +52,25 @@ class _StubVcs(VcsPort):
         approvals: dict[tuple[str, int], ApprovalInfo],
         mr_status: MRStatus = MRStatus.OPEN,
         pipeline_status: PipelineStatus = PipelineStatus.SUCCESS,
+        ci_jobs: list[PipelineJob] | None = None,
     ) -> None:
         self._comments = comments
         self._approvals = approvals
         self._mr_status = mr_status
         self._pipeline_status = pipeline_status
+        # Reviewer derives "ready for review" gate from get_latest_pipeline_jobs.
+        # Default: a single-job green pipeline → ping fires.
+        if ci_jobs is None:
+            ci_jobs = [PipelineJob(
+                id=1, name="tests", stage="test", status="success",
+                web_url="https://gitlab/x/jobs/1",
+            )]
+        self._ci_jobs = ci_jobs
+
+    async def get_latest_pipeline_jobs(
+        self, repo_key: str, iid: int, *, log_tail_lines: int = 80,
+    ) -> list[PipelineJob]:
+        return list(self._ci_jobs)
 
     async def list_review_comments(self, repo_key: str, iid: int) -> list[ReviewComment]:
         return list(self._comments.get((repo_key, iid), []))
@@ -125,11 +139,6 @@ class _StubVcs(VcsPort):
         raise NotImplementedError
 
     async def merge(self, repo_key: str, iid: int) -> None:  # pragma: no cover
-        raise NotImplementedError
-
-    async def get_latest_pipeline_jobs(
-        self, repo_key: str, iid: int, *, log_tail_lines: int = 80,
-    ) -> Sequence[PipelineJob]:  # pragma: no cover
         raise NotImplementedError
 
 
@@ -369,6 +378,13 @@ async def test_review_ping_fires_once_on_first_observation(
     assert chat.sent_channels == []
 
 
+def _job(name: str, status: str) -> PipelineJob:
+    return PipelineJob(
+        id=1, name=name, stage="test", status=status,
+        web_url=f"https://gitlab/x/jobs/{name}",
+    )
+
+
 @pytest.mark.asyncio
 async def test_review_ping_held_while_pipeline_failed(
     session_factory: async_sessionmaker[AsyncSession],
@@ -379,7 +395,7 @@ async def test_review_ping_held_while_pipeline_failed(
         comments={("bellingshausen", 42): []},
         approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
         mr_status=MRStatus.OPEN,
-        pipeline_status=PipelineStatus.FAILED,
+        ci_jobs=[_job("tests", "failed")],
     )
     chat = _RecordingChat()
     communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
@@ -400,7 +416,7 @@ async def test_review_ping_held_while_pipeline_running(
         comments={("bellingshausen", 42): []},
         approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
         mr_status=MRStatus.OPEN,
-        pipeline_status=PipelineStatus.RUNNING,
+        ci_jobs=[_job("tests", "running")],
     )
     chat = _RecordingChat()
     communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
@@ -408,6 +424,26 @@ async def test_review_ping_held_while_pipeline_running(
 
     stats = await agent.tick()
     assert stats.review_pings_sent == 0
+
+
+@pytest.mark.asyncio
+async def test_review_ping_fires_when_no_ci_configured(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """No pipeline at all → assume repo without CI → ping right away."""
+    await _insert_mr(session_factory, review_ping_sent=False)
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        mr_status=MRStatus.OPEN,
+        ci_jobs=[],   # no jobs → no CI
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    stats = await agent.tick()
+    assert stats.review_pings_sent == 1
 
 
 @pytest.mark.asyncio
