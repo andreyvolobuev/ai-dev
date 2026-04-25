@@ -53,10 +53,11 @@ class _ServerAuthSSLWebsocket(Websocket):
             verify = self.options.get("verify", True)
             context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
             if verify is False:
-                # Order matters on Python ≥3.12: check_hostname=False is only
-                # legal when verify_mode==CERT_NONE, so flip verify_mode first.
-                context.verify_mode = ssl.CERT_NONE
+                # Python ≥3.12 enforces: setting verify_mode=CERT_NONE while
+                # check_hostname is True raises ValueError. So clear
+                # check_hostname FIRST, then drop verify_mode.
                 context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
             elif isinstance(verify, str):
                 context.load_verify_locations(cafile=verify)
         else:
