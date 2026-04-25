@@ -221,17 +221,20 @@ class GitLabVcs(VcsPort):
     ) -> MergeRequest:
         def _run() -> MergeRequest:
             project = self._client.projects.get(self._project_path(repo_key))
+            # Self-hosted GitLab silently drops the dedicated `draft` field
+            # in some versions (we observed `draft=False` on the resulting
+            # MR despite sending it). The "Draft: " title prefix is the
+            # canonical, version-agnostic way: GitLab parses it on create,
+            # and when a human clicks "Mark as ready" GitLab strips it
+            # automatically — so the prefix doesn't leak into the live
+            # title once review is open.
+            final_title = f"Draft: {title}" if draft else title
             payload: dict[str, Any] = {
                 "source_branch": source_branch,
                 "target_branch": target_branch,
-                "title": title,
+                "title": final_title,
                 "description": description,
                 "remove_source_branch": True,
-                # Use the dedicated `draft` flag instead of prefixing "Draft: "
-                # in the title — un-drafting via UI flips the flag but does
-                # NOT clean the title string, so the prefix would leak into
-                # MM "ready for review" pings.
-                "draft": draft,
             }
             mr = project.mergerequests.create(payload)
             return _mr_from_gitlab(mr)
