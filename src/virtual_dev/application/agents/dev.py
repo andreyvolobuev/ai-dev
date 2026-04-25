@@ -42,7 +42,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from virtual_dev.application.services import ResearcherToolkit, RulesLoader
+from virtual_dev.application.services import PromptsLoader, ResearcherToolkit, RulesLoader
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus
 from virtual_dev.domain.models.plan import Plan, PlanStatus
 from virtual_dev.domain.models.task import TaskStatus
@@ -88,42 +88,11 @@ class DevResult:
     submission: dict[str, Any] = field(default_factory=dict)
 
 
-_DEV_SYSTEM_BASE = (
-    "You are a Dev agent of a multi-agent AI developer. Your job: given a "
-    "plan that an Analyst already built, implement it in the repository "
-    "you're running in and open a Merge Request.\n"
-    "\n"
-    "Process:\n"
-    "  1. You are already on a fresh branch based on the repo's default "
-    "branch. Don't create more branches.\n"
-    "  2. Use the built-in tools (Read / Glob / Grep / Edit / Write / Bash) "
-    "to implement the plan step by step.\n"
-    "  3. Run the repository's test suite (see `tests_cmd` in the plan "
-    "instructions). Keep iterating until tests pass, OR until you are "
-    "convinced they can't be made to pass within the scope of the plan.\n"
-    "  4. When you are done, call the `submit_mr` tool exactly once with "
-    "the MR title and description. Do NOT commit / push / create MR "
-    "yourself — the runtime does that after you call submit_mr.\n"
-    "  5. If you cannot make progress (e.g. the plan is unworkable, or "
-    "external prerequisites are missing), still call `submit_mr` but set "
-    "`status=\"failed\"` and explain in `notes`.\n"
-    "\n"
-    "Coding style (always enforced):\n"
-    "  * Comments explain WHY, not WHAT. A well-named identifier already "
-    "tells the reader what the code does; only write a comment when the "
-    "reason is non-obvious (hidden constraint, workaround, invariant).\n"
-    "  * Default is NO comment. Before writing one, ask: would a competent "
-    "reader need this to avoid a wrong assumption? If no — drop it.\n"
-    "  * Do not reference the ticket / this session / \"added for X\" in "
-    "code comments — that belongs in the MR description.\n"
-    "  * Do not add error handling, fallbacks or validation for scenarios "
-    "that can't happen. Trust internal code.\n"
-    "\n"
-    "MR submission:\n"
-    "  * The runtime prepends the ticket key to your title (e.g. "
-    "\"DM-123: ...\"); do NOT include the key yourself.\n"
-    "  * Title is a concise one-liner (<70 chars). Put details in "
-    "description.\n"
+_DEV_PROMPT_NAME = "dev"
+_DEV_FALLBACK_PROMPT = (
+    "You are the Dev agent. Implement the Analyst's plan in this repo, run "
+    "the tests until they pass, then call submit_mr exactly once. Do NOT "
+    "commit or push yourself — the runtime does that.\n"
 )
 
 
@@ -154,6 +123,7 @@ class DevAgent:
         vcs: VcsPort,
         code_agent: CodeAgentPort,
         rules_loader: RulesLoader,
+        prompts_loader: PromptsLoader,
         session_factory: async_sessionmaker[AsyncSession],
         config: AppConfig,
         settings: Settings,
@@ -166,6 +136,7 @@ class DevAgent:
         self._vcs = vcs
         self._code_agent = code_agent
         self._rules = rules_loader
+        self._prompts = prompts_loader
         self._researcher = researcher
         self._session_factory = session_factory
         self._config = config
@@ -470,7 +441,8 @@ class DevAgent:
         )
 
     def _compose_system_prompt(self, task_row: TaskRow) -> str:
-        parts: list[str] = [_DEV_SYSTEM_BASE]
+        base = self._prompts.load(_DEV_PROMPT_NAME, fallback=_DEV_FALLBACK_PROMPT)
+        parts: list[str] = [base]
         repo_cfg = self._config.get_repository(self._repo_key)
         if repo_cfg is not None:
             parts.append("")

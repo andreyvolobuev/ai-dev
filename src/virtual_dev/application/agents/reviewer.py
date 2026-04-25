@@ -38,7 +38,7 @@ from virtual_dev.application.agents.orchestrator import (
     TOPIC_MR_STUCK,
 )
 from virtual_dev.application.services.communicator import CommunicatorService
-from virtual_dev.domain.models.merge_request import MRStatus, ReviewComment
+from virtual_dev.domain.models.merge_request import MRStatus, PipelineStatus, ReviewComment
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
 from virtual_dev.domain.ports.vcs import VcsPort
 from virtual_dev.infrastructure.config import AppConfig
@@ -190,13 +190,23 @@ class ReviewerAgent:
                 ))
             touched = True
 
-        # "Please review" ping — once, when MR is no longer a draft.
+        # "Please review" ping — once, when MR is no longer a draft AND
+        # the CI pipeline is green (or unconfigured). Calling reviewers
+        # while CI is red is bad form: humans expect "I think it's done"
+        # to mean "tests pass". On red, we wait — when the developer
+        # (the bot itself, via thread iteration, or a human) pushes a
+        # fix and CI flips green, the next tick fires the ping.
         review_ping_sent = row.review_ping_sent
-        if (
-            not review_ping_sent
-            and live.status == MRStatus.OPEN
-        ):
-            if await self._notify_ready_for_review(row, live.title):
+        pipeline_blocks_ping = live.pipeline_status in (
+            PipelineStatus.FAILED, PipelineStatus.PENDING, PipelineStatus.RUNNING,
+        )
+        if not review_ping_sent and live.status == MRStatus.OPEN:
+            if pipeline_blocks_ping:
+                logger.info(
+                    "Reviewer: {}!{} — pipeline {!r}, holding 'please review' ping",
+                    row.repo_key, row.iid, live.pipeline_status.value,
+                )
+            elif await self._notify_ready_for_review(row, live.title):
                 review_ping_sent = True
                 stats.review_pings_sent += 1
                 touched = True

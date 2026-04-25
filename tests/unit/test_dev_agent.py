@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents import DevAgent, DevOutcome, DevSkipReason
-from virtual_dev.application.services import RulesLoader
+from virtual_dev.application.services import PromptsLoader, RulesLoader
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus, PipelineStatus
 from virtual_dev.domain.models.plan import PlanStatus
 from virtual_dev.domain.models.task import TaskStatus
@@ -257,6 +257,7 @@ def _make_dev(
         vcs=vcs,
         code_agent=code_agent,
         rules_loader=rules_loader,
+        prompts_loader=PromptsLoader("/no-prompts-dir"),
         session_factory=session_factory,
         config=cfg,
         settings=Settings(),

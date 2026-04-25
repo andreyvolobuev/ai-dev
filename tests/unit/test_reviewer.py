@@ -51,10 +51,12 @@ class _StubVcs(VcsPort):
         comments: dict[tuple[str, int], list[ReviewComment]],
         approvals: dict[tuple[str, int], ApprovalInfo],
         mr_status: MRStatus = MRStatus.OPEN,
+        pipeline_status: PipelineStatus = PipelineStatus.SUCCESS,
     ) -> None:
         self._comments = comments
         self._approvals = approvals
         self._mr_status = mr_status
+        self._pipeline_status = pipeline_status
 
     async def list_review_comments(self, repo_key: str, iid: int) -> list[ReviewComment]:
         return list(self._comments.get((repo_key, iid), []))
@@ -70,6 +72,7 @@ class _StubVcs(VcsPort):
             author_username="virtual-dev",
             web_url=f"https://gitlab/x/merge_requests/{iid}",
             status=self._mr_status,
+            pipeline_status=self._pipeline_status,
         )
 
     # unused methods raise
@@ -364,6 +367,47 @@ async def test_review_ping_fires_once_on_first_observation(
     stats2 = await agent.tick()
     assert stats2.review_pings_sent == 0
     assert chat.sent_channels == []
+
+
+@pytest.mark.asyncio
+async def test_review_ping_held_while_pipeline_failed(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Don't call reviewers when CI is red — fix it first."""
+    await _insert_mr(session_factory, review_ping_sent=False)
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        mr_status=MRStatus.OPEN,
+        pipeline_status=PipelineStatus.FAILED,
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    stats = await agent.tick()
+    assert stats.review_pings_sent == 0
+    assert chat.sent_channels == []
+
+
+@pytest.mark.asyncio
+async def test_review_ping_held_while_pipeline_running(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Wait for CI to finish before pinging."""
+    await _insert_mr(session_factory, review_ping_sent=False)
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        mr_status=MRStatus.OPEN,
+        pipeline_status=PipelineStatus.RUNNING,
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    stats = await agent.tick()
+    assert stats.review_pings_sent == 0
 
 
 @pytest.mark.asyncio

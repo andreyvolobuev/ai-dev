@@ -177,6 +177,7 @@ def _make_analyst(
         injection_filter=InjectionFilter(),
     )
     communicator = CommunicatorService(None, InjectionFilter())
+    from virtual_dev.application.services import PromptsLoader
     return _TestAnalyst(
         code_agent=code_agent,
         researcher=researcher,
@@ -184,6 +185,7 @@ def _make_analyst(
         session_factory=session_factory,
         config=app_config,
         settings=Settings(),
+        prompts_loader=PromptsLoader("/no-prompts-dir"),
         preset_submission=preset_submission,
     )
 

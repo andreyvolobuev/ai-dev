@@ -10,6 +10,7 @@ from virtual_dev.application.services.injection_filter import (
     WrappedUntrusted,
 )
 from virtual_dev.application.services.link_extractor import ExtractedLinks, extract_links
+from virtual_dev.application.services.prompts import PromptsLoader
 from virtual_dev.application.services.researcher import ResearcherToolkit
 from virtual_dev.application.services.rules import RulesLoader
 
@@ -18,6 +19,7 @@ __all__ = [
     "CommunicatorService",
     "ExtractedLinks",
     "InjectionFilter",
+    "PromptsLoader",
     "ResearcherToolkit",
     "RulesLoader",
     "ThreadDigest",

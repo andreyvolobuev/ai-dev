@@ -29,6 +29,7 @@ from virtual_dev.application.agents.thread_responder import ThreadResponderAgent
 from virtual_dev.application.services import (
     CommunicatorService,
     InjectionFilter,
+    PromptsLoader,
     ResearcherToolkit,
     RulesLoader,
 )
@@ -74,6 +75,7 @@ class Container:
     researcher: ResearcherToolkit
     communicator: CommunicatorService
     rules_loader: RulesLoader
+    prompts_loader: PromptsLoader
     reviewer: ReviewerAgent
     devops: DevOpsAgent
     thread_responder: ThreadResponderAgent
@@ -206,6 +208,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         respect_working_hours=settings.communicator_respect_working_hours,
     )
     rules_loader = RulesLoader(Path(config_dir) / "rules")
+    prompts_loader = PromptsLoader(Path(config_dir) / "prompts")
 
     # bot_username here is the GitLab username — comments authored by that
     # user on our MRs are our own. Primary signal inside the agent is still
@@ -230,6 +233,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         code_agent=code_agent,
         config=config,
         injection_filter=injection_filter,
+        prompts_loader=prompts_loader,
     )
 
     return Container(
@@ -251,6 +255,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         researcher=researcher,
         communicator=communicator,
         rules_loader=rules_loader,
+        prompts_loader=prompts_loader,
         reviewer=reviewer,
         devops=devops,
         thread_responder=thread_responder,

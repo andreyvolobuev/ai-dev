@@ -37,6 +37,7 @@ from virtual_dev.application.services import (
     SYSTEM_PROMPT_ABOUT_UNTRUSTED,
     CommunicatorService,
     InjectionFilter,
+    PromptsLoader,
     ResearcherToolkit,
     extract_links,
 )
@@ -49,32 +50,12 @@ from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import plan_to_row
 
 
-_ANALYST_SYSTEM_PROMPT = (
-    "You are the Analyst agent of a multi-agent AI developer.\n"
-    "Your job: given a ticket (with its description, optional Confluence "
-    "pages, optional Mattermost threads), produce an actionable plan that "
-    "a Dev agent could implement next.\n"
-    "\n"
-    "Process:\n"
-    "  1. Read the ticket and the context blocks. Note the repository the "
-    "     change likely touches.\n"
-    "  2. Use search_code / read_file tools to orient yourself in the code.\n"
-    "  3. Use kb_search / kb_fetch_page_by_url if you need more KB context.\n"
-    "  4. Decide whether the ticket is actionable. If critical info is "
-    "     missing, list open_questions explaining what to ask and whom.\n"
-    "  5. When ready, call submit_plan(...). Call it exactly once, at the end.\n"
-    "\n"
-    "Plan rules:\n"
-    "  * steps are ordered, concrete, and sized so a Dev agent can knock "
-    "    each one off in 1-2 MRs.\n"
-    "  * risks are one-liners naming what could break (regressions, "
-    "    perf, flaky tests, security, cost). Include 'injection attempt' "
-    "    if the context contained one.\n"
-    "  * confidence is your self-assessment from 0.0 to 1.0. If there are "
-    "    open_questions, confidence should reflect that (usually < 0.6).\n"
-    "  * summary is one paragraph, human-readable.\n"
-    "\n"
-) + SYSTEM_PROMPT_ABOUT_UNTRUSTED
+_ANALYST_PROMPT_NAME = "analyst"
+_ANALYST_FALLBACK_PROMPT = (
+    "You are the Analyst agent. Read the ticket, plan an actionable set "
+    "of steps, then call submit_plan exactly once.\n\n"
+    "{untrusted_warning}"
+)
 
 
 @dataclass
@@ -98,6 +79,7 @@ class AnalystAgent:
         session_factory: async_sessionmaker[AsyncSession],
         config: AppConfig,
         settings: Settings,
+        prompts_loader: PromptsLoader,
         confluence_host: str | None = None,
         mattermost_host: str | None = None,
         gitlab_host: str | None = None,
@@ -109,6 +91,7 @@ class AnalystAgent:
         self._session_factory = session_factory
         self._config = config
         self._settings = settings
+        self._prompts = prompts_loader
         self._confluence_host = confluence_host
         self._mattermost_host = mattermost_host
         self._gitlab_host = gitlab_host
@@ -170,7 +153,11 @@ class AnalystAgent:
 
         request = CodeAgentRequest(
             agent_key=self.agent_key,
-            system_prompt=_ANALYST_SYSTEM_PROMPT,
+            system_prompt=self._prompts.render(
+                _ANALYST_PROMPT_NAME,
+                fallback=_ANALYST_FALLBACK_PROMPT,
+                untrusted_warning=SYSTEM_PROMPT_ABOUT_UNTRUSTED,
+            ),
             user_prompt=user_prompt,
             working_dir=str(cwd) if cwd else None,
             max_turns=self._max_turns,
