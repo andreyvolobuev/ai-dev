@@ -201,34 +201,36 @@ class ReviewerAgent:
         # agents see the world the same way.
         ci_state: str | None = None
         review_ping_sent = row.review_ping_sent
+        clear_iteration_pending = False
         if not review_ping_sent and live.status == MRStatus.OPEN:
             ci_state = await self._derive_ci_state(row.repo_key, row.iid)
-            if ci_state == "no-ci":
-                # Repo has no pipeline configured for this branch; nothing
-                # to wait for, ping right away.
+            if ci_state in ("success", "no-ci"):
                 if await self._notify_ready_for_review(row, live.title):
                     review_ping_sent = True
                     stats.review_pings_sent += 1
                     touched = True
-            elif ci_state == "success":
-                if await self._notify_ready_for_review(row, live.title):
-                    review_ping_sent = True
-                    stats.review_pings_sent += 1
-                    touched = True
+                    # The "ready for review" ping itself proves CI is
+                    # green for the latest commit. Any iteration that
+                    # was waiting for CI confirmation is subsumed —
+                    # drop the flag silently, no separate ack message.
+                    clear_iteration_pending = True
             else:
                 logger.info(
                     "Reviewer: {}!{} — CI state {!r}, holding 'please review' ping",
                     row.repo_key, row.iid, ci_state,
                 )
 
-        # Iteration follow-up: when an MM-driven or autofix iteration push
-        # is awaiting CI confirmation (``iteration_pending_ci_sha`` set),
-        # announce "✅ изменения внесены, CI зелёный" in the review thread
-        # once CI flips to success. Until then the bot stays silent —
-        # reviewers don't want to hear about commits that haven't been
-        # validated by CI yet.
-        clear_iteration_pending = False
-        if row.iteration_pending_ci_sha and row.review_thread_root_id:
+        # Iteration follow-up: a thread-driven or autofix iteration push
+        # AFTER the review thread already exists. We post the "✅ CI
+        # зелёный" ack into that thread the first tick CI flips green.
+        # If the thread doesn't exist yet (review_ping not sent), the
+        # branch above will eventually fire review_ping and silently
+        # clear the flag.
+        if (
+            not clear_iteration_pending
+            and row.iteration_pending_ci_sha
+            and row.review_thread_root_id
+        ):
             if ci_state is None:
                 ci_state = await self._derive_ci_state(row.repo_key, row.iid)
             if ci_state in ("success", "no-ci"):
