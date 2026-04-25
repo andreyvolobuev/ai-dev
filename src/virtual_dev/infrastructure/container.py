@@ -23,7 +23,9 @@ from virtual_dev.adapters.mr_history import LocalMrHistory
 from virtual_dev.adapters.secrets import EnvSecrets
 from virtual_dev.adapters.task_tracker import JiraTaskTracker
 from virtual_dev.adapters.vcs import GitIdentity, GitLabVcs
+from virtual_dev.application.agents.dev import DevAgent
 from virtual_dev.application.agents.devops import DevOpsAgent
+from virtual_dev.application.agents.orchestrator import dev_agent_key
 from virtual_dev.application.agents.reviewer import ReviewerAgent
 from virtual_dev.application.agents.thread_responder import ThreadResponderAgent
 from virtual_dev.application.services import (
@@ -76,6 +78,7 @@ class Container:
     communicator: CommunicatorService
     rules_loader: RulesLoader
     prompts_loader: PromptsLoader
+    dev_agents: dict[str, DevAgent]   # repo_key → DevAgent (backend specialisation)
     reviewer: ReviewerAgent
     devops: DevOpsAgent
     thread_responder: ThreadResponderAgent
@@ -222,11 +225,31 @@ def build_container(config_dir: Path | str = "config") -> Container:
         message_bus=message_bus,
         bot_username=None,   # relying on the MR.author_username signal
     )
+    dev_agents: dict[str, DevAgent] = {}
+    if vcs is not None:
+        for repo in config.repositories:
+            if not repo.agents.backend:
+                continue
+            dev_agents[repo.key] = DevAgent(
+                agent_key=dev_agent_key(repo.key, "backend"),
+                repo_key=repo.key,
+                specialisation="backend",
+                vcs=vcs,
+                code_agent=code_agent,
+                rules_loader=rules_loader,
+                prompts_loader=prompts_loader,
+                session_factory=session_factory,
+                config=config,
+                settings=settings,
+                researcher=researcher if mr_history else None,
+            )
+
     devops = DevOpsAgent(
         vcs=vcs,
         communicator=communicator,
         session_factory=session_factory,
         config=config,
+        dev_agents=dev_agents,
         message_bus=message_bus,
     )
     thread_responder = ThreadResponderAgent(
@@ -256,6 +279,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         communicator=communicator,
         rules_loader=rules_loader,
         prompts_loader=prompts_loader,
+        dev_agents=dev_agents,
         reviewer=reviewer,
         devops=devops,
         thread_responder=thread_responder,

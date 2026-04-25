@@ -108,6 +108,12 @@ class MergeRequestRow(Base):
     # and can route replies back to the Reviewer / Dev iteration path.
     review_thread_channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     review_thread_root_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # CI auto-fix state. counter increments after each Dev iteration the
+    # DevOps agent dispatches against this MR; resets to 0 on a green
+    # pipeline. ``escalated`` is set once when attempts run out and we DM
+    # the team-lead, so we don't keep DMing on every subsequent tick.
+    pipeline_autofix_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    pipeline_autofix_escalated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 

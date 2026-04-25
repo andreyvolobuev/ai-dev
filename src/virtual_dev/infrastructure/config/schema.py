@@ -85,6 +85,20 @@ class ReviewPolicyCfg(_StrictModel):
     escalate_after_hours: int = 24
 
 
+class PipelinePolicyCfg(_StrictModel):
+    """How aggressive auto-fix on red pipelines is.
+
+    DevOps detects red CI and dispatches Dev-iteration with the full job
+    logs. After ``max_autofix_attempts`` failed attempts (each followed
+    by another red pipeline), DevOps gives up and DMs
+    ``escalation.mattermost_user``. CI failure events are NEVER posted
+    to team channels — fixing one's own CI is the developer's job, and
+    the bot IS the developer here.
+    """
+
+    max_autofix_attempts: int = 3
+
+
 class EscalationCfg(_StrictModel):
     mattermost_user: str = ""
 
@@ -97,8 +111,10 @@ class MmTemplatesCfg(_StrictModel):
     merge_ping: str = ""
     stale_ping: str = ""
     escalation_dm: str = ""
-    pipeline_failed_short: str = ""
-    pipeline_failed_full: str = ""
+    # Auto-fix path. Pipeline failures are NEVER announced in a team
+    # channel — only DM'd to escalation.mattermost_user when the bot
+    # has exhausted its auto-fix attempts.
+    pipeline_autofix_gave_up_dm: str = ""
     thread_reply_no_dev_agent: str = ""
     thread_reply_no_task: str = ""
     thread_reply_iteration_crashed: str = ""
@@ -142,6 +158,7 @@ class AgentsCfg(_StrictModel):
     working_hours: WorkingHoursCfg = Field(default_factory=WorkingHoursCfg)
     agents: dict[str, AgentCfg] = Field(default_factory=dict)
     review_policy: ReviewPolicyCfg = Field(default_factory=ReviewPolicyCfg)
+    pipeline_policy: PipelinePolicyCfg = Field(default_factory=PipelinePolicyCfg)
     escalation: EscalationCfg = Field(default_factory=EscalationCfg)
 
 

@@ -520,10 +520,11 @@ def _comment_from_gitlab(note: Any, iid: int) -> ReviewComment:
 
 
 def _fetch_job_log_tail(project: Any, job_id: int, tail_lines: int) -> str:
-    """Pull the last ``tail_lines`` of a failing job's trace.
+    """Pull a failing job's trace from GitLab.
 
-    GitLab jobs.trace() streams bytes; we keep only the tail so the
-    DevOpsAgent's log doesn't blow up for a 20MB build log.
+    ``tail_lines <= 0`` returns the full log (used by DevOps auto-fix —
+    Dev needs the whole picture, not just the last 80 lines). Positive
+    values keep only the tail so MM messages don't explode.
     """
     try:
         job = project.jobs.get(job_id)
@@ -535,6 +536,8 @@ def _fetch_job_log_tail(project: Any, job_id: int, tail_lines: int) -> str:
         text = raw.decode("utf-8", errors="replace")
     else:
         text = str(raw)
+    if tail_lines <= 0:
+        return text
     lines = text.splitlines()
     if len(lines) > tail_lines:
         lines = lines[-tail_lines:]

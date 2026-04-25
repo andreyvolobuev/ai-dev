@@ -81,6 +81,12 @@ review_policy:
   ping_reviewers_after_hours: 4
   escalate_after_hours: 24
 
+# Авто-фикс CI. DevOps на красном пайплайне сам зовёт Dev на правки и
+# повторяет до max_autofix_attempts; после — DM тимлиду из escalation.
+# Пайплайны НИКОГДА не упоминаются в командных каналах.
+pipeline_policy:
+  max_autofix_attempts: 3
+
 # Эскалация: куда писать, когда бот застрял.
 escalation:
   mattermost_user: ""  # твой MM-хендл — переопредели в config/local.yaml (gitignored)

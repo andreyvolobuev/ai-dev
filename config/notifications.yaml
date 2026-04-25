@@ -28,18 +28,17 @@ mattermost:
   escalation_dm: |
     [virtual-dev] MR `{repo_key}!{iid}` без активности {idle_hours}ч — напомни кому-нибудь или переназначь. {web_url}
 
-  # DevOps. {jobs} — csv имён упавших job'ов, {jobs_detail_block} —
-  # многострочный блок job-name + log-tail в ``` блоках, готовый к вставке.
-  pipeline_failed_short: |
-    [virtual-dev] Pipeline FAILED на `{repo_key}!{iid}`: {web_url}
+  # DevOps авто-фикс: ТОЛЬКО DM на escalation.mattermost_user, никогда не
+  # в канал. Канал должен видеть MR только когда CI зелёный и можно ревью.
+  # {repo_key}, {iid}, {title}, {web_url}, {attempts}, {failing_jobs}.
+  pipeline_autofix_gave_up_dm: |
+    [virtual-dev] CI на `{repo_key}!{iid}` не починился после {attempts} попыток авто-фикса.
 
-    Failing jobs: {jobs}
+    Title: {title}
+    Failing jobs: {failing_jobs}
+    URL: {web_url}
 
-  pipeline_failed_full: |
-    [virtual-dev] DevOps: pipeline failed на `{repo_key}!{iid}`.
-
-    {jobs_detail_block}
-    {web_url}
+    Нужно вручную разобраться, что не так.
 
   # Reviewer thread responses (MmThreadListener). {commit_sha_short}, {branch}.
   thread_reply_no_dev_agent: "Не могу внести правку: Dev-агент для этого репо не сконфигурирован."

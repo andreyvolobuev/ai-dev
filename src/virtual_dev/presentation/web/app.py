@@ -20,11 +20,10 @@ from fastapi.templating import Jinja2Templates
 from loguru import logger
 from sqlalchemy import select
 
-from virtual_dev.application.agents import AnalystAgent, DevAgent, Orchestrator
+from virtual_dev.application.agents import AnalystAgent, Orchestrator
 from virtual_dev.application.agents.orchestrator import (
     TOPIC_PLAN_READY,
     TOPIC_TASK_DISCOVERED,
-    dev_agent_key,
 )
 from virtual_dev.infrastructure.container import Container
 from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow, TaskRow
@@ -75,40 +74,22 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         handlers={TOPIC_TASK_DISCOVERED: analyst_inbox.handle},
     )
 
-    # Dev-agent: one per (repo, specialisation). Phase 2 = only backend on
-    # whichever repos have backend=True in config. We enumerate here so the
-    # dashboard shows each as a separate status line.
+    # Dev-agents are constructed in the Container so that DevOps + the
+    # MM thread listener can share them. Here we just wire each to a
+    # DevInbox + bus runner so plan.ready messages reach them.
     dev_runners: list[AgentRunner] = []
-    dev_agents: list[DevAgent] = []
-    if container.vcs is not None:
-        for repo in container.config.repositories:
-            if not repo.agents.backend:
-                continue
-            dev = DevAgent(
-                agent_key=dev_agent_key(repo.key, "backend"),
-                repo_key=repo.key,
-                specialisation="backend",
-                vcs=container.vcs,
-                code_agent=container.code_agent,
-                rules_loader=container.rules_loader,
-                prompts_loader=container.prompts_loader,
-                session_factory=container.session_factory,
-                config=container.config,
-                settings=container.settings,
-                researcher=container.researcher if container.mr_history else None,
-            )
-            inbox = DevInbox(
-                dev_agent=dev,
-                task_tracker=container.task_tracker,
-                config=container.config,
-            )
-            runner = AgentRunner(
-                agent_key=dev.agent_key,
-                message_bus=container.message_bus,
-                handlers={TOPIC_PLAN_READY: inbox.handle},
-            )
-            dev_agents.append(dev)
-            dev_runners.append(runner)
+    for repo_key, dev in container.dev_agents.items():
+        inbox = DevInbox(
+            dev_agent=dev,
+            task_tracker=container.task_tracker,
+            config=container.config,
+        )
+        runner = AgentRunner(
+            agent_key=dev.agent_key,
+            message_bus=container.message_bus,
+            handlers={TOPIC_PLAN_READY: inbox.handle},
+        )
+        dev_runners.append(runner)
 
     reviewer_poller = PollerWorker(
         name="reviewer",
@@ -123,16 +104,11 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
 
     mm_listener: MmThreadListener | None = None
     if container.chat is not None and container.vcs is not None:
-        dev_by_repo: dict[str, DevAgent] = {}
-        # Dev agents were already built above per (repo, specialisation).
-        # Phase 3.5 routes MM-thread iteration to the backend agent only.
-        for d in dev_agents:
-            dev_by_repo.setdefault(d._repo_key, d)   # type: ignore[attr-defined]
         mm_listener = MmThreadListener(
             chat=container.chat,
             communicator=container.communicator,
             responder=container.thread_responder,
-            dev_agents=dev_by_repo,
+            dev_agents=container.dev_agents,
             session_factory=container.session_factory,
             config=container.config,
         )
