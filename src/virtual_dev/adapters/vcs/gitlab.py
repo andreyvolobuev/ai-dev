@@ -73,6 +73,18 @@ class GitLabVcs(VcsPort):
         # so ensure_clone stays idempotent after the Dev-agent starts dirtying
         # the tree with its own edits.
         self._verified_local_path: set[str] = set()
+        # Per-repo lock guarding all mutating local-checkout ops (#11 in
+        # techdebt). Two concurrent task runs against the same repo would
+        # otherwise race on the same working tree (one's checkout / commit
+        # / push trampling another).
+        self._repo_locks: dict[str, asyncio.Lock] = {}
+
+    def _lock(self, repo_key: str) -> asyncio.Lock:
+        lock = self._repo_locks.get(repo_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._repo_locks[repo_key] = lock
+        return lock
 
     # --- Local checkout ---
 
@@ -115,40 +127,73 @@ class GitLabVcs(VcsPort):
         return bool(output.strip())
 
     async def fetch_and_checkout(self, repo_key: str, branch: str) -> None:
-        path = await self._ensure_local(repo_key)
-        await self._run_git(path, "fetch", "--prune", "origin")
-        # Remote branch may not exist; fall back to local branch if so.
-        try:
-            await self._run_git(path, "checkout", "-B", branch, f"origin/{branch}")
-        except VcsError:
-            await self._run_git(path, "checkout", branch)
-        await self._run_git(path, "reset", "--hard", f"origin/{branch}")
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            await self._run_git(path, "fetch", "--prune", "origin")
+            # Remote branch may not exist; fall back to local branch if so.
+            try:
+                await self._run_git(path, "checkout", "-B", branch, f"origin/{branch}")
+            except VcsError:
+                await self._run_git(path, "checkout", branch)
+            await self._run_git(path, "reset", "--hard", f"origin/{branch}")
 
     async def checkout_existing_branch(self, repo_key: str, branch: str) -> None:
-        path = await self._ensure_local(repo_key)
-        await self._run_git(path, "fetch", "--prune", "origin")
-        # -B ensures we move/recreate the local branch to the remote's tip
-        # *without* losing the remote's commits — it's `checkout -b` if the
-        # branch doesn't exist locally, `reset --hard origin/...` effectively
-        # if it does. The local uncommitted state is the caller's
-        # responsibility (Dev iteration already did ensure_clone with the
-        # safety check).
-        await self._run_git(path, "checkout", "-B", branch, f"origin/{branch}")
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            await self._run_git(path, "fetch", "--prune", "origin")
+            # -B ensures we move/recreate the local branch to the remote's tip
+            # *without* losing the remote's commits — it's `checkout -b` if the
+            # branch doesn't exist locally, `reset --hard origin/...` effectively
+            # if it does. The local uncommitted state is the caller's
+            # responsibility (Dev iteration already did ensure_clone with the
+            # safety check).
+            await self._run_git(path, "checkout", "-B", branch, f"origin/{branch}")
+
+    async def merge_base_into_current(self, repo_key: str, base: str) -> bool:
+        """Merge ``origin/<base>`` into the currently checked-out branch.
+
+        Returns True on success (clean merge or already up-to-date), False
+        when there's a conflict. On conflict we ``git merge --abort`` so
+        the working tree is restored. Used by Dev iteration to keep the
+        feature branch up to date with master before pushing again (#12
+        in techdebt).
+        """
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            await self._run_git(path, "fetch", "--prune", "origin")
+            try:
+                await self._run_git_with_identity(
+                    path, "merge", "--no-edit", f"origin/{base}",
+                )
+                return True
+            except VcsError as exc:
+                logger.warning(
+                    "VCS: merge origin/{} into current failed: {}",
+                    base, str(exc).splitlines()[0][:200],
+                )
+                # Best-effort abort — ignore failures (nothing to abort,
+                # already-resolved, etc.) so we always return cleanly.
+                try:
+                    await self._run_git(path, "merge", "--abort")
+                except VcsError:
+                    pass
+                return False
 
     async def create_branch(self, repo_key: str, branch: str, base: str) -> None:
-        path = await self._ensure_local(repo_key)
-        await self._run_git(path, "fetch", "--prune", "origin")
-        # Refresh base before branching off.
-        try:
-            await self._run_git(path, "checkout", "-B", base, f"origin/{base}")
-        except VcsError:
-            await self._run_git(path, "checkout", base)
-        # Delete any stale local branch with the same name so we start fresh.
-        try:
-            await self._run_git(path, "branch", "-D", branch)
-        except VcsError:
-            pass
-        await self._run_git(path, "checkout", "-b", branch)
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            await self._run_git(path, "fetch", "--prune", "origin")
+            # Refresh base before branching off.
+            try:
+                await self._run_git(path, "checkout", "-B", base, f"origin/{base}")
+            except VcsError:
+                await self._run_git(path, "checkout", base)
+            # Delete any stale local branch with the same name so we start fresh.
+            try:
+                await self._run_git(path, "branch", "-D", branch)
+            except VcsError:
+                pass
+            await self._run_git(path, "checkout", "-b", branch)
 
     async def commit_all(self, repo_key: str, message: str) -> str:
         """Stage + commit pending changes; return the SHA to push.
@@ -165,29 +210,34 @@ class GitLabVcs(VcsPort):
 
         Returns ``""`` only when there's truly nothing to push.
         """
-        path = await self._ensure_local(repo_key)
-        await self._run_git(path, "add", "-A")
-        if await self.has_uncommitted_changes(repo_key):
-            await self._run_git_with_identity(path, "commit", "-m", message)
-            return (await self._run_git(path, "rev-parse", "HEAD")).strip()
-        # Clean tree — check whether the model already committed.
-        branch = await self.current_branch(repo_key)
-        local_head = (await self._run_git(path, "rev-parse", "HEAD")).strip()
-        try:
-            remote_head = (
-                await self._run_git(path, "rev-parse", f"origin/{branch}")
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            await self._run_git(path, "add", "-A")
+            # Inline status check (avoid re-acquiring the lock through
+            # has_uncommitted_changes).
+            if (await self._run_git(path, "status", "--porcelain")).strip():
+                await self._run_git_with_identity(path, "commit", "-m", message)
+                return (await self._run_git(path, "rev-parse", "HEAD")).strip()
+            # Clean tree — check whether the model already committed.
+            branch = (
+                await self._run_git(path, "rev-parse", "--abbrev-ref", "HEAD")
             ).strip()
-        except VcsError:
-            # Branch doesn't exist on origin yet → any commit is "new".
-            remote_head = ""
-        if local_head and local_head != remote_head:
-            logger.warning(
-                "VCS: working tree clean but {!r} HEAD {} ≠ origin {!r}; "
-                "Dev appears to have committed itself — pushing anyway",
-                branch, local_head[:12], remote_head[:12] or "(none)",
-            )
-            return local_head
-        return ""
+            local_head = (await self._run_git(path, "rev-parse", "HEAD")).strip()
+            try:
+                remote_head = (
+                    await self._run_git(path, "rev-parse", f"origin/{branch}")
+                ).strip()
+            except VcsError:
+                # Branch doesn't exist on origin yet → any commit is "new".
+                remote_head = ""
+            if local_head and local_head != remote_head:
+                logger.warning(
+                    "VCS: working tree clean but {!r} HEAD {} ≠ origin {!r}; "
+                    "Dev appears to have committed itself — pushing anyway",
+                    branch, local_head[:12], remote_head[:12] or "(none)",
+                )
+                return local_head
+            return ""
 
     async def push(self, repo_key: str, branch: str) -> None:
         """Push with limited retry.
@@ -197,36 +247,37 @@ class GitLabVcs(VcsPort):
         already invested turns into the commit by this point — a quick
         retry loop avoids throwing the whole Dev-agent run away.
         """
-        path = await self._ensure_local(repo_key)
-        last_exc: VcsError | None = None
-        for attempt in range(1, 4):
-            try:
-                await self._run_git(path, "push", "--set-upstream", "origin", branch)
-                if attempt > 1:
-                    logger.info("git push succeeded on attempt {}/3", attempt)
-                return
-            except VcsError as exc:
-                message = str(exc)
-                transient = any(
-                    marker in message for marker in (
-                        "Internal API unreachable",
-                        "could not resolve host",
-                        "Connection reset",
-                        "early EOF",
-                        "HTTP 5",
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            last_exc: VcsError | None = None
+            for attempt in range(1, 4):
+                try:
+                    await self._run_git(path, "push", "--set-upstream", "origin", branch)
+                    if attempt > 1:
+                        logger.info("git push succeeded on attempt {}/3", attempt)
+                    return
+                except VcsError as exc:
+                    message = str(exc)
+                    transient = any(
+                        marker in message for marker in (
+                            "Internal API unreachable",
+                            "could not resolve host",
+                            "Connection reset",
+                            "early EOF",
+                            "HTTP 5",
+                        )
                     )
-                )
-                if not transient or attempt == 3:
-                    raise
-                last_exc = exc
-                wait = 2 * attempt
-                logger.warning(
-                    "git push failed (attempt {}/3): {}. Retrying in {}s",
-                    attempt, message.splitlines()[0][:160], wait,
-                )
-                await asyncio.sleep(wait)
-        assert last_exc is not None
-        raise last_exc
+                    if not transient or attempt == 3:
+                        raise
+                    last_exc = exc
+                    wait = 2 * attempt
+                    logger.warning(
+                        "git push failed (attempt {}/3): {}. Retrying in {}s",
+                        attempt, message.splitlines()[0][:160], wait,
+                    )
+                    await asyncio.sleep(wait)
+            assert last_exc is not None
+            raise last_exc
 
     async def current_branch(self, repo_key: str) -> str:
         path = await self._ensure_local(repo_key)
@@ -316,13 +367,35 @@ class GitLabVcs(VcsPort):
         def _run() -> list[ReviewComment]:
             project = self._client.projects.get(self._project_path(repo_key))
             mr = project.mergerequests.get(iid)
-            # Oldest-first — Reviewer's diff against last_seen_comment_id walks
-            # the list in that order. GitLab defaults to desc, which breaks
-            # the cutoff (new comments come before the cutoff id, so the
-            # "passed cutoff" flag never flips to True on them).
+            # We pull through the discussions endpoint so we know which
+            # discussion each note belongs to — that's what we need to
+            # post threaded replies (#1 in techdebt). discussions.list()
+            # is desc by default; we sort discussions by their first
+            # note's created_at to get oldest-first.
+            try:
+                discussions = list(mr.discussions.list(all=True, iterator=True))
+            except Exception:
+                logger.exception(
+                    "list_review_comments: discussions.list failed {}!{}",
+                    repo_key, iid,
+                )
+                return []
+            flat: list[tuple[Any, str]] = []  # (note_attrs, discussion_id)
+            for disc in discussions:
+                disc_id = str(getattr(disc, "id", "") or "")
+                attrs = getattr(disc, "attributes", None) or {}
+                for note in attrs.get("notes") or []:
+                    flat.append((note, disc_id))
+            # Oldest-first by note created_at (string ISO sort works).
+            def _key(item: tuple[Any, str]) -> str:
+                note, _ = item
+                if isinstance(note, dict):
+                    return str(note.get("created_at") or "")
+                return str(getattr(note, "created_at", "") or "")
+            flat.sort(key=_key)
             return [
-                _comment_from_gitlab(n, iid)
-                for n in mr.notes.list(all=True, order_by="created_at", sort="asc")
+                _comment_from_gitlab_dict(note, iid, disc_id)
+                for note, disc_id in flat
             ]
 
         return await asyncio.to_thread(_run)
@@ -330,11 +403,27 @@ class GitLabVcs(VcsPort):
     async def reply_to_comment(
         self, repo_key: str, iid: int, comment_id: str, body: str
     ) -> None:
+        """Reply to a comment, threaded inside its discussion when possible.
+
+        ``comment_id`` is interpreted as a discussion id (what the
+        Reviewer captures in ``ReviewComment.discussion_id``). If the
+        legacy form (a note id) is passed, GitLab returns a 404 from
+        ``discussions.get`` — we fall back to a top-level note so the
+        reply still lands on the MR rather than disappearing.
+        """
         def _run() -> None:
             project = self._client.projects.get(self._project_path(repo_key))
             mr = project.mergerequests.get(iid)
-            discussion = mr.discussions.get(comment_id)
-            discussion.notes.create({"body": body})
+            try:
+                discussion = mr.discussions.get(comment_id)
+                discussion.notes.create({"body": body})
+                return
+            except Exception:
+                logger.exception(
+                    "reply_to_comment: discussion {} not found, "
+                    "posting as top-level note instead", comment_id,
+                )
+            mr.notes.create({"body": body})
 
         await asyncio.to_thread(_run)
 
@@ -382,6 +471,43 @@ class GitLabVcs(VcsPort):
                         approved_by.append(name)
             required = int(getattr(approvals, "approvals_required", 0) or 0) or 1
             return ApprovalInfo(approved_by=approved_by, required=required)
+
+        return await asyncio.to_thread(_run)
+
+    async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+        """Build a unified diff text from the MR's changes.
+
+        We use the ``mr.changes()`` endpoint and synthesise unified-diff
+        text per file so the ThreadResponder can read it without GitLab
+        API knowledge. Truncated to ~50KB total to keep the LLM prompt
+        manageable.
+        """
+        def _run() -> str:
+            project = self._client.projects.get(self._project_path(repo_key))
+            mr = project.mergerequests.get(iid)
+            try:
+                changes = mr.changes()
+            except Exception:
+                logger.exception("get_mr_diff: changes() failed for {}!{}", repo_key, iid)
+                return ""
+            files = changes.get("changes") or []
+            chunks: list[str] = []
+            total = 0
+            limit = 50_000
+            for entry in files:
+                old_path = str(entry.get("old_path") or "")
+                new_path = str(entry.get("new_path") or "")
+                diff = str(entry.get("diff") or "")
+                if not diff:
+                    continue
+                header = f"diff --git a/{old_path} b/{new_path}\n"
+                block = header + diff
+                if total + len(block) > limit:
+                    chunks.append("\n[diff truncated]\n")
+                    break
+                chunks.append(block)
+                total += len(block)
+            return "\n".join(chunks)
 
         return await asyncio.to_thread(_run)
 
@@ -562,6 +688,37 @@ def _comment_from_gitlab(note: Any, iid: int) -> ReviewComment:
         resolved=bool(getattr(note, "resolvable", False) and getattr(note, "resolved", False)),
         system=bool(getattr(note, "system", False)),
     )
+
+
+def _comment_from_gitlab_dict(
+    note: Any, iid: int, discussion_id: str,
+) -> ReviewComment:
+    """Build a ReviewComment from a discussions endpoint note (dict form)."""
+    if isinstance(note, dict):
+        author = note.get("author") or {}
+        author_username = str(author.get("username") or "") if isinstance(author, dict) else ""
+        from datetime import datetime as _dt
+        created_at_raw = note.get("created_at")
+        created_at = None
+        if isinstance(created_at_raw, str):
+            try:
+                created_at = _dt.fromisoformat(created_at_raw.replace("Z", "+00:00"))
+            except ValueError:
+                created_at = None
+        return ReviewComment(
+            id=str(note.get("id") or ""),
+            mr_id=str(iid),
+            author_username=author_username,
+            body=str(note.get("body") or ""),
+            resolved=bool(note.get("resolvable") and note.get("resolved")),
+            system=bool(note.get("system")),
+            discussion_id=discussion_id or None,
+            created_at=created_at,
+        )
+    # Object-form fallback (older python-gitlab).
+    base = _comment_from_gitlab(note, iid)
+    base.discussion_id = discussion_id or None
+    return base
 
 
 def _fetch_job_log_tail(project: Any, job_id: int, tail_lines: int) -> str:

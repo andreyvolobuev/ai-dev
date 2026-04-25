@@ -12,6 +12,9 @@ from virtual_dev.infrastructure.db.models import (
     MergeRequestRow,
     MrHistoryRow,
     PlanRow,
+    QuestionAnswerRow,
+    QuestionFragmentRow,
+    QuestionRow,
     TaskRow,
 )
 
@@ -22,6 +25,9 @@ __all__ = [
     "MergeRequestRow",
     "MrHistoryRow",
     "PlanRow",
+    "QuestionAnswerRow",
+    "QuestionFragmentRow",
+    "QuestionRow",
     "TaskRow",
     "make_engine",
     "make_session_factory",

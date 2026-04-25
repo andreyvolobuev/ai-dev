@@ -32,10 +32,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents import DevAgent, ResponderAction, ThreadResponderAgent
+from virtual_dev.application.services.clarification import ClarificationOrchestrator
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
 from virtual_dev.domain.ports.chat import ChatPort
+from virtual_dev.domain.ports.vcs import VcsPort
 from pathlib import Path
 
 from virtual_dev.infrastructure.config import AppConfig, Settings
@@ -68,6 +70,8 @@ class MmThreadListener:
         session_factory: async_sessionmaker[AsyncSession],
         config: AppConfig,
         settings: Settings,
+        vcs: VcsPort | None = None,
+        clarification_orchestrator: ClarificationOrchestrator | None = None,
     ) -> None:
         self._chat = chat
         self._communicator = communicator
@@ -76,6 +80,8 @@ class MmThreadListener:
         self._session_factory = session_factory
         self._config = config
         self._settings = settings
+        self._vcs = vcs
+        self._clarification = clarification_orchestrator
         self._stop_event = asyncio.Event()
         self._running = False
         self.stats = MmListenerStats()
@@ -133,10 +139,36 @@ class MmThreadListener:
             logger.info("MmThreadListener stopped")
 
     async def _dispatch(self, event: ChatMessage) -> None:
-        # Filters: must be a threaded reply, must not be ours.
-        if not event.thread_root_id:
-            return
         if event.trusted:
+            return
+
+        # Clarification fragment? Phase 3.8 model: each MM event under a
+        # bot-asked question is one *fragment* — we append, restart the
+        # idle timer, and let the AnswerCoalescerWorker eventually
+        # classify the merged text. NO immediate ack here (mid-message
+        # acks read as the bot interrupting).
+        #
+        # Two routing forms:
+        #   * Thread-reply → match by ``asked_post_id``.
+        #   * Plain DM (no thread root) → FIFO oldest active question
+        #     for this channel + author.
+        if self._clarification is not None:
+            question = None
+            if event.thread_root_id:
+                question = await self._clarification.find_question_by_thread(
+                    event.thread_root_id,
+                )
+            if question is None:
+                question = await self._clarification.find_question_by_channel(
+                    mm_channel_id=event.channel_id,
+                    mm_user_id=event.author_id,
+                )
+            if question is not None:
+                await self._handle_clarification_fragment(question, event)
+                return
+
+        # Below this point we only act on threaded replies (review thread routing).
+        if not event.thread_root_id:
             return
 
         row = await self._load_mr_by_thread(event.thread_root_id)
@@ -164,6 +196,16 @@ class MmThreadListener:
             "MmThreadListener: routing reply on {}!{} from {!r}: {!r}",
             row.repo_key, row.iid, event.author_id, event.text[:160],
         )
+        mr_diff = ""
+        if self._vcs is not None:
+            try:
+                mr_diff = await self._vcs.get_mr_diff(row.repo_key, row.iid)
+            except Exception:
+                logger.exception(
+                    "MmThreadListener: get_mr_diff failed for {}!{}",
+                    row.repo_key, row.iid,
+                )
+
         decision = await self._responder.decide(
             mr_title=row.title,
             mr_description=row.description or "",
@@ -172,6 +214,7 @@ class MmThreadListener:
             thread=transcript,
             latest_reply=event,
             repo_workspace=self._resolve_repo_workspace(row.repo_key),
+            mr_diff=mr_diff,
         )
         logger.info(
             "MmThreadListener: decision={} reasoning={!r}",
@@ -198,6 +241,58 @@ class MmThreadListener:
             await self._chat.add_reaction(event.id, _PROCESSED_REACTION)
         except Exception:
             logger.warning("MmThreadListener: add_reaction failed for post {}", event.id)
+
+    async def _handle_clarification_fragment(
+        self, question: object, event: ChatMessage,
+    ) -> None:
+        """Append the incoming MM event as a fragment of this Question.
+
+        This is the new Phase 3.8 contract: we DON'T classify here. The
+        AnswerCoalescerWorker is the one that calls the LLM after the
+        idle window has passed. Here we just persist + restart the
+        timer.
+
+        Idempotency is ensured at two levels:
+        * The bot's ✅-reaction acts as a fast no-op for replays.
+        * The DB has UNIQUE on ``mm_post_id`` so even without the
+          reaction, a duplicate WS-delivery collapses cleanly.
+        """
+        from virtual_dev.domain.models.clarification import (
+            Question as _Question,
+        )
+
+        assert self._clarification is not None
+        assert isinstance(question, _Question)
+
+        # Fast path: skip if we already reacted on this exact post.
+        fresh_post = await self._chat.get_post(event.id)
+        if fresh_post is not None and _PROCESSED_REACTION in fresh_post.bot_reactions:
+            logger.debug(
+                "MmThreadListener: clarification fragment {} already processed",
+                event.id,
+            )
+            return
+
+        try:
+            await self._clarification.append_fragment(question.id, event)
+        except Exception:
+            logger.exception(
+                "MmThreadListener: append_fragment crashed for question {}",
+                question.id,
+            )
+            return
+
+        # React ✅ as soon as the fragment is persisted — don't wait for
+        # classification (we don't want to re-process on coalescer
+        # retry). The orchestrator will post the contextual ack
+        # (DIRECT/REDIRECT/etc.) once classification runs.
+        try:
+            await self._chat.add_reaction(event.id, _PROCESSED_REACTION)
+        except Exception:
+            logger.warning(
+                "MmThreadListener: add_reaction failed for fragment post {}",
+                event.id,
+            )
 
     async def _run_iteration(
         self,

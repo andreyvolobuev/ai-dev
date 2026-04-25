@@ -26,7 +26,13 @@ from virtual_dev.application.agents.orchestrator import (
     TOPIC_TASK_DISCOVERED,
 )
 from virtual_dev.infrastructure.container import Container
-from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow, TaskRow
+from virtual_dev.infrastructure.db import (
+    MergeRequestRow,
+    PlanRow,
+    QuestionAnswerRow,
+    QuestionRow,
+    TaskRow,
+)
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
 from virtual_dev.runtime.workers import (
@@ -35,6 +41,7 @@ from virtual_dev.runtime.workers import (
     DevInbox,
     MmThreadListener,
     PollerWorker,
+    make_answer_coalescer_worker,
 )
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -67,6 +74,8 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         task_tracker=container.task_tracker,
         config=container.config,
         message_bus=container.message_bus,
+        clarification_orchestrator=container.clarification_orchestrator,
+        session_factory=container.session_factory,
     )
     analyst_runner = AgentRunner(
         agent_key=AnalystAgent.agent_key,
@@ -102,6 +111,11 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         ticks={"devops": container.devops.tick},
     )
 
+    coalescer_poller = make_answer_coalescer_worker(
+        orchestrator=container.clarification_orchestrator,
+        interval_seconds=container.settings.answer_coalesce_poll_interval_seconds,
+    )
+
     mm_listener: MmThreadListener | None = None
     if container.chat is not None and container.vcs is not None:
         mm_listener = MmThreadListener(
@@ -112,6 +126,8 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             session_factory=container.session_factory,
             config=container.config,
             settings=container.settings,
+            vcs=container.vcs,
+            clarification_orchestrator=container.clarification_orchestrator,
         )
 
     @asynccontextmanager
@@ -129,13 +145,16 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                 background.append(asyncio.create_task(
                     devops_poller.run_forever(), name="devops-poller",
                 ))
+            background.append(asyncio.create_task(
+                coalescer_poller.run_forever(), name="answer-coalescer-poller",
+            ))
             if mm_listener is not None:
                 background.append(asyncio.create_task(
                     mm_listener.run_forever(), name="mm-thread-listener",
                 ))
             logger.info(
                 "Started: orchestrator + analyst-runner + {} dev runner(s) "
-                "+ reviewer/devops pollers + mm-thread-listener={}",
+                "+ reviewer/devops/coalescer pollers + mm-thread-listener={}",
                 len(dev_runners), mm_listener is not None,
             )
         try:
@@ -147,6 +166,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                 await runner.stop()
             await reviewer_poller.stop()
             await devops_poller.stop()
+            await coalescer_poller.stop()
             if mm_listener is not None:
                 await mm_listener.stop()
             for task in background:
@@ -219,6 +239,39 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                         .order_by(MergeRequestRow.created_at.desc())
                     )
                 ).scalars().all())
+                # Phase 3.8: questions tree replaces flat clarifications.
+                question_rows = list((
+                    await session.execute(
+                        select(QuestionRow)
+                        .where(
+                            QuestionRow.tracker == row.tracker,
+                            QuestionRow.task_external_id == row.external_id,
+                        )
+                        .order_by(QuestionRow.id.asc())
+                    )
+                ).scalars().all())
+                # Pre-load latest answer (if any) per question for the
+                # template — avoids N+1 in the loop.
+                answer_rows = list((
+                    await session.execute(
+                        select(QuestionAnswerRow).where(
+                            QuestionAnswerRow.question_id.in_(
+                                [q.id for q in question_rows]
+                            )
+                        )
+                    )
+                ).scalars().all()) if question_rows else []
+                answers_by_qid = {a.question_id: a for a in answer_rows}
+                questions = [
+                    {
+                        "row": q,
+                        "answer": answers_by_qid.get(q.id),
+                        "indent": q.chain_depth,
+                    }
+                    for q in question_rows
+                ]
+            else:
+                questions = []
         if row is None:
             return HTMLResponse("Not found", status_code=404)
         return templates.TemplateResponse(
@@ -227,6 +280,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                 "task": row,
                 "plans": [row_to_plan(p) for p in plans],
                 "mrs": mrs,
+                "questions": questions,
             },
         )
 

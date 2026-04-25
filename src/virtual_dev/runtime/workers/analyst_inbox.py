@@ -14,16 +14,20 @@ from __future__ import annotations
 import uuid
 
 from loguru import logger
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents import AnalystAgent
 from virtual_dev.application.agents.orchestrator import (
     TOPIC_PLAN_READY,
     dev_agent_key,
 )
+from virtual_dev.application.services.clarification import ClarificationOrchestrator
 from virtual_dev.domain.models.plan import Plan, PlanStatus
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 from virtual_dev.infrastructure.config import AppConfig
+from virtual_dev.infrastructure.db import PlanRow, TaskRow
 
 
 def _render_plan_comment(
@@ -89,6 +93,8 @@ class AnalystInbox:
         message_bus: MessageBusPort | None = None,
         post_to_tracker: bool = True,
         dev_specialisation: str = "backend",
+        clarification_orchestrator: ClarificationOrchestrator | None = None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self._analyst = analyst
         self._task_tracker = task_tracker
@@ -96,6 +102,8 @@ class AnalystInbox:
         self._message_bus = message_bus
         self._post_to_tracker = post_to_tracker
         self._dev_specialisation = dev_specialisation
+        self._clarification = clarification_orchestrator
+        self._session_factory = session_factory
 
     async def handle(self, message: AgentMessage) -> None:
         tracker = str(message.payload.get("tracker") or "")
@@ -140,6 +148,31 @@ class AnalystInbox:
                     "AnalystInbox: failed to comment plan on {}", external_id,
                 )
 
+        # CLARIFYING plan with open questions → spawn root Questions in
+        # the clarification subsystem. The Dev-agent does NOT get
+        # ``plan.ready`` until the human answers come back and the
+        # Analyst re-plans (Phase 3.8 contract).
+        if (
+            plan.status == PlanStatus.CLARIFYING
+            and plan.open_questions
+            and self._clarification is not None
+            and self._session_factory is not None
+        ):
+            task_row, plan_row_id = await self._load_task_and_plan_id(
+                tracker, external_id,
+            )
+            if task_row is not None and plan_row_id is not None:
+                try:
+                    await self._clarification.request_clarifications(
+                        task_row=task_row, plan=plan, plan_row_id=plan_row_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "AnalystInbox: clarification dispatch failed for {}",
+                        external_id,
+                    )
+            return
+
         # Phase 2 hand-off: when the plan is clean and a target repo is
         # known, publish plan.ready so the Dev-agent can pick it up. We do
         # NOT publish when the plan has open questions — the task waits for
@@ -160,3 +193,30 @@ class AnalystInbox:
                     "repo_key": plan.target_repo_key,
                 },
             ))
+
+    async def _load_task_and_plan_id(
+        self, tracker: str, external_id: str,
+    ) -> tuple[TaskRow | None, int | None]:
+        """Look up the task row + the latest non-superseded plan id for
+        clarifier bookkeeping."""
+        assert self._session_factory is not None
+        async with self._session_factory() as session:
+            task_row = (await session.execute(
+                select(TaskRow).where(
+                    TaskRow.tracker == tracker,
+                    TaskRow.external_id == external_id,
+                )
+            )).scalar_one_or_none()
+            if task_row is None:
+                return None, None
+            plan_row = (await session.execute(
+                select(PlanRow)
+                .where(
+                    PlanRow.tracker == tracker,
+                    PlanRow.task_external_id == external_id,
+                    PlanRow.status != PlanStatus.SUPERSEDED.value,
+                )
+                .order_by(PlanRow.created_at.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+            return task_row, (plan_row.id if plan_row is not None else None)

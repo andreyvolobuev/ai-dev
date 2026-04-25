@@ -28,12 +28,19 @@ from virtual_dev.application.agents.devops import DevOpsAgent
 from virtual_dev.application.agents.orchestrator import dev_agent_key
 from virtual_dev.application.agents.reviewer import ReviewerAgent
 from virtual_dev.application.agents.thread_responder import ThreadResponderAgent
+from virtual_dev.application.agents.answer_classifier import AnswerClassifier
+from virtual_dev.application.agents.counter_answerer import CounterQuestionAnswerer
 from virtual_dev.application.services import (
     CommunicatorService,
     InjectionFilter,
     PromptsLoader,
     ResearcherToolkit,
     RulesLoader,
+)
+from virtual_dev.application.services.clarification import (
+    ClarificationOrchestrator,
+    QuestionRepository,
+    StakeholderResolver,
 )
 from virtual_dev.domain.ports.chat import ChatPort
 from virtual_dev.domain.ports.code_agent import CodeAgentPort
@@ -82,6 +89,12 @@ class Container:
     reviewer: ReviewerAgent
     devops: DevOpsAgent
     thread_responder: ThreadResponderAgent
+    # Phase 3.8: clarification subsystem.
+    question_repo: QuestionRepository
+    answer_classifier: AnswerClassifier
+    counter_answerer: CounterQuestionAnswerer
+    stakeholder_resolver: StakeholderResolver
+    clarification_orchestrator: ClarificationOrchestrator
 
     async def init_db(self) -> None:
         """Create all tables. Used by ``virtual-dev db init``."""
@@ -157,6 +170,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         logger.warning("Confluence credentials missing — KB disabled")
 
     vcs: VcsPort | None = None
+    gitlab_bot_username: str | None = None
     if settings.gitlab_url and settings.gitlab_token:
         vcs = GitLabVcs(
             config=config,
@@ -168,6 +182,19 @@ def build_container(config_dir: Path | str = "config") -> Container:
                 email=settings.dev_git_author_email,
             ),
         )
+        # Resolve our own GitLab username so the Reviewer filters out the
+        # bot's own MR comments instead of feeding them back through the
+        # ThreadResponder (#13 in techdebt).
+        try:
+            client = vcs._client   # type: ignore[attr-defined]
+            client.auth()
+            gitlab_bot_username = (
+                str(client.user.username) if client.user else None  # type: ignore[union-attr]
+            ) or None
+            if gitlab_bot_username:
+                logger.info("GitLab bot username resolved: @{}", gitlab_bot_username)
+        except Exception:
+            logger.exception("could not resolve GitLab bot username; reviewer filter degraded")
     else:
         logger.warning(
             "GitLab credentials missing — VCS disabled; Dev-agent will not run"
@@ -241,6 +268,40 @@ def build_container(config_dir: Path | str = "config") -> Container:
         prompts_loader=prompts_loader,
     )
 
+    # Phase 3.8: clarification subsystem.
+    question_repo = QuestionRepository(session_factory=session_factory)
+    answer_classifier = AnswerClassifier(
+        code_agent=code_agent,
+        config=config,
+        prompts_loader=prompts_loader,
+        injection_filter=injection_filter,
+    )
+    counter_answerer = CounterQuestionAnswerer(
+        code_agent=code_agent,
+        config=config,
+        prompts_loader=prompts_loader,
+        researcher=researcher if mr_history else researcher,
+        injection_filter=injection_filter,
+    )
+    stakeholder_resolver = StakeholderResolver(
+        communicator=communicator,
+        code_agent=code_agent,
+        config=config,
+        prompts_loader=prompts_loader,
+        injection_filter=injection_filter,
+        confidence_threshold=0.8,
+    )
+    clarification_orchestrator = ClarificationOrchestrator(
+        repo=question_repo,
+        communicator=communicator,
+        classifier=answer_classifier,
+        counter_answerer=counter_answerer,
+        stakeholder_resolver=stakeholder_resolver,
+        config=config,
+        session_factory=session_factory,
+        message_bus=message_bus,
+    )
+
     # bot_username here is the GitLab username — comments authored by that
     # user on our MRs are our own. Primary signal inside the agent is still
     # the per-MR author_username (which matches by definition); this is a
@@ -254,7 +315,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         session_factory=session_factory,
         config=config,
         message_bus=message_bus,
-        bot_username=None,
+        bot_username=gitlab_bot_username,
         responder=thread_responder,
         dev_agents=dict(dev_agents),
     )
@@ -292,6 +353,11 @@ def build_container(config_dir: Path | str = "config") -> Container:
         reviewer=reviewer,
         devops=devops,
         thread_responder=thread_responder,
+        question_repo=question_repo,
+        answer_classifier=answer_classifier,
+        counter_answerer=counter_answerer,
+        stakeholder_resolver=stakeholder_resolver,
+        clarification_orchestrator=clarification_orchestrator,
     )
 
 

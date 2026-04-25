@@ -218,6 +218,80 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
   - Тесты: 102 (на старте сегодняшней сессии было 91). Новые: pipeline-gate review_ping, autofix dispatch+escalation, iteration silent-push state, listener+settings, GitLab comment routing.
 
 - ✅ **Фаза 3.5** — MM-тред как канал ревью. Бот слушает WebSocket (с SSL-фиксом от poker-planning-bot), при каждом реплае в "please review"-треде спрашивает у `ThreadResponderAgent` (LLM через claude-agent-sdk): ответить текстом / внести правку / молча проигнорировать. Агент знает про injection-фильтр, может послать коллег "погуляй" если фидбек бредовый. Для правок: `DevAgent.handle_iteration` — checkout существующей ветки (`VcsPort.checkout_existing_branch`), новый коммит поверх, push. GitLab автоматически обновляет MR. Идемпотентность через реакцию ✅ (`white_check_mark`) на обработанном посте. Новые колонки `MergeRequestRow.review_thread_{channel_id,root_id}`. Новый worker `MmThreadListener` в web lifespan. 97 unit-тестов.
+
+- ✅ **Phase 3.8 (2026-04-26)** — переписан clarification flow в нормальную доменную модель.
+  Старый `ClarifierService` (один DM = один ответ, всё первое сообщение в DM) удалён, заменён на дерево вопросов с LLM-классификацией ответов.
+  - **Доменные модели** (`src/virtual_dev/domain/models/clarification.py`):
+    - `Question` — узел дерева. `parent_id`/`root_id`/`chain_depth` задают редирект-цепочку.
+    - `Stakeholder` (`StakeholderKind`: EXPLICIT_HANDLE / EMAIL / TASK_AUTHOR / TEAM_CHANNEL / TEAM_LEAD / UNRESOLVED_NAME / BOT) — кому задаём вопрос.
+    - `Answer` — фрагменты + coalesced_text + классификация + extracted-payload.
+    - `QuestionState`: PENDING → ASKING → COALESCING → CLASSIFYING → {ANSWERED | REDIRECTED | COUNTER_PENDING | ASKING_FOR_STAKEHOLDER | ABANDONED | ESCALATED}.
+    - `Classification`: DIRECT / REDIRECT / COUNTER_QUESTION / DONT_KNOW / OUT_OF_SCOPE / HANDLE_PROVIDED.
+    - `CounterQuestionKind`: FACTUAL (бот сам отвечает) / BUSINESS (эскалация автору тикета).
+  - **БД (`infrastructure/db/models.py`)**: дропнули `clarifications`, добавили три таблицы:
+    - `questions` — узлы дерева; индексы `(state, last_fragment_at)` для горячих query coalescer'а, `deadline_at` для sweep'а.
+    - `question_fragments` — сырые MM-сообщения, `mm_post_id UNIQUE` для идемпотентности WS-replays.
+    - `question_answers` — итог классификации (1:1 с question, опционально), audit trail с `extracted_json`.
+  - **Компоненты:**
+    - `QuestionRepository` (`application/services/clarification/repo.py`) — единственное место, что трогает rows. `chain_user_ids()` для cycle-detection.
+    - `AnswerClassifier` (`application/agents/answer_classifier.py`) — Haiku 4.5, mirror'ит ThreadResponderAgent: structured submit_classification через `@tool`+JSON-schema. Промпт `config/prompts/answer_classifier.md` детализирует все 6 типов ответов и subkind для counter-Q.
+    - `CounterQuestionAnswerer` (`application/agents/counter_answerer.py`) — Sonnet 4.5 с Read/Glob/Grep + Researcher. Output `{answer_text, confidence, escalate_to_reporter}`. По умолчанию `counter_question_confidence_threshold=0.6` — ниже — fallback на BUSINESS-путь.
+    - `StakeholderResolver` (`application/services/clarification/stakeholder_resolver.py`) — детерминистика для `@nick`/email; для свободно-формного имени → LLM (`stakeholder_resolver.md`) пытается дать `firstname.lastname` транслитерацию. Если LLM confidence ниже 0.8 ИЛИ MM не находит — `UNRESOLVED_NAME` → orchestrator спавнит ASKING_FOR_STAKEHOLDER.
+    - `ClarificationOrchestrator` (`application/services/clarification/orchestrator.py`) — owner state machine'а, `apply_classification` маршрутизирует все 6 классификаций, плюс `flush_idle()` (coalescer-tick) и `sweep_deadlines()` (timeout-tick).
+  - **Coalescing**: люди отвечают порциями («дай минуту… так… в общем смотри в коде у Васи… ой нет, лучше у Пети»). `MmThreadListener` теперь НЕ классифицирует на каждом event'е — только append'ит fragment + reset'ит idle-timer. `AnswerCoalescerWorker` (PollerWorker-обёртка с двумя tick'ами `flush_idle`/`deadline_sweep`) раз в 60s проверяет: если `last_fragment_at + coalesce_window_seconds (default=600) <= now` → coalesce all unflushed fragments → call AnswerClassifier → drive state machine. Пока человек пишет — мы молчим. Mid-message ack удалён (читался как «бот перебил»).
+  - **Loop guards** (все pure-state, без LLM):
+    - `max_chain_depth=4`: a→b→c→d → пятый редирект → ABANDONED + ESCALATED.
+    - **Cycle detection**: `chain_user_ids` от родителя → если редирект резолвится в уже-в-цепочке user_id → escalate.
+    - `max_question_age_hours=48`: deadline_sweep tick'ом.
+    - `max_subquestions_per_root=10`: страховка от runaway-дерева.
+  - **Counter-question hybrid mode** (по выбору user'а):
+    - FACTUAL counter-Q (типа «какая из 10 ручек?») → `CounterQuestionAnswerer` сам читает Issue + код через Read/Glob/Grep + Researcher → постит контекст в DM-тред respondent'а → родитель остаётся в ASKING (idle-timer крутится для следующего ответа).
+    - BUSINESS counter-Q (типа «что важнее — скорость или точность?») → spawn child Question со stakeholder=task.reporter_id. Standard clarification cycle.
+    - Низкий confidence FACTUAL → fallback на BUSINESS-путь автоматически.
+  - **Re-publish task.discovered**: когда все root-Q дерева в terminal-state и хотя бы один в ANSWERED — orchestrator складывает Q&A-блок в `task.description`, помечает план `superseded`, публикует `task.discovered` → Analyst переплáнирует. Цикл может повториться (новый план снова clarifying — по новой задаём вопросы).
+  - **Конфиг (`config/agents.yaml`)**: новая секция `clarification:` с tunable'ами; новые агенты `answer_classifier`/`counter_answerer`/`stakeholder_resolver` в блоке `agents:` (модели — lightweight/default/lightweight соответственно). `config/notifications.yaml`: 6 новых шаблонов (`clarifier_redirect_ack`, `clarifier_handle_request`, `clarifier_counter_factual_intro`, `clarifier_out_of_scope_ack`, `clarifier_dont_know_ack`, `clarifier_escalation_to_lead`). `config/prompts/{answer_classifier,counter_answerer,stakeholder_resolver}.md`.
+  - **CLI**: `virtual-dev clarifications show DM-XXXX` — печатает дерево вопросов со state/stakeholder/answer (rich.tree).
+  - **Дашборд**: `/tasks/{id}` рендерит дерево вопросов с indent по `chain_depth`, видны state каждого узла + extracted-классификация ответа.
+  - **MM Listener**: переписан с `accept_answer` (сразу-классифицируем) на `append_fragment` (буферизуем, ждём coalescer'а). Lookup по thread + fallback по channel+author (FIFO oldest active) сохранён.
+  - **Тесты: 137** (было 108): −6 удалённых из старого test_clarifier, +35 новых:
+    - `test_clarification_repo.py` (7) — round-trip + idempotent fragment + cycle-detection + idle/overdue queries.
+    - `test_clarification_orchestrator.py` (10) — все state-transitions + max_chain_depth guard + DONT_KNOW + counter FACTUAL/BUSINESS + UNRESOLVED_NAME → handle_request + deadline_sweep + OUT_OF_SCOPE.
+    - `test_answer_classifier.py` (6) — все 6 классификаций + malformed payload + invalid string fallback.
+    - `test_stakeholder_resolver.py` (6) — explicit/email/free-form/low-confidence/give-up/MM-not-found.
+    - `test_counter_answerer.py` (4) — high/low confidence + no-capture + clamp.
+    - `test_mm_thread_listener_clarification.py` (2) — fragment-append (threaded + plain DM), no mid-message ack.
+  - **Schema migration**: `rm data/virtual_dev.db && uv run virtual-dev db init` (или просто `db init` — `create_all` идемпотентен и добавит новые таблицы; старая `clarifications` останется-неиспользуемой).
+
+- ✅ **Фаза 3.7 (2026-04-25 поздний вечер)** — техдолг + clarification flow. Закрыли 9 пунктов техдолга и реализовали критический функционал «бот сам уточняет инфу у людей до того как пускать Dev в код».
+  - **Clarification flow** (`application/services/clarifier.py` — новый сервис):
+    - Аналитик может в `submit_plan` поставить `status: clarifying` + `open_questions[]`. Промпт `analyst.md` обновлён: явно требует ставить clarifying когда в тикете "уточнить у X / спросить Y / API будет позже / схема TBD" — было бы строго лучше задать лишний вопрос, чем зашиппить неправильный код.
+    - При CLARIFYING-плане `AnalystInbox` зовёт `ClarifierService.request_clarifications(...)`: каждый вопрос идёт DM'ом в Маттермост к `ask_whom` (ресолвится как username, если не получилось — как email; иначе — fallback на `escalation.mattermost_user` с пометкой "перенаправлено"). Каждый отправленный DM-пост записывается строкой в новой таблице `clarifications` (см. `ClarificationRow` ORM).
+    - Когда человек отвечает в DM, `MmThreadListener._dispatch` сначала смотрит, не реплай ли это под нашим вопросом-DM'ом (по `mm_root_post_id` для tread-ответа или по `mm_channel_id`+автору для plain-DM ответа). Если да — `ClarifierService.accept_answer(...)` записывает ответ; ack-постится в DM ("спасибо, записал"). Идемпотентность через ✅-реакцию на пост-ответ.
+    - Когда последний вопрос для плана отвечен, Clarifier:
+       - дописывает Q&A-блок в `task.description`,
+       - старый план помечает `status=superseded`,
+       - публикует на шине новый `task.discovered` → Analyst переплáнирует уже с уточнениями. Цикл может повториться, если новый план снова clarifying.
+    - В дашборде на `/tasks/{id}` появилась секция "Уточнения" со статусом каждого вопроса (ждём/отвечено) + история Q&A.
+    - Конфиг: `notifications.mattermost.{clarifier_question, clarifier_answer_ack, clarifier_all_answered_ack}` — вынесены в `config/notifications.yaml`. Дефолты на русском.
+    - Тесты: `test_clarifier.py` — 6 кейсов (DM-диспатч с разными формами ask_whom, идемпотентность, fallback на тимлида, цикл "ответ → re-publish → supersede", FIFO-pickup для plain-DM ответа).
+  - **#13 Bot self-comment loop в GitLab** — Container'е резолвим свой GitLab username через `gl.user.username`, прокидываем в `ReviewerAgent.bot_username`. Теперь `_is_bot_author` явно дропает комменты от нашего MR-автора (а не только по `row.author_username`).
+  - **#2 Hot-reload системных промптов** — `PromptsLoader` теперь кеширует по `(name, mtime_ns)`. Edit `config/prompts/*.md` → следующий tick подхватывает без рестарта. Лог `reloaded prompt {name} (file changed)` подтверждает hit.
+  - **#11 Concurrent task workspace race** — `GitLabVcs._repo_locks: dict[str, asyncio.Lock]`. Все мутирующие локальные ops (`fetch_and_checkout`, `checkout_existing_branch`, `create_branch`, `commit_all`, `push`, новый `merge_base_into_current`) под per-repo lock'ом. `ensure_clone` без lock'а — идемпотентен и читать race здесь не страшно.
+  - **#12 Merge-conflict on iteration** — новый `VcsPort.merge_base_into_current(repo, base) -> bool` (default-impl `True`, реализация в GitLabVcs делает `git merge --no-edit origin/<base>`, на conflict — `git merge --abort` + `False`). `Dev.handle_iteration` после `checkout_existing_branch` зовёт его; на False возвращает `DevResult(FAILED, stopped_reason=merge-conflict-with-<base>)` — человек разруливает руками.
+  - **#1 GitLab reply threading** — `ReviewComment.discussion_id` добавлено в доменную модель. `GitLabVcs.list_review_comments` теперь идёт через `mr.discussions.list(...)`, плюский notes-список собирается с привязкой к discussion. `reply_to_comment` использует discussion id (с graceful fallback на top-level note). `Reviewer._handle_gitlab_actionable` для REPLY decision'а вызывает `reply_to_comment` если знает discussion_id, иначе `add_mr_comment`.
+  - **#14 ThreadResponder MR diff** — `VcsPort.get_mr_diff(repo, iid) -> str` (default `""`, в GitLabVcs синтезирует unified-diff из `mr.changes()` с обрезанием на ~50KB). `ThreadResponderAgent.decide(..., mr_diff=...)` принимает диф и встраивает в prompt блоком ```diff. И `MmThreadListener`, и `Reviewer` теперь подтягивают diff и пробрасывают.
+  - **#4 Rate-limit handling** — `ClaudeAgentSdkCodeAgent` обернут в retry-loop с экспоненциальным backoff'ом. Detector — regex по тексту exception/stderr (`rate_limit | 429 | too many requests | 5h limit | usage limit reached`). По дефолту 2 попытки c 60s/180s sleep'ом. Если падение — не rate-limit, поднимаем сразу.
+  - **#9 Dashboard улучшения (partial)** — `/mrs` показывает столбцы `pipeline_status` (с CSS-классом), autofix-attempts (с warning-иконкой если escalated), pending CI sha. На `/tasks/{id}` MR-список тоже расширен. Появилась секция "Уточнения" (см. clarification flow выше). Полный rewrite дашборда (timeline, override-кнопки) — отложено.
+  - **Тесты: 108** (было 102): добавлены 6 в `test_clarifier.py`. Существующие 102 не сломались.
+
+- **Phase 3.7 — отложено в техдолге (зафиксировано здесь, делаем позже):**
+  - **#5 Vault для секретов** — пока `.env` достаточно. Vault интеграция требует выяснить, какой Vault в компании, согласовать политику. Не блокер для реальных задач.
+  - **#6 Long-running stability** — нужны метрики память/CPU/connections + автоматический recycle WS подключения, перезапуск после OOM. Делается, когда боль реально возникнет на продакшен-нагрузке.
+  - **#7 Monitoring** — Prometheus/Grafana, alerts. Сейчас лога loguru хватает. Нужно при росте репо/команды.
+  - **#8 Test coverage** — 108 unit-тестов покрывают happy-path. Нужны e2e тесты с реальным GitLab/Jira/MM в docker-compose. Дорого собирать, делается, когда стабилизируется фичеспек.
+  - **#10 Web dashboard полный rewrite** — таймлайн событий, кнопки override "пни ревьюеров вручную", "перепланируй", "stop". Сейчас сделана только partial-секция. Когда будет команда пользоваться дашбордом регулярно.
+  - **Alembic migrations** — пока БД пересоздаётся через `db init` при изменениях схемы (теряем данные). При работе на проде нужны нормальные миграции; пока на dev'е допустимо.
+
 - **Фаза 4** — обкатка на реальных задачах всей команды.
 - **Фаза 5** — автопилот, все репо, фронт-агенты, auto-fix CI DevOps-агентом, LLM-классификация комментов (замена эвристик из Phase 3).
 

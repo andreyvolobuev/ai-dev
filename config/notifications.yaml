@@ -55,6 +55,63 @@ mattermost:
   # по смыслу, но без MM-форматирования.
   gitlab_reply_iteration_done: "✅ Внёс правки, CI зелёный — коммит `{commit_sha_short}` на `{branch}`. Можно смотреть."
 
+  # --- Clarification flow (Analyst → DM → answer → re-plan) ---
+  # Бот шлёт это сообщение в DM человеку, которого Analyst указал в
+  # open_questions[].ask_whom. Доступные placeholders:
+  #   {external_id}, {title}, {task_url}, {question},
+  #   {why_it_matters}, {why_it_matters_block} (с переводом строки или пусто).
+  clarifier_question: |
+    Привет! Я бот virtual-dev, мне нужно уточнение по тикету [{external_id}]({task_url}) — *{title}*.
+
+    **Вопрос:** {question}
+    {why_it_matters_block}
+    Ответь, пожалуйста, прямо в этом DM — я подхвачу ответ и продолжу планирование.
+  # Постится тредом под вопросом когда пользователь ответил, но остались
+  # ещё другие открытые вопросы по этой задаче.
+  clarifier_answer_ack: "Спасибо! Записал ответ. По задаче ещё есть незакрытые вопросы — допишу, как соберу всё."
+  # Постится тредом под последним отвеченным вопросом когда все
+  # уточнения собраны — задача возвращается на повторное планирование.
+  clarifier_all_answered_ack: "Спасибо! Все уточнения собраны, отдаю задачу обратно аналитику на повторное планирование."
+
+  # --- Phase 3.8: tree-aware clarification ack/escalation templates ---
+  # Постится в DM-тред respondent'а, когда LLM-классификатор расценил
+  # ответ как REDIRECT и стейкхолдер успешно зарезолвился.
+  # Placeholders: {handle}, {target_display_name}.
+  clarifier_redirect_ack: "Спасибо! Перенаправил вопрос на @{handle}."
+  # Постится в DM-тред original respondent'а, когда LLM зарезолвить имя
+  # ("Вася Курочкин") в MM-ник не смог. Просим уточнить.
+  # Placeholders: {raw_name}, {original_question}.
+  clarifier_handle_request: |
+    Спасибо за наводку! Подскажи, пожалуйста, MM-ник `{raw_name}`, чтобы я мог ему написать про:
+    > {original_question}
+  # Постится в DM-тред когда бот сам отвечает на factual counter-question
+  # (CounterQuestionAnswerer вернул high-confidence ответ).
+  # Placeholders: {bot_answer}.
+  clarifier_counter_factual_intro: |
+    Уточнение для контекста: {bot_answer}
+
+    Если этого хватит — поможешь с исходным вопросом?
+  # Ack для OUT_OF_SCOPE: бота попросили отвалить или сказали "не тот человек".
+  # Не настаиваем; эскалируем тимлиду.
+  clarifier_out_of_scope_ack: "Понял, не буду беспокоить. Эскалировал вопрос тимлиду."
+  # Ack для DONT_KNOW: respondent честно сказал "не знаю".
+  clarifier_dont_know_ack: "Понял, спасибо. Эскалировал вопрос тимлиду."
+  # DM тимлиду с цепочкой контекста.
+  # Placeholders: {tracker}, {external_id}, {task_url}, {original_question},
+  #   {chain_summary} (multi-line: «спросили X → ответ Y → ...»),
+  #   {reason} (почему эскалировали).
+  clarifier_escalation_to_lead: |
+    Застрял с уточнением по тикету [{external_id}]({task_url}).
+
+    **Причина:** {reason}
+
+    **Исходный вопрос:** {original_question}
+
+    **Цепочка:**
+    {chain_summary}
+
+    Помоги, пожалуйста, разобраться или подскажи, кому переадресовать.
+
 # --- Jira (комментарии к тикетам) ---
 # Доступные placeholders:
 #   {tracker}, {external_id}, {status}, {confidence}, {summary},

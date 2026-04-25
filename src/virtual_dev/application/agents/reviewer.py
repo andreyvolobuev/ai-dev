@@ -387,6 +387,14 @@ class ReviewerAgent:
         plan = await self._load_plan(row.task_external_id)
         repo_workspace = self._resolve_repo_workspace(row.repo_key)
 
+        mr_diff = ""
+        try:
+            mr_diff = await self._vcs.get_mr_diff(row.repo_key, row.iid)
+        except Exception:
+            logger.exception(
+                "Reviewer: get_mr_diff failed for {}!{}", row.repo_key, row.iid,
+            )
+
         decision = await self._responder.decide(   # type: ignore[union-attr]
             mr_title=row.title,
             mr_description=row.description or "",
@@ -395,6 +403,7 @@ class ReviewerAgent:
             thread=transcript,
             latest_reply=latest_chat,
             repo_workspace=repo_workspace,
+            mr_diff=mr_diff,
         )
         logger.info(
             "Reviewer: GitLab comment decision={} reasoning={!r}",
@@ -404,9 +413,17 @@ class ReviewerAgent:
         if decision.action == ResponderAction.REPLY and decision.reply_text:
             assert self._vcs is not None
             try:
-                await self._vcs.add_mr_comment(
-                    row.repo_key, row.iid, decision.reply_text,
-                )
+                # Threaded reply when we know the discussion id; falls
+                # back to top-level only when GitLab didn't expose one.
+                if latest.discussion_id:
+                    await self._vcs.reply_to_comment(
+                        row.repo_key, row.iid,
+                        latest.discussion_id, decision.reply_text,
+                    )
+                else:
+                    await self._vcs.add_mr_comment(
+                        row.repo_key, row.iid, decision.reply_text,
+                    )
                 stats.gitlab_replies_posted += 1
             except Exception:
                 logger.exception("Reviewer: GitLab reply post failed")

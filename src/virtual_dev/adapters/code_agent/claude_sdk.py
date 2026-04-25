@@ -13,6 +13,8 @@ used for enforcement.
 
 from __future__ import annotations
 
+import asyncio
+import re
 from collections.abc import AsyncIterator, Iterable
 from typing import Any, cast
 
@@ -49,12 +51,40 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
         default_model: str | None = None,
         permission_mode: str = "bypassPermissions",
         cli_path: str | None = None,
+        rate_limit_max_retries: int = 2,
+        rate_limit_initial_backoff_seconds: int = 60,
     ) -> None:
         self._default_model = default_model
         self._permission_mode = permission_mode
         self._cli_path = cli_path
+        self._rate_limit_max_retries = max(0, rate_limit_max_retries)
+        self._rate_limit_initial_backoff = max(1, rate_limit_initial_backoff_seconds)
 
     async def run_task(self, request: CodeAgentRequest) -> CodeAgentResult:
+        # Wrap the actual run in a retry loop that catches Claude Max
+        # rate-limit signals (#4 in techdebt). The Claude Max session
+        # blocks on rate limits in-CLI and surfaces "rate" / "429" /
+        # "rate_limit" in stderr or in the exception message.
+        attempt = 0
+        backoff = self._rate_limit_initial_backoff
+        while True:
+            try:
+                return await self._run_task_once(request)
+            except Exception as exc:
+                if attempt >= self._rate_limit_max_retries:
+                    raise
+                if not _looks_like_rate_limit(str(exc)):
+                    raise
+                attempt += 1
+                logger.warning(
+                    "[{}] Claude rate-limited (attempt {}/{}); sleeping {}s before retry: {}",
+                    request.agent_key, attempt, self._rate_limit_max_retries,
+                    backoff, str(exc)[:200],
+                )
+                await asyncio.sleep(backoff)
+                backoff *= 3
+
+    async def _run_task_once(self, request: CodeAgentRequest) -> CodeAgentResult:
         mcp_servers = _as_mcp_servers(request.extras.get("mcp_servers"))
         allowed_tool_names = _as_allowed_tools(request.extras.get("allowed_tool_names"))
         stderr_lines: list[str] = []
@@ -123,6 +153,14 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
                         len(stderr_lines),
                         "\n".join(stderr_lines[-200:]),
                     )
+                # Surface a rate-limit signal to the run_task wrapper so
+                # it can back off and retry. Detected from stderr because
+                # the CLI exits with a generic "Command failed" otherwise.
+                stderr_blob = "\n".join(stderr_lines[-50:])
+                if _looks_like_rate_limit(stderr_blob):
+                    raise RuntimeError(
+                        f"claude rate limit hit: {stderr_blob[-400:]}"
+                    ) from exc
                 raise
         finally:
             if stderr_lines:
@@ -186,6 +224,20 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
                 stderr_sink.append(line)
             kwargs["stderr"] = _on_stderr
         return ClaudeAgentOptions(**kwargs)
+
+
+_RATE_LIMIT_RE = re.compile(
+    r"\b(rate[ _-]?limit|429\b|too many requests|rate limited|"
+    r"5h limit|usage limit reached|limit exceeded)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_rate_limit(text: str) -> bool:
+    """Heuristic: does this exception / stderr look like a rate-limit?"""
+    if not text:
+        return False
+    return bool(_RATE_LIMIT_RE.search(text))
 
 
 def _tool_input_preview(tool_input: Any) -> str:

@@ -15,6 +15,8 @@
                     <th>Branch</th>
                     <th>Status</th>
                     <th>Pipeline</th>
+                    <th>Autofix</th>
+                    <th>Pending CI</th>
                     <th>When</th>
                 </tr>
             </thead>
@@ -31,7 +33,21 @@
                         <td>{{ mr.title | truncate(80) }}</td>
                         <td><code>{{ mr.source_branch }}</code></td>
                         <td><span class="status status-{{ mr.status }}">{{ mr.status }}</span></td>
-                        <td>{{ mr.pipeline_status }}</td>
+                        <td><span class="status status-{{ mr.pipeline_status }}">{{ mr.pipeline_status }}</span></td>
+                        <td>
+                            {% if mr.pipeline_autofix_escalated %}
+                                <span class="status status-failed" title="Escalated to team-lead">⚠ {{ mr.pipeline_autofix_attempts }}</span>
+                            {% elif mr.pipeline_autofix_attempts %}
+                                {{ mr.pipeline_autofix_attempts }}
+                            {% else %}
+                                —
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if mr.iteration_pending_ci_sha %}
+                                <code title="ack target: {{ mr.iteration_ack_target or '—' }}">{{ mr.iteration_pending_ci_sha[:8] }}</code>
+                            {% else %}—{% endif %}
+                        </td>
                         <td>{{ mr.created_at.strftime("%Y-%m-%d %H:%M") if mr.created_at else "—" }}</td>
                     </tr>
                 {% endfor %}

@@ -10,6 +10,10 @@ Files may use ``{untrusted_warning}`` as a placeholder; the caller
 substitutes the canonical injection-filter notice. Other placeholders
 the caller doesn't know about are left literal so a missing key
 shouldn't crash the run.
+
+Cache strategy: keyed by ``(name, mtime_ns)``. When the file on disk
+changes, ``stat()`` returns a new mtime and we re-read — operators can
+edit prompts and pick up changes within the next agent run, no restart.
 """
 
 from __future__ import annotations
@@ -22,25 +26,37 @@ from loguru import logger
 class PromptsLoader:
     def __init__(self, prompts_dir: str | Path) -> None:
         self._prompts_dir = Path(prompts_dir)
-        self._cache: dict[str, str] = {}
+        # name → (mtime_ns, text). mtime_ns == -1 means "file missing,
+        # fallback cached".
+        self._cache: dict[str, tuple[int, str]] = {}
 
     def load(self, name: str, fallback: str = "") -> str:
         """Return the contents of ``<prompts_dir>/<name>.md`` or ``fallback``.
 
-        Cached after first read; the file is expected to be stable for
-        the lifetime of the process. Restart to pick up edits.
+        Re-reads if the on-disk mtime has changed since the last cache
+        entry (allows operators to tune prompts without restarting).
         """
-        if name in self._cache:
-            return self._cache[name]
         path = self._prompts_dir / f"{name}.md"
-        if not path.is_file():
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except FileNotFoundError:
+            mtime_ns = -1
+
+        cached = self._cache.get(name)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
+
+        if mtime_ns == -1:
             logger.warning(
                 "PromptsLoader: prompt file missing — {} (using fallback)", path,
             )
-            self._cache[name] = fallback
+            self._cache[name] = (-1, fallback)
             return fallback
+
         text = path.read_text(encoding="utf-8").strip()
-        self._cache[name] = text
+        if cached is not None:
+            logger.info("PromptsLoader: reloaded prompt {!r} (file changed)", name)
+        self._cache[name] = (mtime_ns, text)
         return text
 
     def render(self, name: str, fallback: str = "", **kwargs: str) -> str:

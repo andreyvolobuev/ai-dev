@@ -62,6 +62,25 @@ class VcsPort(ABC):
     async def has_uncommitted_changes(self, repo_key: str) -> bool:
         """Return ``True`` iff the working tree has staged or unstaged changes."""
 
+    async def merge_base_into_current(self, repo_key: str, base: str) -> bool:
+        """Merge ``origin/<base>`` into the currently checked-out branch.
+
+        Returns ``True`` on a clean merge (or already up-to-date),
+        ``False`` if the merge conflicted (caller should give up). Default
+        impl is a no-op that returns ``True`` so test fakes don't need
+        boilerplate.
+        """
+        return True
+
+    async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+        """Return the unified diff for an MR.
+
+        Default impl returns empty string. Used by ThreadResponder so it
+        can ground its decision in the actual code change instead of just
+        the title + plan summary (#14 in techdebt).
+        """
+        return ""
+
     # --- Remote API ---
 
     @abstractmethod

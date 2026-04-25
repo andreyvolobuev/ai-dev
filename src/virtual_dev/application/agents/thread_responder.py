@@ -113,11 +113,13 @@ class ThreadResponderAgent:
         thread: Sequence[ChatMessage],
         latest_reply: ChatMessage,
         repo_workspace: str | None = None,
+        mr_diff: str = "",
     ) -> ResponderDecision:
         prompt = self._render_prompt(
             mr_title=mr_title, mr_description=mr_description,
             mr_web_url=mr_web_url, plan=plan,
             thread=thread, latest=latest_reply,
+            mr_diff=mr_diff,
         )
         captured, result = await self._call_model(prompt, repo_workspace)
 
@@ -196,6 +198,7 @@ class ThreadResponderAgent:
         plan: Plan | None,
         thread: Sequence[ChatMessage],
         latest: ChatMessage,
+        mr_diff: str = "",
     ) -> str:
         parts: list[str] = []
         parts.append("# Review thread context")
@@ -216,6 +219,12 @@ class ThreadResponderAgent:
                 parts.append("### Plan steps")
                 for step in plan.steps:
                     parts.append(f"{step.order}. {step.summary}")
+            parts.append("")
+        if mr_diff.strip():
+            parts.append("## MR diff (the actual change under review)")
+            parts.append("```diff")
+            parts.append(mr_diff[:50_000])
+            parts.append("```")
             parts.append("")
         parts.append("## Thread so far (oldest first)")
         wrapped_thread = self._filter.wrap(

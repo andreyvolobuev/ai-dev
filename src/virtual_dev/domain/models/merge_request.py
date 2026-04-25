@@ -39,6 +39,11 @@ class ReviewComment:
     # comments`, marked draft → ready и т.п.) как system=True. Reviewer
     # их не маршрутизирует в LLM — это шум, не запрос от человека.
     system: bool = False
+    # GitLab discussion id this note belongs to. Set when the comment was
+    # fetched via the discussions endpoint; used by reply_to_comment to
+    # post threaded replies (#1 in techdebt). For top-level notes
+    # GitLab still gives us a synthesised discussion of one note.
+    discussion_id: str | None = None
 
 
 @dataclass

@@ -281,6 +281,26 @@ class DevAgent:
         workspace_path = await self._vcs.ensure_clone(self._repo_key)
         await self._vcs.checkout_existing_branch(self._repo_key, branch_name)
 
+        # Refresh against master before iterating: stale branches that have
+        # diverged silently produce a "Merge conflict" pipeline failure
+        # the LLM can't act on. Pull master in proactively; on a merge
+        # conflict, give up cleanly and surface FAILED so the human can
+        # rebase manually (#12 in techdebt).
+        base_branch = self._default_branch()
+        merge_ok = await self._vcs.merge_base_into_current(
+            self._repo_key, base_branch,
+        )
+        if not merge_ok:
+            logger.warning(
+                "Dev[{}] iteration aborted for {}: merge conflict against {}",
+                self._agent_key, external_id, base_branch,
+            )
+            return DevResult(
+                outcome=DevOutcome.FAILED,
+                branch_name=branch_name,
+                stopped_reason=f"merge-conflict-with-{base_branch}",
+            )
+
         request = self._build_iteration_request(
             plan=plan, task_row=task_row,
             workspace_path=workspace_path, feedback=feedback,

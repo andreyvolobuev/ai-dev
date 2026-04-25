@@ -290,6 +290,8 @@ def plan_task(
         task_tracker=container.task_tracker if post_to_tracker else None,
         config=container.config,
         post_to_tracker=post_to_tracker,
+        clarification_orchestrator=container.clarification_orchestrator,
+        session_factory=container.session_factory,
     )
 
     async def _run() -> None:
@@ -365,6 +367,76 @@ async def _ensure_task_in_db(
 
     console.print(f"[green]Fetched {external_id} from Jira and stored locally[/green]")
     return True
+
+
+clarifications_app = typer.Typer(help="Inspect the clarification Q-tree")
+app.add_typer(clarifications_app, name="clarifications")
+
+
+@clarifications_app.command("show")
+def clarifications_show(
+    external_id: str = typer.Argument(..., help="Tracker task id, e.g. DM-1234"),
+    tracker: str = typer.Option("jira", help="Tracker name"),
+) -> None:
+    """Print the question tree for one task as ASCII.
+
+    Each node shows ``state | stakeholder | text``. Indentation reflects
+    ``chain_depth`` (root depth=0, redirects deeper). Includes the
+    classified answer if there is one. Read-only; useful when
+    escalation reaches the team-lead and they need to see what the bot
+    actually asked / heard.
+    """
+    _bootstrap()
+    container = build_container()
+
+    async def _run() -> None:
+        repo = container.question_repo
+        questions = await repo.list_for_task(tracker, external_id)
+        if not questions:
+            console.print(
+                f"[yellow]No clarifications for {tracker}:{external_id}[/yellow]"
+            )
+            return
+
+        from rich.tree import Tree
+
+        # Build a parent_id → children map.
+        children_map: dict[int | None, list] = {}
+        for q in questions:
+            children_map.setdefault(q.parent_id, []).append(q)
+
+        def _node_label(q):  # type: ignore[no-untyped-def]
+            who = (
+                q.stakeholder.display_name
+                or q.stakeholder.raw_hint
+                or "(team-lead)"
+            )
+            label = (
+                f"[bold]{q.state.value}[/bold] "
+                f"| @{who} ({q.stakeholder.kind.value}) "
+                f"| {q.text[:140]}"
+            )
+            if q.answer is not None and q.answer.classification is not None:
+                label += (
+                    f"\n   [dim]→ {q.answer.classification.value}: "
+                    f"{q.answer.coalesced_text[:140]}[/dim]"
+                )
+            return label
+
+        def _build_tree(parent_id: int | None, parent_node) -> None:
+            for q in children_map.get(parent_id, []):
+                node = parent_node.add(_node_label(q))
+                _build_tree(q.id, node)
+
+        # Roots are the children of None.
+        roots = children_map.get(None, [])
+        for root in roots:
+            tree = Tree(_node_label(root))
+            _build_tree(root.id, tree)
+            console.print(tree)
+        await container.dispose()
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

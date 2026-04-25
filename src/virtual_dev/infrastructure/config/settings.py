@@ -70,3 +70,11 @@ class Settings(BaseSettings):
     # When False, Communicator sends messages outside working hours anyway.
     # Useful for demos / manual smoke tests; production should keep True.
     communicator_respect_working_hours: bool = False
+
+    # --- Phase 3.8 (clarification tree) ---
+    # AnswerCoalescer poll cadence + idle-window before triggering LLM
+    # classification. The window also lives in agents.yaml so it's
+    # tunable per-environment, but the env value here is the runtime
+    # default we use when constructing the worker.
+    answer_coalesce_poll_interval_seconds: int = 60
+    answer_coalesce_window_seconds: int = 600

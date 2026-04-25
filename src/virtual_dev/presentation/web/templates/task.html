@@ -35,7 +35,43 @@
                     <a href="{{ mr.web_url }}">!{{ mr.iid }}</a>
                     <span class="status status-{{ mr.status }}">{{ mr.status }}</span>
                     — branch <code>{{ mr.source_branch }}</code>
-                    (pipeline: {{ mr.pipeline_status }})
+                    (pipeline: <span class="status status-{{ mr.pipeline_status }}">{{ mr.pipeline_status }}</span>)
+                    {% if mr.pipeline_autofix_attempts %}
+                        · autofix: {{ mr.pipeline_autofix_attempts }}{% if mr.pipeline_autofix_escalated %} ⚠ escalated{% endif %}
+                    {% endif %}
+                    {% if mr.iteration_pending_ci_sha %}
+                        · pending CI on <code>{{ mr.iteration_pending_ci_sha[:8] }}</code>
+                    {% endif %}
+                </li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+
+    {% if questions %}
+        <h3>Уточнения (Q-tree)</h3>
+        <ul style="list-style:none; padding-left:0;">
+            {% for q in questions %}
+                {% set row = q.row %}
+                {% set ans = q.answer %}
+                <li style="padding:0.4rem 0; padding-left:{{ q.indent * 1.5 }}rem; border-left:2px solid #eee;">
+                    <span class="status status-{{ row.state }}">{{ row.state }}</span>
+                    {% if row.chain_depth %}<small>↳ depth {{ row.chain_depth }}</small>{% endif %}
+                    <strong>{{ row.text | truncate(180) }}</strong>
+                    <br><small>
+                        к: {{ row.stakeholder_display_name or row.stakeholder_raw_hint or "—" }}
+                        ({{ row.stakeholder_kind }})
+                        {% if row.asked_at %}· asked {{ row.asked_at.strftime("%Y-%m-%d %H:%M") }}{% endif %}
+                        {% if row.deadline_at %}· deadline {{ row.deadline_at.strftime("%Y-%m-%d %H:%M") }}{% endif %}
+                    </small>
+                    {% if row.why_it_matters %}
+                        <br><small><em>{{ row.why_it_matters }}</em></small>
+                    {% endif %}
+                    {% if ans %}
+                        <br><small>
+                            <strong>A ({{ ans.classification }}):</strong>
+                            {{ ans.coalesced_text | truncate(300) }}
+                        </small>
+                    {% endif %}
                 </li>
             {% endfor %}
         </ul>
