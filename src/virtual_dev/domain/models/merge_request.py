@@ -35,6 +35,10 @@ class ReviewComment:
     line: int | None = None
     created_at: datetime | None = None
     resolved: bool = False
+    # GitLab помечает свои авто-нотки (`added 1 commit`, `left review
+    # comments`, marked draft → ready и т.п.) как system=True. Reviewer
+    # их не маршрутизирует в LLM — это шум, не запрос от человека.
+    system: bool = False
 
 
 @dataclass

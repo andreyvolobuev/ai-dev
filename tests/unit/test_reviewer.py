@@ -58,6 +58,7 @@ class _StubVcs(VcsPort):
         self._approvals = approvals
         self._mr_status = mr_status
         self._pipeline_status = pipeline_status
+        self.posted_mr_comments: list[tuple[str, int, str]] = []
         # Reviewer derives "ready for review" gate from get_latest_pipeline_jobs.
         # Default: a single-job green pipeline → ping fires.
         if ci_jobs is None:
@@ -134,6 +135,10 @@ class _StubVcs(VcsPort):
         self, repo_key: str, iid: int, comment_id: str, body: str,
     ) -> None:  # pragma: no cover
         raise NotImplementedError
+
+    async def add_mr_comment(self, repo_key: str, iid: int, body: str) -> None:
+        # Tests override by setting self.posted_mr_comments below.
+        self.posted_mr_comments.append((repo_key, iid, body))
 
     async def approve_merge_request(self, repo_key: str, iid: int) -> None:  # pragma: no cover
         raise NotImplementedError

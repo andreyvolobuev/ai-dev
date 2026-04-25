@@ -107,6 +107,10 @@ class VcsPort(ABC):
         """Reply to a review comment."""
 
     @abstractmethod
+    async def add_mr_comment(self, repo_key: str, iid: int, body: str) -> None:
+        """Post a new top-level comment on the MR (not a thread reply)."""
+
+    @abstractmethod
     async def approve_merge_request(self, repo_key: str, iid: int) -> None:
         """Add the bot's approval to an MR."""
 

@@ -50,6 +50,11 @@ mattermost:
   thread_reply_iteration_done: "✅ Внёс правки, CI зелёный — коммит `{commit_sha_short}` на `{branch}`. Можно смотреть."
   thread_reply_iteration_no_changes: "Рабочее дерево осталось чистым — правка не потребовалась или модель не смогла внести её. Смотри логи."
 
+  # Постится top-level MR-комментом в GitLab когда фидбек был оставлен
+  # в самом MR (а не в MM-треде). Текст идентичен thread_reply_iteration_done
+  # по смыслу, но без MM-форматирования.
+  gitlab_reply_iteration_done: "✅ Внёс правки, CI зелёный — коммит `{commit_sha_short}` на `{branch}`. Можно смотреть."
+
 # --- Jira (комментарии к тикетам) ---
 # Доступные placeholders:
 #   {tracker}, {external_id}, {status}, {confidence}, {summary},

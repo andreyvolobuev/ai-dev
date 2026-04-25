@@ -271,6 +271,7 @@ class MmThreadListener:
             if row is None:
                 return
             row.iteration_pending_ci_sha = sha
+            row.iteration_ack_target = "mm"
             if reset_autofix:
                 row.pipeline_autofix_attempts = 0
                 row.pipeline_autofix_escalated = False

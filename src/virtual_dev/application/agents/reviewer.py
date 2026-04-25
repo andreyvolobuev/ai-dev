@@ -89,6 +89,8 @@ class ReviewerTickStats:
     approvals_sent: int = 0
     pings_sent: int = 0
     escalations_sent: int = 0
+    gitlab_replies_posted: int = 0
+    gitlab_iterations_dispatched: int = 0
 
 
 class ReviewerAgent:
@@ -105,6 +107,12 @@ class ReviewerAgent:
         config: AppConfig,
         message_bus: MessageBusPort | None = None,
         bot_username: str | None = None,
+        # Phase 4: routing of actionable GitLab MR comments through the
+        # ThreadResponder agent and back via vcs.add_mr_comment / Dev
+        # iteration. Both are optional — when None the Reviewer falls
+        # back to the previous "observe-only" behaviour.
+        responder: object | None = None,   # ThreadResponderAgent (avoid circular import)
+        dev_agents: dict[str, object] | None = None,
     ) -> None:
         self._vcs = vcs
         self._communicator = communicator
@@ -112,6 +120,8 @@ class ReviewerAgent:
         self._config = config
         self._message_bus = message_bus
         self._bot_username = (bot_username or "").strip() or None
+        self._responder = responder
+        self._dev_agents = dev_agents or {}
 
     # --- Entry point (called by PollerWorker) ---
 
@@ -165,6 +175,10 @@ class ReviewerAgent:
         now = datetime.now(timezone.utc)
         touched = False
 
+        # Comments that warrant a bot response: questions and change
+        # requests. Approval hints (LGTM) are inferred from approvals
+        # endpoint; chatter ("nice work") needs no reply.
+        actionable_comments: list[ReviewComment] = []
         for comment in new_comments:
             klass = classify_comment(comment.body)
             logger.info(
@@ -190,6 +204,15 @@ class ReviewerAgent:
                     },
                 ))
             touched = True
+            if klass in (CommentClass.QUESTION, CommentClass.CHANGE_REQUEST):
+                actionable_comments.append(comment)
+
+        # Route actionable comments through ThreadResponder. We process
+        # only the LATEST one this tick — multiple back-to-back comments
+        # often refer to each other, and one round-trip with the full
+        # transcript is cheaper than N independent decisions.
+        if actionable_comments and self._responder is not None:
+            await self._handle_gitlab_actionable(row, comments, actionable_comments[-1], stats)
 
         # "Please review" ping — once, when MR is no longer a draft AND
         # the CI pipeline of the latest commit is green (or there's no
@@ -289,12 +312,32 @@ class ReviewerAgent:
             )
 
     async def _announce_iteration_done(self, row: MergeRequestRow) -> None:
-        """Post the post-CI-green ack into the review thread."""
+        """Post the post-CI-green ack to wherever the iteration was
+        triggered: MM thread (default) or a top-level GitLab MR comment."""
+        sha = row.iteration_pending_ci_sha or ""
+        if row.iteration_ack_target == "gitlab":
+            try:
+                text = self._config.notifications.mattermost.gitlab_reply_iteration_done.format(
+                    commit_sha_short=sha[:12], branch=row.source_branch,
+                )
+            except (KeyError, IndexError):
+                text = self._config.notifications.mattermost.gitlab_reply_iteration_done
+            assert self._vcs is not None
+            try:
+                await self._vcs.add_mr_comment(row.repo_key, row.iid, text)
+                logger.info(
+                    "Reviewer: posted GitLab iteration-done ack for {}!{} sha={}",
+                    row.repo_key, row.iid, sha[:12],
+                )
+            except Exception:
+                logger.exception("Reviewer: failed to post GitLab iteration ack")
+            return
+
+        # Default: Mattermost thread.
         channel_id = row.review_thread_channel_id
         root_id = row.review_thread_root_id
         if not channel_id or not root_id:
             return
-        sha = row.iteration_pending_ci_sha or ""
         try:
             text = self._config.notifications.mattermost.thread_reply_iteration_done.format(
                 commit_sha_short=sha[:12], branch=row.source_branch,
@@ -303,9 +346,146 @@ class ReviewerAgent:
             text = self._config.notifications.mattermost.thread_reply_iteration_done
         await self._communicator.send_channel(channel_id, text, thread_root_id=root_id)
         logger.info(
-            "Reviewer: posted iteration-done ack for {}!{} sha={}",
+            "Reviewer: posted MM iteration-done ack for {}!{} sha={}",
             row.repo_key, row.iid, sha[:12],
         )
+
+    async def _handle_gitlab_actionable(
+        self,
+        row: MergeRequestRow,
+        all_comments: list[ReviewComment],
+        latest: ReviewComment,
+        stats: ReviewerTickStats,
+    ) -> None:
+        """Route a question / change-request comment from GitLab through
+        ThreadResponder. Reply / iterate / ignore — same shape as the
+        Mattermost-driven path, but staying in GitLab."""
+        # Build a "thread" of prior non-system, non-bot comments as
+        # context. Convert to ChatMessage shape so ThreadResponder is
+        # medium-agnostic.
+        from datetime import datetime as _dt, timezone as _tz
+
+        from virtual_dev.application.agents.thread_responder import ResponderAction
+        from virtual_dev.domain.models.chat import ChatMessage
+
+        def _to_chat(c: ReviewComment) -> ChatMessage:
+            return ChatMessage(
+                id=c.id, channel_id=f"gitlab:{row.iid}",
+                author_id=c.author_username, text=c.body,
+                timestamp=c.created_at or _dt.now(_tz.utc),
+                thread_root_id=None, trusted=False,
+            )
+
+        transcript = [
+            _to_chat(c) for c in all_comments
+            if not c.system
+            and not self._is_bot_author(c.author_username)
+            and c.id != latest.id
+        ]
+        latest_chat = _to_chat(latest)
+
+        plan = await self._load_plan(row.task_external_id)
+        repo_workspace = self._resolve_repo_workspace(row.repo_key)
+
+        decision = await self._responder.decide(   # type: ignore[union-attr]
+            mr_title=row.title,
+            mr_description=row.description or "",
+            mr_web_url=row.web_url,
+            plan=plan,
+            thread=transcript,
+            latest_reply=latest_chat,
+            repo_workspace=repo_workspace,
+        )
+        logger.info(
+            "Reviewer: GitLab comment decision={} reasoning={!r}",
+            decision.action.value, decision.reasoning,
+        )
+
+        if decision.action == ResponderAction.REPLY and decision.reply_text:
+            assert self._vcs is not None
+            try:
+                await self._vcs.add_mr_comment(
+                    row.repo_key, row.iid, decision.reply_text,
+                )
+                stats.gitlab_replies_posted += 1
+            except Exception:
+                logger.exception("Reviewer: GitLab reply post failed")
+            return
+
+        if decision.action == ResponderAction.ITERATE:
+            dev = self._dev_agents.get(row.repo_key)
+            if dev is None or not row.task_external_id:
+                logger.warning(
+                    "Reviewer: cannot iterate on {}!{} — missing dev agent or task id",
+                    row.repo_key, row.iid,
+                )
+                return
+            try:
+                result = await dev.handle_iteration(   # type: ignore[union-attr]
+                    tracker="jira",
+                    external_id=row.task_external_id,
+                    branch_name=row.source_branch,
+                    feedback=latest.body,
+                )
+            except Exception:
+                logger.exception("Reviewer: GitLab iteration crashed")
+                return
+            if result.commit_sha:
+                # Mark as pending CI confirmation, with ack-target=gitlab
+                # so the green-CI ack lands as a GitLab MR comment, not
+                # in the MM thread.
+                await self._mark_iteration_pending(
+                    row.id, sha=result.commit_sha, ack_target="gitlab",
+                )
+                stats.gitlab_iterations_dispatched += 1
+                logger.info(
+                    "Reviewer: dispatched iteration from GitLab comment "
+                    "for {}!{} sha={}",
+                    row.repo_key, row.iid, result.commit_sha[:12],
+                )
+
+    async def _load_plan(self, task_external_id: str | None):
+        """Load the latest non-superseded plan for an MR's task, for the
+        ThreadResponder to ground its decision in."""
+        if not task_external_id:
+            return None
+        from virtual_dev.domain.models.plan import PlanStatus
+        from virtual_dev.infrastructure.db import PlanRow
+        from virtual_dev.infrastructure.db.mappers import row_to_plan
+
+        async with self._session_factory() as session:
+            stmt = (
+                select(PlanRow)
+                .where(
+                    PlanRow.task_external_id == task_external_id,
+                    PlanRow.status != PlanStatus.SUPERSEDED.value,
+                )
+                .order_by(PlanRow.created_at.desc())
+                .limit(1)
+            )
+            plan_row = (await session.execute(stmt)).scalar_one_or_none()
+        return row_to_plan(plan_row) if plan_row is not None else None
+
+    def _resolve_repo_workspace(self, repo_key: str) -> str | None:
+        from pathlib import Path
+        repo_cfg = self._config.get_repository(repo_key)
+        if repo_cfg is None:
+            return None
+        if repo_cfg.local_path:
+            return str(Path(repo_cfg.local_path).expanduser().resolve())
+        return None   # Reviewer doesn't have settings; no workspaces_dir fallback
+
+    async def _mark_iteration_pending(
+        self, row_id: int, *, sha: str, ack_target: str,
+    ) -> None:
+        async with session_scope(self._session_factory) as session:
+            row = (await session.execute(
+                select(MergeRequestRow).where(MergeRequestRow.id == row_id)
+            )).scalar_one_or_none()
+            if row is None:
+                return
+            row.iteration_pending_ci_sha = sha
+            row.iteration_ack_target = ack_target
 
     async def _notify_ready_for_review(
         self, row: MergeRequestRow, live_title: str,
@@ -434,9 +614,12 @@ class ReviewerAgent:
 
         ``list_review_comments`` returns oldest-first (enforced at the
         adapter). We advance past everything up to and including
-        ``last_seen_comment_id``, then return the tail minus any comments
-        from a configured ``bot_username`` (empty in single-user setups —
-        nothing is filtered).
+        ``last_seen_comment_id``, then drop:
+
+        * comments by a configured ``bot_username`` (empty in single-user
+          setups — no filtering),
+        * GitLab system notes (``added 1 commit``, ``left review
+          comments``, draft/ready toggles, etc. — ``system=True``).
         """
         filtered: list[ReviewComment] = []
         seen_cutoff = row.last_seen_comment_id or ""
@@ -445,6 +628,8 @@ class ReviewerAgent:
             if not passed_cutoff:
                 if comment.id == seen_cutoff:
                     passed_cutoff = True
+                continue
+            if comment.system:
                 continue
             if self._is_bot_author(comment.author_username):
                 continue
@@ -535,6 +720,7 @@ class ReviewerAgent:
                 row.last_escalation_at = now
             if clear_iteration_pending:
                 row.iteration_pending_ci_sha = None
+                row.iteration_ack_target = None
 
     async def _persist_final_state(self, row_id: int, new_status: str) -> None:
         async with session_scope(self._session_factory) as session:

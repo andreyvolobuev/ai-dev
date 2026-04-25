@@ -119,6 +119,10 @@ class MergeRequestRow(Base):
     # turns green, then clears the field. Means: "we have an unannounced
     # iteration commit waiting for CI confirmation".
     iteration_pending_ci_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Where to post the "✅ CI зелёный" ack: 'mm' for the review thread,
+    # 'gitlab' for a top-level MR comment. Set when iteration is
+    # triggered, cleared together with iteration_pending_ci_sha.
+    iteration_ack_target: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 

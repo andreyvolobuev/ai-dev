@@ -213,18 +213,8 @@ def build_container(config_dir: Path | str = "config") -> Container:
     rules_loader = RulesLoader(Path(config_dir) / "rules")
     prompts_loader = PromptsLoader(Path(config_dir) / "prompts")
 
-    # bot_username here is the GitLab username — comments authored by that
-    # user on our MRs are our own. Primary signal inside the agent is still
-    # the per-MR author_username (which matches by definition); this is a
-    # secondary safety net for cases where another bot account replies.
-    reviewer = ReviewerAgent(
-        vcs=vcs,
-        communicator=communicator,
-        session_factory=session_factory,
-        config=config,
-        message_bus=message_bus,
-        bot_username=None,   # relying on the MR.author_username signal
-    )
+    # Build Dev-agents first so DevOps + Reviewer can share the same
+    # instances for iteration dispatch.
     dev_agents: dict[str, DevAgent] = {}
     if vcs is not None:
         for repo in config.repositories:
@@ -244,6 +234,31 @@ def build_container(config_dir: Path | str = "config") -> Container:
                 researcher=researcher if mr_history else None,
             )
 
+    thread_responder = ThreadResponderAgent(
+        code_agent=code_agent,
+        config=config,
+        injection_filter=injection_filter,
+        prompts_loader=prompts_loader,
+    )
+
+    # bot_username here is the GitLab username — comments authored by that
+    # user on our MRs are our own. Primary signal inside the agent is still
+    # the per-MR author_username (which matches by definition); this is a
+    # secondary safety net for cases where another bot account replies.
+    # Phase 4: Reviewer also routes actionable GitLab MR comments through
+    # the ThreadResponder (and Dev for iterations) so feedback in GitLab
+    # gets a response in GitLab, mirroring the MM-thread flow.
+    reviewer = ReviewerAgent(
+        vcs=vcs,
+        communicator=communicator,
+        session_factory=session_factory,
+        config=config,
+        message_bus=message_bus,
+        bot_username=None,
+        responder=thread_responder,
+        dev_agents=dict(dev_agents),
+    )
+
     devops = DevOpsAgent(
         vcs=vcs,
         communicator=communicator,
@@ -251,12 +266,6 @@ def build_container(config_dir: Path | str = "config") -> Container:
         config=config,
         dev_agents=dev_agents,
         message_bus=message_bus,
-    )
-    thread_responder = ThreadResponderAgent(
-        code_agent=code_agent,
-        config=config,
-        injection_filter=injection_filter,
-        prompts_loader=prompts_loader,
     )
 
     return Container(

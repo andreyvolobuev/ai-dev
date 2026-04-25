@@ -338,6 +338,14 @@ class GitLabVcs(VcsPort):
 
         await asyncio.to_thread(_run)
 
+    async def add_mr_comment(self, repo_key: str, iid: int, body: str) -> None:
+        def _run() -> None:
+            project = self._client.projects.get(self._project_path(repo_key))
+            mr = project.mergerequests.get(iid)
+            mr.notes.create({"body": body})
+
+        await asyncio.to_thread(_run)
+
     async def approve_merge_request(self, repo_key: str, iid: int) -> None:
         def _run() -> None:
             project = self._client.projects.get(self._project_path(repo_key))
@@ -552,6 +560,7 @@ def _comment_from_gitlab(note: Any, iid: int) -> ReviewComment:
         author_username=str(cast(dict[str, Any], getattr(note, "author", {}) or {}).get("username", "")),
         body=str(getattr(note, "body", "")),
         resolved=bool(getattr(note, "resolvable", False) and getattr(note, "resolved", False)),
+        system=bool(getattr(note, "system", False)),
     )
 
 

@@ -118,6 +118,9 @@ class _FakeVcs(VcsPort):
     async def list_review_comments(self, repo_key: str, iid: int) -> Sequence[Any]:  # pragma: no cover
         raise NotImplementedError
 
+    async def add_mr_comment(self, repo_key: str, iid: int, body: str) -> None:  # pragma: no cover
+        raise NotImplementedError
+
     async def reply_to_comment(self, repo_key: str, iid: int, comment_id: str, body: str) -> None:
         # pragma: no cover
         raise NotImplementedError

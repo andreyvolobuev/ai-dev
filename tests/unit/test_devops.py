@@ -61,6 +61,7 @@ class _StubVcs(VcsPort):
     async def list_merged_merge_requests(self, *args, **kwargs) -> Sequence[MergeRequest]: raise NotImplementedError  # pragma: no cover
     async def list_review_comments(self, *args, **kwargs) -> Sequence[ReviewComment]: raise NotImplementedError  # pragma: no cover
     async def reply_to_comment(self, *args, **kwargs) -> None: raise NotImplementedError  # pragma: no cover
+    async def add_mr_comment(self, *args, **kwargs) -> None: raise NotImplementedError  # pragma: no cover
     async def approve_merge_request(self, *args, **kwargs) -> None: raise NotImplementedError  # pragma: no cover
     async def merge(self, *args, **kwargs) -> None: raise NotImplementedError  # pragma: no cover
     async def get_mr_approvals(self, *args, **kwargs) -> ApprovalInfo: raise NotImplementedError  # pragma: no cover
