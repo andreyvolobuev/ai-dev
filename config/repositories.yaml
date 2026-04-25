@@ -28,13 +28,13 @@ repositories:
     # local_path — машино-зависимо; задаётся в config/local.yaml (gitignored).
     description: "Монорепа (бэкенд + фронтенд)."
     jira_components: []  # заполнишь позже
-    default_branch: master   # проверь, возможно main
+    default_branch: master
     agents:
       backend: true
       frontend: true
       devops: false
     primary_language: python
-    frontend_stack: unknown   # заменить на реальный: react, vue, ...
+    frontend_stack: react
     tests_cmd: "pytest"
     lint_cmd: "ruff check ."
     ci_provider: gitlab_ci

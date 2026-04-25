@@ -53,8 +53,10 @@ class _ServerAuthSSLWebsocket(Websocket):
             verify = self.options.get("verify", True)
             context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
             if verify is False:
-                context.check_hostname = False
+                # Order matters on Python ≥3.12: check_hostname=False is only
+                # legal when verify_mode==CERT_NONE, so flip verify_mode first.
                 context.verify_mode = ssl.CERT_NONE
+                context.check_hostname = False
             elif isinstance(verify, str):
                 context.load_verify_locations(cafile=verify)
         else:
@@ -70,20 +72,39 @@ class _ServerAuthSSLWebsocket(Websocket):
 
         self._alive = True
         kw_args: dict[str, Any] = dict(self.options.get("websocket_kw_args") or {})
-        while True:
+        consecutive_failures = 0
+        base_delay = float(self.options.get("keepalive_delay", 3))
+        while self._alive:
             try:
+                ws_log.debug("MM WS connecting → %s (attempt %d)", url, consecutive_failures + 1)
                 websocket = await websockets.connect(url, ssl=context, **kw_args)
+                ws_log.debug("MM WS connected, sending auth challenge")
                 await self._authenticate_websocket(websocket, event_handler)
+                ws_log.info("MM WS authenticated; entering message loop")
+                consecutive_failures = 0   # successful auth resets backoff
                 while self._alive:
                     try:
                         await self._start_loop(websocket, event_handler)
                     except websockets.ConnectionClosedError:
+                        ws_log.info("MM WS message loop closed; will reconnect")
                         break
-                if (not self.options.get("keepalive")) or (not self._alive):
+                if not self.options.get("keepalive") or not self._alive:
                     break
             except Exception as exc:
-                ws_log.warning("websocket connect failed: %s", exc)
-                await asyncio.sleep(self.options.get("keepalive_delay", 3))
+                consecutive_failures += 1
+                # Exponential backoff capped at 5 minutes — prevents the corp
+                # firewall from rate-limiting us into a tighter loop after a
+                # few sequential failures.
+                delay = min(base_delay * (2 ** min(consecutive_failures - 1, 7)), 300)
+                # Log only the first N failures verbose, then once-per-minute
+                # equivalent so the log doesn't drown out everything else.
+                if consecutive_failures <= 3 or consecutive_failures % 10 == 0:
+                    ws_log.warning(
+                        "MM WS connect failed (%d in a row): %s: %s — "
+                        "retrying in %.0fs",
+                        consecutive_failures, type(exc).__name__, exc, delay,
+                    )
+                await asyncio.sleep(delay)
 
 
 def _parse_host_port_scheme(url: str) -> tuple[str, int, str]:
