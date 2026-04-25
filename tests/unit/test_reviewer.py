@@ -215,6 +215,7 @@ def _cfg(
             merge_ping="`{repo_key}!{iid}` Please merge: {web_url}",
             stale_ping="MR `{repo_key}!{iid}` is waiting for a review ({idle_hours}h idle). {web_url}",
             escalation_dm="MR `{repo_key}!{iid}` no reviewer activity {idle_hours}h: {web_url}",
+            thread_reply_iteration_done="✅ CI зелёный — коммит {commit_sha_short} на {branch}",
         )),
     )
 
@@ -424,6 +425,51 @@ async def test_review_ping_held_while_pipeline_running(
 
     stats = await agent.tick()
     assert stats.review_pings_sent == 0
+
+
+@pytest.mark.asyncio
+async def test_iteration_pending_announces_when_ci_green(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """After silent iteration push the Reviewer announces in the review
+    thread the moment CI flips green — and clears the pending flag."""
+    from sqlalchemy import select as _select
+    from virtual_dev.infrastructure.db import MergeRequestRow
+    mr_id = await _insert_mr(session_factory)
+    # Pre-set the pending state as if MmThreadListener / DevOps just pushed.
+    async with session_factory() as session:
+        row = (await session.execute(
+            _select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        row.iteration_pending_ci_sha = "abc123def456"
+        row.review_thread_channel_id = "team-chan"
+        row.review_thread_root_id = "root-iter"
+        await session.commit()
+
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        ci_jobs=[_job("tests", "success")],
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    await agent.tick()
+    # An ack post should have landed in the review thread, in the right thread.
+    threaded = [
+        body for ch, body, root in
+        ((c, b, r) for c, b in chat.sent_channels for r in [None])
+        if False   # placeholder — sent_channels has no thread root attr
+    ]
+    # _RecordingChat appends (channel_id, text) — thread_root is dropped.
+    # We simply check the message body shape on the channel.
+    assert any("CI зелёный" in body for _, body in chat.sent_channels)
+    async with session_factory() as session:
+        row = (await session.execute(
+            _select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.iteration_pending_ci_sha is None
 
 
 @pytest.mark.asyncio

@@ -249,11 +249,22 @@ async def test_iterate_triggers_dev_and_reports_back(
     assert call["external_id"] == "DM-1"
     assert call["branch_name"] == "ai-dev/dm-1"
     assert "foo" in call["feedback"]
-    # Two replies: acknowledgement + "done" with sha.
+    # Listener posts ONLY the acknowledgement here. The "done with sha"
+    # ack is now Reviewer's job, fired when CI for the new commit
+    # actually turns green — listener stays silent on the push itself.
     thread_replies = [body for _, body, root in chat.sent if root == "root-2"]
     assert any("Принято" in r for r in thread_replies)
-    assert any("deadbeef0000" in r for r in thread_replies)
-    # ✅ reaction set.
+    assert not any("deadbeef0000" in r for r in thread_replies)
+    # MR row marked as awaiting CI confirmation.
+    from sqlalchemy import select
+    from virtual_dev.infrastructure.db import MergeRequestRow
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.iid == 1001)
+        )).scalar_one()
+        assert row.iteration_pending_ci_sha == "deadbeef0000deadbeef"
+        assert row.pipeline_autofix_attempts == 0   # reset by user-driven iter
+    # ✅ reaction set on the source comment.
     assert ("post-b", _PROCESSED_REACTION) in chat.reactions
 
 

@@ -199,6 +199,7 @@ class ReviewerAgent:
         # previous run). We instead pull the latest pipeline's jobs and
         # derive status from them — same source DevOps uses, so both
         # agents see the world the same way.
+        ci_state: str | None = None
         review_ping_sent = row.review_ping_sent
         if not review_ping_sent and live.status == MRStatus.OPEN:
             ci_state = await self._derive_ci_state(row.repo_key, row.iid)
@@ -219,6 +220,21 @@ class ReviewerAgent:
                     "Reviewer: {}!{} — CI state {!r}, holding 'please review' ping",
                     row.repo_key, row.iid, ci_state,
                 )
+
+        # Iteration follow-up: when an MM-driven or autofix iteration push
+        # is awaiting CI confirmation (``iteration_pending_ci_sha`` set),
+        # announce "✅ изменения внесены, CI зелёный" in the review thread
+        # once CI flips to success. Until then the bot stays silent —
+        # reviewers don't want to hear about commits that haven't been
+        # validated by CI yet.
+        clear_iteration_pending = False
+        if row.iteration_pending_ci_sha and row.review_thread_root_id:
+            if ci_state is None:
+                ci_state = await self._derive_ci_state(row.repo_key, row.iid)
+            if ci_state in ("success", "no-ci"):
+                await self._announce_iteration_done(row)
+                clear_iteration_pending = True
+                touched = True
 
         # Approvals threshold check.
         required = self._config.agents.review_policy.required_approvals
@@ -261,6 +277,7 @@ class ReviewerAgent:
             review_ping_sent=review_ping_sent,
             touched=touched,
             escalated_this_tick=escalated_this_tick,
+            clear_iteration_pending=clear_iteration_pending,
             now=now,
         )
         if row_status_changed:
@@ -268,6 +285,25 @@ class ReviewerAgent:
                 "Reviewer: {}!{} status transitioned {} → {}",
                 row.repo_key, row.iid, row.status, current_status,
             )
+
+    async def _announce_iteration_done(self, row: MergeRequestRow) -> None:
+        """Post the post-CI-green ack into the review thread."""
+        channel_id = row.review_thread_channel_id
+        root_id = row.review_thread_root_id
+        if not channel_id or not root_id:
+            return
+        sha = row.iteration_pending_ci_sha or ""
+        try:
+            text = self._config.notifications.mattermost.thread_reply_iteration_done.format(
+                commit_sha_short=sha[:12], branch=row.source_branch,
+            )
+        except (KeyError, IndexError):
+            text = self._config.notifications.mattermost.thread_reply_iteration_done
+        await self._communicator.send_channel(channel_id, text, thread_root_id=root_id)
+        logger.info(
+            "Reviewer: posted iteration-done ack for {}!{} sha={}",
+            row.repo_key, row.iid, sha[:12],
+        )
 
     async def _notify_ready_for_review(
         self, row: MergeRequestRow, live_title: str,
@@ -472,6 +508,7 @@ class ReviewerAgent:
         review_ping_sent: bool,
         touched: bool,
         escalated_this_tick: bool,
+        clear_iteration_pending: bool,
         now: datetime,
     ) -> None:
         async with session_scope(self._session_factory) as session:
@@ -494,6 +531,8 @@ class ReviewerAgent:
                 row.last_escalation_at = None
             if escalated_this_tick:
                 row.last_escalation_at = now
+            if clear_iteration_pending:
+                row.iteration_pending_ci_sha = None
 
     async def _persist_final_state(self, row_id: int, new_status: str) -> None:
         async with session_scope(self._session_factory) as session:

@@ -178,21 +178,28 @@ class DevOpsAgent:
             if dev is None:
                 return
             feedback = _render_autofix_feedback(row, jobs)
+            commit_sha: str | None = None
             try:
-                await dev.handle_iteration(
+                result = await dev.handle_iteration(
                     tracker="jira",
                     external_id=row.task_external_id or "",
                     branch_name=row.source_branch,
                     feedback=feedback,
                 )
+                commit_sha = result.commit_sha or None
             except Exception:
                 logger.exception(
                     "DevOps: auto-fix iteration crashed for {}!{}",
                     row.repo_key, row.iid,
                 )
-            # Whether the iteration succeeded or crashed, this attempt is
-            # consumed — bump the counter so we eventually escalate.
-            await self._increment_autofix_attempts(row.id)
+            # Bump the counter regardless — a crashed iteration also
+            # consumed an attempt slot. If the iteration succeeded with
+            # a commit, mark the MR as awaiting CI confirmation so the
+            # Reviewer poll announces "fixed, CI green" once the new
+            # pipeline turns green (no announcement in the meantime).
+            await self._post_iteration_state(
+                row.id, commit_sha=commit_sha,
+            )
         finally:
             self._inflight_autofix.discard(key)
 
@@ -261,7 +268,10 @@ class DevOpsAgent:
             if increment_attempts:
                 row.pipeline_autofix_attempts = (row.pipeline_autofix_attempts or 0) + 1
 
-    async def _increment_autofix_attempts(self, row_id: int) -> None:
+    async def _post_iteration_state(
+        self, row_id: int, *, commit_sha: str | None,
+    ) -> None:
+        """Bump autofix attempts; remember sha awaiting CI green (if any)."""
         async with session_scope(self._session_factory) as session:
             row = (await session.execute(
                 select(MergeRequestRow).where(MergeRequestRow.id == row_id)
@@ -269,6 +279,8 @@ class DevOpsAgent:
             if row is None:
                 return
             row.pipeline_autofix_attempts = (row.pipeline_autofix_attempts or 0) + 1
+            if commit_sha:
+                row.iteration_pending_ci_sha = commit_sha
 
 
 _PASSING_JOB_STATUSES = frozenset({

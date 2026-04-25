@@ -114,6 +114,11 @@ class MergeRequestRow(Base):
     # the team-lead, so we don't keep DMing on every subsequent tick.
     pipeline_autofix_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     pipeline_autofix_escalated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Set by both MM-driven and autofix iteration paths after a successful
+    # push. The Reviewer poll ack-posts to the thread when CI for this sha
+    # turns green, then clears the field. Means: "we have an unannounced
+    # iteration commit waiting for CI confirmation".
+    iteration_pending_ci_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 

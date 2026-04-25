@@ -206,6 +206,17 @@ class MmThreadListener:
         channel_id: str,
         root_id: str,
     ) -> None:
+        """Run a Dev iteration in response to a thread comment.
+
+        On a successful push we DON'T immediately announce in the thread —
+        reviewers don't want to hear "I changed something" until CI has
+        actually confirmed the change works. We just set
+        ``iteration_pending_ci_sha`` on the MR; Reviewer will see CI go
+        green on the next tick and post the ack then.
+
+        We also reset the autofix counter, because user-driven iteration
+        is fresh intent that shouldn't inherit prior CI budget.
+        """
         templates = self._config.notifications.mattermost
         dev = self._dev_agents.get(row.repo_key)
         if dev is None:
@@ -233,18 +244,36 @@ class MmThreadListener:
             return
 
         if result.commit_sha:
-            try:
-                done_text = templates.thread_reply_iteration_done.format(
-                    commit_sha_short=result.commit_sha[:12],
-                    branch=row.source_branch,
-                )
-            except (KeyError, IndexError):
-                done_text = templates.thread_reply_iteration_done
-            await self._post_reply(channel_id, root_id, done_text)
+            # Silent push. Mark the MR as "iteration pending CI" so the
+            # Reviewer poll announces in the thread when CI flips green.
+            await self._mark_iteration_pending(
+                row.id, sha=result.commit_sha, reset_autofix=True,
+            )
+            logger.info(
+                "MmThreadListener: iteration pushed silently {}!{} sha={}, "
+                "thread ack will follow once CI is green",
+                row.repo_key, row.iid, result.commit_sha[:12],
+            )
         else:
+            # Nothing to push → nothing to wait for. Tell the user we
+            # didn't change anything; no CI gate involved.
             await self._post_reply(
                 channel_id, root_id, templates.thread_reply_iteration_no_changes,
             )
+
+    async def _mark_iteration_pending(
+        self, row_id: int, *, sha: str, reset_autofix: bool,
+    ) -> None:
+        async with session_scope(self._session_factory) as session:
+            row = (await session.execute(
+                select(MergeRequestRow).where(MergeRequestRow.id == row_id)
+            )).scalar_one_or_none()
+            if row is None:
+                return
+            row.iteration_pending_ci_sha = sha
+            if reset_autofix:
+                row.pipeline_autofix_attempts = 0
+                row.pipeline_autofix_escalated = False
 
     def _resolve_repo_workspace(self, repo_key: str) -> str | None:
         """Resolve the on-disk workspace for a repo so ThreadResponder's
