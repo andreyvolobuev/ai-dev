@@ -345,7 +345,17 @@ class MattermostChat(ChatPort):
         Bridges the driver's callback-based WebSocket to an async iterator:
         a background task drives the ``connect`` coroutine and drops parsed
         ``ChatMessage`` objects onto a queue that the iterator drains.
+
+        Critical: ``driver.login()`` MUST be called before constructing the
+        Websocket. ``Client.__init__`` initialises ``client.token = ''``;
+        only ``login()`` copies the real token out of ``options``. Without
+        this call the WS auth challenge sends an empty token and MM closes
+        the connection (manifests as ``no close frame received or sent``).
         """
+        # Force a login + cache bot id before reading client.token.
+        self._ensure_login()
+        self._bot_user_id()
+
         queue: asyncio.Queue[ChatMessage] = asyncio.Queue()
 
         async def _handler(raw: str) -> None:
