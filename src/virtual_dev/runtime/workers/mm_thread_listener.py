@@ -36,6 +36,7 @@ from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
 from virtual_dev.domain.ports.chat import ChatPort
+from virtual_dev.infrastructure.config import AppConfig
 from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
@@ -63,12 +64,14 @@ class MmThreadListener:
         responder: ThreadResponderAgent,
         dev_agents: dict[str, DevAgent],     # repo_key → DevAgent
         session_factory: async_sessionmaker[AsyncSession],
+        config: AppConfig,
     ) -> None:
         self._chat = chat
         self._communicator = communicator
         self._responder = responder
         self._dev_agents = dev_agents
         self._session_factory = session_factory
+        self._config = config
         self._stop_event = asyncio.Event()
         self._running = False
         self.stats = MmListenerStats()
@@ -199,19 +202,17 @@ class MmThreadListener:
         channel_id: str,
         root_id: str,
     ) -> None:
+        templates = self._config.notifications.mattermost
         dev = self._dev_agents.get(row.repo_key)
         if dev is None:
             logger.warning(
                 "MmThreadListener: no Dev-agent for repo {!r}; cannot iterate",
                 row.repo_key,
             )
-            await self._post_reply(
-                channel_id, root_id,
-                "Не могу внести правку: Dev-агент для этого репо не сконфигурирован.",
-            )
+            await self._post_reply(channel_id, root_id, templates.thread_reply_no_dev_agent)
             return
         if not row.task_external_id:
-            await self._post_reply(channel_id, root_id, "Не нашёл связанный тикет.")
+            await self._post_reply(channel_id, root_id, templates.thread_reply_no_task)
             return
 
         tracker = "jira"   # Phase 3.5: single-tracker assumption
@@ -224,23 +225,21 @@ class MmThreadListener:
             )
         except Exception:
             logger.exception("MmThreadListener: iteration crashed")
-            await self._post_reply(
-                channel_id, root_id,
-                "Попробовал внести правку, но Dev-агент упал. Смотри логи.",
-            )
+            await self._post_reply(channel_id, root_id, templates.thread_reply_iteration_crashed)
             return
 
         if result.commit_sha:
-            await self._post_reply(
-                channel_id, root_id,
-                f"Внёс правку: новый коммит `{result.commit_sha[:12]}` запушен на "
-                f"`{row.source_branch}`. MR обновлён.",
-            )
+            try:
+                done_text = templates.thread_reply_iteration_done.format(
+                    commit_sha_short=result.commit_sha[:12],
+                    branch=row.source_branch,
+                )
+            except (KeyError, IndexError):
+                done_text = templates.thread_reply_iteration_done
+            await self._post_reply(channel_id, root_id, done_text)
         else:
             await self._post_reply(
-                channel_id, root_id,
-                "Рабочее дерево осталось чистым — правка не потребовалась или "
-                "модель не смогла внести её. Смотри логи.",
+                channel_id, root_id, templates.thread_reply_iteration_no_changes,
             )
 
     async def _post_reply(self, channel_id: str, root_id: str, text: str) -> None:

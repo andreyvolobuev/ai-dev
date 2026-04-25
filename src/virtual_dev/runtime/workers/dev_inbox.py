@@ -19,32 +19,27 @@ from loguru import logger
 from virtual_dev.application.agents import DevAgent, DevOutcome
 from virtual_dev.domain.ports.message_bus import AgentMessage
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
-from virtual_dev.infrastructure.config import AgentsCfg
+from virtual_dev.infrastructure.config import AppConfig
 
 
-def _render_mr_comment(web_url: str, branch: str) -> str:
-    return (
-        "*[virtual-dev] Dev agent opened a draft MR for this ticket.*\n\n"
-        f"- MR: {web_url}\n"
-        f"- Branch: `{branch}`\n\n"
-        "_Please review and merge when ready._"
-    )
+def _render_mr_comment(template: str, *, web_url: str, branch: str) -> str:
+    try:
+        return template.format(web_url=web_url, branch=branch)
+    except (KeyError, IndexError) as exc:
+        logger.warning("DevInbox: mr_link_comment template format failed: {}", exc)
+        return template
 
 
-def _render_failure_comment(result_notes: str, branch: str | None) -> str:
-    lines: list[str] = [
-        "*[virtual-dev] Dev agent could not finish this ticket.*",
-        "",
-    ]
-    if branch:
-        lines.append(f"- Branch: `{branch}`")
-    if result_notes:
-        lines.append("")
-        lines.append("_Notes from the agent:_")
-        lines.append(result_notes)
-    lines.append("")
-    lines.append("_Task kept in FAILED state; a human can take it from here._")
-    return "\n".join(lines)
+def _render_failure_comment(template: str, *, notes: str, branch: str | None) -> str:
+    branch_block = f"- Branch: `{branch}`" if branch else ""
+    notes_block = ""
+    if notes:
+        notes_block = f"\n_Notes from the agent:_\n{notes}"
+    try:
+        return template.format(branch_block=branch_block, notes_block=notes_block)
+    except (KeyError, IndexError) as exc:
+        logger.warning("DevInbox: failure_comment template format failed: {}", exc)
+        return template
 
 
 class DevInbox:
@@ -55,12 +50,12 @@ class DevInbox:
         *,
         dev_agent: DevAgent,
         task_tracker: TaskTrackerPort | None,
-        agents_config: AgentsCfg,
+        config: AppConfig,
         post_to_tracker: bool = True,
     ) -> None:
         self._dev = dev_agent
         self._task_tracker = task_tracker
-        self._agents_config = agents_config
+        self._config = config
         self._post_to_tracker = post_to_tracker
 
     async def handle(self, message: AgentMessage) -> None:
@@ -86,7 +81,7 @@ class DevInbox:
         if result.outcome is DevOutcome.MR_OPENED and result.merge_request is not None:
             mr = result.merge_request
             if self._post_to_tracker and self._task_tracker is not None:
-                to_review = self._agents_config.jira_transitions.to_review
+                to_review = self._config.agents.jira_transitions.to_review
                 try:
                     await self._task_tracker.transition(external_id, to_review)
                 except Exception:
@@ -97,7 +92,11 @@ class DevInbox:
                 try:
                     await self._task_tracker.comment(
                         external_id,
-                        _render_mr_comment(mr.web_url, result.branch_name or ""),
+                        _render_mr_comment(
+                            self._config.notifications.jira.mr_link_comment,
+                            web_url=mr.web_url,
+                            branch=result.branch_name or "",
+                        ),
                     )
                 except Exception:
                     logger.exception(
@@ -111,7 +110,11 @@ class DevInbox:
             try:
                 await self._task_tracker.comment(
                     external_id,
-                    _render_failure_comment(notes, result.branch_name),
+                    _render_failure_comment(
+                        self._config.notifications.jira.failure_comment,
+                        notes=notes,
+                        branch=result.branch_name,
+                    ),
                 )
             except Exception:
                 logger.exception(

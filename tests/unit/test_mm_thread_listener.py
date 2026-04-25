@@ -18,6 +18,13 @@ from virtual_dev.application.agents import (
 from virtual_dev.application.services import CommunicatorService, InjectionFilter
 from virtual_dev.domain.models.chat import ChatMessage, ChatUser
 from virtual_dev.domain.ports.chat import ChatPort
+from virtual_dev.infrastructure.config import (
+    AgentsCfg,
+    AppConfig,
+    MappingsCfg,
+    MmTemplatesCfg,
+    NotificationsCfg,
+)
 from virtual_dev.infrastructure.db import MergeRequestRow
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.runtime.workers.mm_thread_listener import (
@@ -81,6 +88,21 @@ class _ScriptedChat(ChatPort):
                 yield event
 
         return _gen()
+
+
+def _test_config() -> AppConfig:
+    return AppConfig(
+        repositories=[],
+        agents=AgentsCfg(),
+        mappings=MappingsCfg(),
+        notifications=NotificationsCfg(mattermost=MmTemplatesCfg(
+            thread_reply_no_dev_agent="нет dev-агента",
+            thread_reply_no_task="нет тикета",
+            thread_reply_iteration_crashed="dev упал",
+            thread_reply_iteration_done="готово {commit_sha_short} на {branch}",
+            thread_reply_iteration_no_changes="без изменений",
+        )),
+    )
 
 
 def _stub_reply() -> ChatMessage:
@@ -164,6 +186,7 @@ async def test_routes_reply_to_responder_and_posts_in_thread(
         responder=responder,   # type: ignore[arg-type]
         dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
         session_factory=session_factory,
+        config=_test_config(),
     )
 
     # Drive one-shot by running run_forever briefly.
@@ -210,6 +233,7 @@ async def test_iterate_triggers_dev_and_reports_back(
         responder=responder,   # type: ignore[arg-type]
         dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
         session_factory=session_factory,
+        config=_test_config(),
     )
 
     task = asyncio.create_task(listener.run_forever())
@@ -249,6 +273,7 @@ async def test_skips_already_reacted_post(
         responder=responder,   # type: ignore[arg-type]
         dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
         session_factory=session_factory,
+        config=_test_config(),
     )
 
     task = asyncio.create_task(listener.run_forever())
@@ -276,6 +301,7 @@ async def test_skips_posts_without_thread_root(
         responder=responder,   # type: ignore[arg-type]
         dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
         session_factory=session_factory,
+        config=_test_config(),
     )
 
     task = asyncio.create_task(listener.run_forever())

@@ -224,9 +224,14 @@ class GitLabVcs(VcsPort):
             payload: dict[str, Any] = {
                 "source_branch": source_branch,
                 "target_branch": target_branch,
-                "title": ("Draft: " + title) if draft else title,
+                "title": title,
                 "description": description,
                 "remove_source_branch": True,
+                # Use the dedicated `draft` flag instead of prefixing "Draft: "
+                # in the title — un-drafting via UI flips the flag but does
+                # NOT clean the title string, so the prefix would leak into
+                # MM "ready for review" pings.
+                "draft": draft,
             }
             mr = project.mergerequests.create(payload)
             return _mr_from_gitlab(mr)

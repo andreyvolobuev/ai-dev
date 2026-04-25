@@ -75,6 +75,9 @@ class _StubDev:
 
 
 def _cfg() -> AppConfig:
+    from virtual_dev.infrastructure.config import (
+        JiraTemplatesCfg, NotificationsCfg,
+    )
     return AppConfig(
         repositories=[],
         agents=AgentsCfg(jira_transitions=JiraTransitionsCfg(
@@ -82,6 +85,13 @@ def _cfg() -> AppConfig:
             to_testing="Testing", to_done="Done",
         )),
         mappings=MappingsCfg(),
+        notifications=NotificationsCfg(
+            jira=JiraTemplatesCfg(
+                plan_comment="plan: {summary}",
+                mr_link_comment="MR: {web_url} branch {branch}",
+                failure_comment="failed: {branch_block} {notes_block}",
+            ),
+        ),
     )
 
 
@@ -113,7 +123,7 @@ async def test_analyst_inbox_publishes_plan_ready_on_ready_plan(
     bus = _SpyBus()
     inbox = AnalystInbox(
         analyst=_StubAnalyst(_ready_plan()),  # type: ignore[arg-type]
-        task_tracker=None, agents_config=_cfg().agents, message_bus=bus,
+        task_tracker=None, config=_cfg(), message_bus=bus,
     )
     await inbox.handle(AgentMessage(
         id="x", from_agent="orchestrator", to_agent="analyst",
@@ -135,7 +145,7 @@ async def test_analyst_inbox_does_not_publish_on_clarifying_plan(
     bus = _SpyBus()
     inbox = AnalystInbox(
         analyst=_StubAnalyst(_clarifying_plan()),  # type: ignore[arg-type]
-        task_tracker=None, agents_config=_cfg().agents, message_bus=bus,
+        task_tracker=None, config=_cfg(), message_bus=bus,
     )
     await inbox.handle(AgentMessage(
         id="x", from_agent="orchestrator", to_agent="analyst",
@@ -153,7 +163,7 @@ async def test_analyst_inbox_does_not_publish_without_target_repo(
     plan.target_repo_key = None
     inbox = AnalystInbox(
         analyst=_StubAnalyst(plan),  # type: ignore[arg-type]
-        task_tracker=None, agents_config=_cfg().agents, message_bus=bus,
+        task_tracker=None, config=_cfg(), message_bus=bus,
     )
     await inbox.handle(AgentMessage(
         id="x", from_agent="orchestrator", to_agent="analyst",
@@ -186,7 +196,7 @@ async def test_dev_inbox_transitions_and_comments_on_mr_opened() -> None:
     )
     inbox = DevInbox(
         dev_agent=_StubDev(dev_result),  # type: ignore[arg-type]
-        task_tracker=tracker, agents_config=_cfg().agents,
+        task_tracker=tracker, config=_cfg(),
     )
 
     await inbox.handle(AgentMessage(
@@ -210,7 +220,7 @@ async def test_dev_inbox_comments_on_failure() -> None:
     )
     inbox = DevInbox(
         dev_agent=_StubDev(dev_result),  # type: ignore[arg-type]
-        task_tracker=tracker, agents_config=_cfg().agents,
+        task_tracker=tracker, config=_cfg(),
     )
 
     await inbox.handle(AgentMessage(
@@ -235,7 +245,7 @@ async def test_dev_inbox_silent_on_skipped() -> None:
     )
     inbox = DevInbox(
         dev_agent=_StubDev(dev_result),  # type: ignore[arg-type]
-        task_tracker=tracker, agents_config=_cfg().agents,
+        task_tracker=tracker, config=_cfg(),
     )
 
     await inbox.handle(AgentMessage(

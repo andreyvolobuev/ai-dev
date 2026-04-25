@@ -89,6 +89,48 @@ class EscalationCfg(_StrictModel):
     mattermost_user: str = ""
 
 
+# See config/notifications.yaml for the canonical defaults + placeholder
+# documentation. The schema here just enumerates which keys must be
+# present.
+class MmTemplatesCfg(_StrictModel):
+    review_ping: str = ""
+    merge_ping: str = ""
+    stale_ping: str = ""
+    escalation_dm: str = ""
+    pipeline_failed_short: str = ""
+    pipeline_failed_full: str = ""
+    thread_reply_no_dev_agent: str = ""
+    thread_reply_no_task: str = ""
+    thread_reply_iteration_crashed: str = ""
+    thread_reply_iteration_done: str = ""
+    thread_reply_iteration_no_changes: str = ""
+
+
+class JiraTemplatesCfg(_StrictModel):
+    plan_comment: str = ""
+    mr_link_comment: str = ""
+    failure_comment: str = ""
+
+
+class MrTemplatesCfg(_StrictModel):
+    title: str = "{key}: {title}"
+    commit_message: str = "[{key}] {title}"
+    description: str = ""
+
+
+class NotificationsCfg(_StrictModel):
+    """All bot-authored, human-facing message templates.
+
+    LLM system prompts are NOT here — they live in code with the agent
+    that owns them. Anything templated (str.format) and shipped to a
+    human via MM / Jira / GitLab MR fields is in this config.
+    """
+
+    mattermost: MmTemplatesCfg = Field(default_factory=MmTemplatesCfg)
+    jira: JiraTemplatesCfg = Field(default_factory=JiraTemplatesCfg)
+    merge_request: MrTemplatesCfg = Field(default_factory=MrTemplatesCfg)
+
+
 class AgentsCfg(_StrictModel):
     models: ModelsCfg = Field(default_factory=ModelsCfg)
     task_source: TaskSourceCfg = Field(
@@ -128,6 +170,7 @@ class AppConfig(_StrictModel):
     repositories: list[RepositoryCfg]
     agents: AgentsCfg
     mappings: MappingsCfg
+    notifications: NotificationsCfg = Field(default_factory=NotificationsCfg)
 
     def get_repository(self, key: str) -> RepositoryCfg | None:
         for repo in self.repositories:

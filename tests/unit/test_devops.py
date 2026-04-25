@@ -144,6 +144,7 @@ def _msg(text: str) -> ChatMessage:
 
 
 def _cfg(*, team_channel: str | None = "team-chan") -> AppConfig:
+    from virtual_dev.infrastructure.config import MmTemplatesCfg, NotificationsCfg
     mappings = MappingsCfg(
         team_channels={"bellingshausen": team_channel} if team_channel else {},
     )
@@ -154,6 +155,9 @@ def _cfg(*, team_channel: str | None = "team-chan") -> AppConfig:
         repositories=[RepositoryCfg(key="bellingshausen", url="git@x:g/bellingshausen.git")],
         agents=agents,
         mappings=mappings,
+        notifications=NotificationsCfg(mattermost=MmTemplatesCfg(
+            pipeline_failed_short="Pipeline FAILED on `{repo_key}!{iid}`: {web_url}\nFailing: {jobs}",
+        )),
     )
 
 

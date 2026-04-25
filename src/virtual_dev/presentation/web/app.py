@@ -65,7 +65,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
     analyst_inbox = AnalystInbox(
         analyst=analyst,
         task_tracker=container.task_tracker,
-        agents_config=container.config.agents,
+        config=container.config,
         message_bus=container.message_bus,
     )
     analyst_runner = AgentRunner(
@@ -98,7 +98,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             inbox = DevInbox(
                 dev_agent=dev,
                 task_tracker=container.task_tracker,
-                agents_config=container.config.agents,
+                config=container.config,
             )
             runner = AgentRunner(
                 agent_key=dev.agent_key,
@@ -132,6 +132,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             responder=container.thread_responder,
             dev_agents=dev_by_repo,
             session_factory=container.session_factory,
+            config=container.config,
         )
 
     @asynccontextmanager

@@ -219,7 +219,7 @@ def dev_task(
     inbox = DevInbox(
         dev_agent=dev,
         task_tracker=container.task_tracker if post_to_tracker else None,
-        agents_config=container.config.agents,
+        config=container.config,
         post_to_tracker=post_to_tracker,
     )
 
@@ -286,7 +286,7 @@ def plan_task(
     inbox = AnalystInbox(
         analyst=analyst,
         task_tracker=container.task_tracker if post_to_tracker else None,
-        agents_config=container.config.agents,
+        config=container.config,
         post_to_tracker=post_to_tracker,
     )
 

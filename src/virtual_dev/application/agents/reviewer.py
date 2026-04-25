@@ -196,7 +196,7 @@ class ReviewerAgent:
             not review_ping_sent
             and live.status == MRStatus.OPEN
         ):
-            if await self._notify_ready_for_review(row):
+            if await self._notify_ready_for_review(row, live.title):
                 review_ping_sent = True
                 stats.review_pings_sent += 1
                 touched = True
@@ -235,6 +235,7 @@ class ReviewerAgent:
         await self._persist_tick_state(
             row_id=row.id,
             new_status=current_status,
+            new_title=live.title,
             new_last_seen=(new_comments[-1].id if new_comments else None),
             approvals_count=approvals.count,
             approvals_required=approvals_required,
@@ -249,7 +250,9 @@ class ReviewerAgent:
                 row.repo_key, row.iid, row.status, current_status,
             )
 
-    async def _notify_ready_for_review(self, row: MergeRequestRow) -> bool:
+    async def _notify_ready_for_review(
+        self, row: MergeRequestRow, live_title: str,
+    ) -> bool:
         """Post a one-off "please review" into the team channel.
 
         Returns True if the ping was sent (persist the flag) and records the
@@ -263,9 +266,10 @@ class ReviewerAgent:
                 row.repo_key,
             )
             return False
-        body = (
-            f"[virtual-dev] MR `{row.repo_key}!{row.iid}` is ready for review.\n"
-            f"{row.title}\n{row.web_url}"
+        body = self._render_template(
+            self._config.notifications.mattermost.review_ping,
+            repo_key=row.repo_key, iid=row.iid,
+            title=live_title or row.title, web_url=row.web_url,
         )
         outcome = await self._communicator.send_channel(channel_id, body)
         if outcome.sent and outcome.message is not None:
@@ -281,11 +285,12 @@ class ReviewerAgent:
         return outcome.sent
 
     async def _notify_ready_to_merge(self, row: MergeRequestRow) -> None:
-        channel_id = self._team_channel_for(row.repo_key)
-        msg = (
-            f"[virtual-dev] MR `{row.repo_key}!{row.iid}` has collected enough "
-            f"approvals. Please merge: {row.web_url}"
+        msg = self._render_template(
+            self._config.notifications.mattermost.merge_ping,
+            repo_key=row.repo_key, iid=row.iid,
+            title=row.title, web_url=row.web_url,
         )
+        channel_id = self._team_channel_for(row.repo_key)
         if channel_id:
             await self._communicator.send_channel(channel_id, msg)
             return
@@ -309,10 +314,11 @@ class ReviewerAgent:
             ):
                 user = await self._resolve_escalation_user()
                 if user:
-                    text = (
-                        f"[virtual-dev] MR `{row.repo_key}!{row.iid}` has had no "
-                        f"reviewer activity for {int(idle.total_seconds() / 3600)}h. "
-                        f"Please chase or reassign: {row.web_url}"
+                    text = self._render_template(
+                        self._config.notifications.mattermost.escalation_dm,
+                        repo_key=row.repo_key, iid=row.iid,
+                        title=row.title, web_url=row.web_url,
+                        idle_hours=int(idle.total_seconds() / 3600),
                     )
                     await self._communicator.send_dm(user, text)
                     stats.escalations_sent += 1
@@ -333,9 +339,11 @@ class ReviewerAgent:
         if idle >= timedelta(hours=policy.ping_reviewers_after_hours):
             if row.ping_reviewers_at is None:
                 channel_id = self._team_channel_for(row.repo_key)
-                text = (
-                    f"[virtual-dev] MR `{row.repo_key}!{row.iid}` is waiting for a "
-                    f"review ({int(idle.total_seconds() / 3600)}h idle). {row.web_url}"
+                text = self._render_template(
+                    self._config.notifications.mattermost.stale_ping,
+                    repo_key=row.repo_key, iid=row.iid,
+                    title=row.title, web_url=row.web_url,
+                    idle_hours=int(idle.total_seconds() / 3600),
                 )
                 if channel_id:
                     await self._communicator.send_channel(channel_id, text)
@@ -343,6 +351,22 @@ class ReviewerAgent:
                 return True
 
         return False
+
+    def _render_template(self, template: str, **kwargs: object) -> str:
+        """Format a notifications template, swallowing missing keys.
+
+        Defensive against operator typos in config (e.g. ``{idl_hours}``):
+        we'd rather post a slightly broken-looking message than crash the
+        whole tick on KeyError.
+        """
+        try:
+            return template.format(**kwargs)
+        except (KeyError, IndexError) as exc:
+            logger.warning(
+                "Reviewer: template format failed ({}): {}",
+                exc, template[:120],
+            )
+            return template
 
     # --- Helpers ---
 
@@ -399,6 +423,7 @@ class ReviewerAgent:
         *,
         row_id: int,
         new_status: str,
+        new_title: str,
         new_last_seen: str | None,
         approvals_count: int,
         approvals_required: int,
@@ -414,6 +439,8 @@ class ReviewerAgent:
             if row is None:
                 return
             row.status = new_status
+            if new_title:
+                row.title = new_title
             if new_last_seen:
                 row.last_seen_comment_id = new_last_seen
             row.approvals_count = approvals_count

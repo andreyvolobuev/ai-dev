@@ -191,12 +191,19 @@ def _cfg(
         ),
         escalation=EscalationCfg(mattermost_user=escalation_user),
     )
+    from virtual_dev.infrastructure.config import MmTemplatesCfg, NotificationsCfg
     return AppConfig(
         repositories=[
             RepositoryCfg(key="bellingshausen", url="git@x:g/bellingshausen.git"),
         ],
         agents=agents,
         mappings=mappings,
+        notifications=NotificationsCfg(mattermost=MmTemplatesCfg(
+            review_ping="MR `{repo_key}!{iid}` is ready for review.\n{title}\n{web_url}",
+            merge_ping="`{repo_key}!{iid}` Please merge: {web_url}",
+            stale_ping="MR `{repo_key}!{iid}` is waiting for a review ({idle_hours}h idle). {web_url}",
+            escalation_dm="MR `{repo_key}!{iid}` no reviewer activity {idle_hours}h: {web_url}",
+        )),
     )
 
 

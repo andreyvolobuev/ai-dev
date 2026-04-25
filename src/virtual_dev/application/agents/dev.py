@@ -526,39 +526,39 @@ class DevAgent:
             str(submission.get("title") or task_row.title),
             task_row.external_id,
         )
-        return f"[{task_row.external_id}] {title}"
+        return _safe_format(
+            self._config.notifications.merge_request.commit_message,
+            key=task_row.external_id, title=title,
+        )
 
     def _render_mr_title(self, task_row: TaskRow, submission: dict[str, Any]) -> str:
         title = _strip_ticket_prefix(
             str(submission.get("title") or task_row.title),
             task_row.external_id,
         )
-        return f"{task_row.external_id}: {title}"
+        return _safe_format(
+            self._config.notifications.merge_request.title,
+            key=task_row.external_id, title=title,
+        )
 
     def _render_mr_description(
         self, task_row: TaskRow, plan: Plan, submission: dict[str, Any]
     ) -> str:
-        description = str(submission.get("description") or "").strip()
+        description = str(submission.get("description") or "").strip() or "(no description provided)"
         notes = str(submission.get("notes") or "").strip()
-
-        parts: list[str] = []
-        parts.append(f"**Ticket:** [{task_row.external_id}]({task_row.url})")
-        parts.append("")
-        parts.append("## What changed")
-        parts.append(description or "(no description provided)")
+        plan_block = ""
         if plan.steps:
-            parts.append("")
-            parts.append("## Plan (from Analyst)")
-            for step in plan.steps:
-                parts.append(f"- {step.summary}")
+            plan_block = "\n## Plan (from Analyst)\n" + "\n".join(
+                f"- {s.summary}" for s in plan.steps
+            )
+        notes_block = ""
         if notes:
-            parts.append("")
-            parts.append("## Notes from the Dev agent")
-            parts.append(notes)
-        parts.append("")
-        parts.append("---")
-        parts.append("_Opened by Virtual Dev. Please review before merging._")
-        return "\n".join(parts)
+            notes_block = f"\n## Notes from the Dev agent\n{notes}"
+        return _safe_format(
+            self._config.notifications.merge_request.description,
+            key=task_row.external_id, url=task_row.url or "",
+            description=description, plan_block=plan_block, notes_block=notes_block,
+        )
 
     # --- DB helpers ---
 
@@ -674,6 +674,20 @@ _SUBMIT_MR_SCHEMA: dict[str, Any] = {
 
 def _slugify(text: str) -> str:
     return _SLUG_SAFE_RE.sub("-", (text or "").lower()).strip("-")
+
+
+def _safe_format(template: str, **kwargs: object) -> str:
+    """Format a notifications template; tolerate missing placeholders.
+
+    Operator typos in config (``{titel}``) shouldn't crash the Dev-agent
+    in the middle of a run. Worst-case the human sees a literal ``{titel}``
+    in their MR description and updates the YAML.
+    """
+    try:
+        return template.format(**kwargs)
+    except (KeyError, IndexError) as exc:
+        logger.warning("Dev: template format failed ({}): {}", exc, template[:120])
+        return template
 
 
 def _dev_max_turns(config: AppConfig) -> int | None:

@@ -96,7 +96,6 @@ class DevOpsAgent:
 
         if new_red:
             failing = [j for j in jobs if j.status == "failed"]
-            summary = _render_pipeline_comment(row, failing)
             logger.warning(
                 "DevOps: red pipeline on {}!{}; posting to MR + MM",
                 row.repo_key, row.iid,
@@ -104,11 +103,7 @@ class DevOpsAgent:
             stats.failures_detected += 1
             if self._communicator is not None:
                 channel = self._team_channel_for(row.repo_key)
-                mm_text = (
-                    f"[virtual-dev] Pipeline FAILED on `{row.repo_key}!{row.iid}`: "
-                    f"{row.web_url}\n\n"
-                    f"Failing jobs: {', '.join(j.name for j in failing) or 'n/a'}"
-                )
+                mm_text = self._render_pipeline_short(row, failing)
                 if channel:
                     outcome = await self._communicator.send_channel(channel, mm_text)
                     if outcome.sent:
@@ -147,6 +142,32 @@ class DevOpsAgent:
         if not handle or handle == "your.name":
             return None
         return await self._communicator.resolve_user_id(username=handle)
+
+    def _render_pipeline_short(
+        self, row: MergeRequestRow, failing: list[PipelineJob],
+    ) -> str:
+        jobs = ", ".join(j.name for j in failing) or "n/a"
+        try:
+            return self._config.notifications.mattermost.pipeline_failed_short.format(
+                repo_key=row.repo_key, iid=row.iid,
+                title=row.title, web_url=row.web_url, jobs=jobs,
+            )
+        except (KeyError, IndexError) as exc:
+            logger.warning("DevOps: pipeline_failed_short template error: {}", exc)
+            return f"Pipeline failed on {row.repo_key}!{row.iid}: {row.web_url}"
+
+    def _render_pipeline_full(
+        self, row: MergeRequestRow, failing: list[PipelineJob],
+    ) -> str:
+        try:
+            return self._config.notifications.mattermost.pipeline_failed_full.format(
+                repo_key=row.repo_key, iid=row.iid,
+                title=row.title, web_url=row.web_url,
+                jobs_detail_block=_render_jobs_detail_block(failing),
+            )
+        except (KeyError, IndexError) as exc:
+            logger.warning("DevOps: pipeline_failed_full template error: {}", exc)
+            return self._render_pipeline_short(row, failing)
 
     def _team_channel_for(self, repo_key: str) -> str | None:
         mapping = self._config.mappings.team_channels or {}
@@ -200,24 +221,18 @@ def _collapse_status(jobs: list[PipelineJob]) -> str:
     return "unknown"
 
 
-def _render_pipeline_comment(row: MergeRequestRow, failing: list[PipelineJob]) -> str:
-    lines: list[str] = []
-    lines.append(
-        f"[virtual-dev] DevOps: pipeline failed on `{row.repo_key}!{row.iid}`."
-    )
-    lines.append("")
+def _render_jobs_detail_block(failing: list[PipelineJob]) -> str:
+    """Render the per-failing-job section of pipeline_failed_full template."""
+    blocks: list[str] = []
     for job in failing:
-        lines.append(f"*{job.name}* ({job.stage}) — {job.web_url}")
+        block = [f"*{job.name}* ({job.stage}) — {job.web_url}"]
         if job.log_excerpt:
-            tail = job.log_excerpt
-            if len(tail) > 2000:
-                tail = tail[-2000:]
-            lines.append("```")
-            lines.append(tail)
-            lines.append("```")
-        lines.append("")
-    lines.append(row.web_url)
-    return "\n".join(lines)
+            tail = job.log_excerpt[-2000:] if len(job.log_excerpt) > 2000 else job.log_excerpt
+            block.append("```")
+            block.append(tail)
+            block.append("```")
+        blocks.append("\n".join(block))
+    return "\n\n".join(blocks)
 
 
 __all__ = ["DevOpsAgent", "DevOpsTickStats"]

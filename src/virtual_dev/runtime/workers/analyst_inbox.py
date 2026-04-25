@@ -23,44 +23,58 @@ from virtual_dev.application.agents.orchestrator import (
 from virtual_dev.domain.models.plan import Plan, PlanStatus
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
-from virtual_dev.infrastructure.config import AgentsCfg
+from virtual_dev.infrastructure.config import AppConfig
 
 
-def _render_plan_comment(plan: Plan, dashboard_url: str | None = None) -> str:
-    """Human-readable summary for a Jira comment."""
-    lines: list[str] = []
-    lines.append("*[virtual-dev] Analyst produced a plan for this ticket.*")
-    lines.append("")
-    lines.append(f"*Status:* {plan.status.value}")
-    lines.append(f"*Confidence:* {plan.confidence:.2f}")
-    if plan.target_repo_key:
-        lines.append(f"*Target repo:* {plan.target_repo_key}")
-    lines.append("")
-    lines.append("*Summary*")
-    lines.append(plan.summary or "(empty)")
+def _render_plan_comment(
+    plan: Plan,
+    template: str,
+    dashboard_url: str | None = None,
+) -> str:
+    """Format the Jira plan-summary comment from a config template.
+
+    The template uses Python ``str.format`` with prebuilt section blocks
+    (``{steps_block}`` etc.) — empty when the plan has no entries — so
+    the YAML stays a single string without conditional logic.
+    """
+    target_repo_block = (
+        f"*Target repo:* {plan.target_repo_key}\n" if plan.target_repo_key else ""
+    )
+    steps_block = ""
     if plan.steps:
-        lines.append("")
-        lines.append("*Steps*")
-        for step in plan.steps:
-            lines.append(f"{step.order}. {step.summary}")
+        steps_block = "\n*Steps*\n" + "\n".join(
+            f"{step.order}. {step.summary}" for step in plan.steps
+        )
+    open_questions_block = ""
     if plan.open_questions:
-        lines.append("")
-        lines.append("*Open questions* (blocking implementation)")
+        lines = ["\n*Open questions* (blocking implementation)"]
         for q in plan.open_questions:
             bits = [f"- {q.question}"]
             if q.ask_whom:
                 bits.append(f"(ask: {q.ask_whom})")
             lines.append(" ".join(bits))
+        open_questions_block = "\n".join(lines)
+    risks_block = ""
     if plan.risks:
-        lines.append("")
-        lines.append("*Risks*")
-        for risk in plan.risks:
-            lines.append(f"- {risk}")
-    lines.append("")
-    lines.append(f"_Turns: {plan.iterations}._")
-    if dashboard_url:
-        lines.append(f"_Dashboard: {dashboard_url}_")
-    return "\n".join(lines)
+        risks_block = "\n*Risks*\n" + "\n".join(f"- {r}" for r in plan.risks)
+    dashboard_block = f"_Dashboard: {dashboard_url}_" if dashboard_url else ""
+    try:
+        return template.format(
+            tracker=plan.tracker,
+            external_id=plan.task_external_id,
+            status=plan.status.value,
+            confidence=f"{plan.confidence:.2f}",
+            summary=plan.summary or "(empty)",
+            iterations=plan.iterations,
+            target_repo_block=target_repo_block,
+            steps_block=steps_block,
+            open_questions_block=open_questions_block,
+            risks_block=risks_block,
+            dashboard_block=dashboard_block,
+        )
+    except (KeyError, IndexError) as exc:
+        logger.warning("AnalystInbox: plan template format failed: {}", exc)
+        return template
 
 
 class AnalystInbox:
@@ -71,14 +85,14 @@ class AnalystInbox:
         *,
         analyst: AnalystAgent,
         task_tracker: TaskTrackerPort | None,
-        agents_config: AgentsCfg,
+        config: AppConfig,
         message_bus: MessageBusPort | None = None,
         post_to_tracker: bool = True,
         dev_specialisation: str = "backend",
     ) -> None:
         self._analyst = analyst
         self._task_tracker = task_tracker
-        self._agents_config = agents_config
+        self._config = config
         self._message_bus = message_bus
         self._post_to_tracker = post_to_tracker
         self._dev_specialisation = dev_specialisation
@@ -95,7 +109,7 @@ class AnalystInbox:
         # while. Rolling back on failure is not worth it — Analyst setting
         # internal_status=FAILED is enough signal for the dashboard.
         if self._post_to_tracker and self._task_tracker is not None:
-            to_in_progress = self._agents_config.jira_transitions.to_in_progress
+            to_in_progress = self._config.agents.jira_transitions.to_in_progress
             try:
                 await self._task_tracker.transition(external_id, to_in_progress)
             except Exception:
@@ -116,7 +130,9 @@ class AnalystInbox:
             return
 
         if self._post_to_tracker and self._task_tracker is not None:
-            body = _render_plan_comment(plan)
+            body = _render_plan_comment(
+                plan, self._config.notifications.jira.plan_comment,
+            )
             try:
                 await self._task_tracker.comment(external_id, body)
             except Exception:

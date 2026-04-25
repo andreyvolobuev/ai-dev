@@ -12,6 +12,7 @@ from virtual_dev.infrastructure.config.schema import (
     AgentsCfg,
     AppConfig,
     MappingsCfg,
+    NotificationsCfg,
     RepositoriesCfg,
 )
 
@@ -78,6 +79,12 @@ def load_config(config_dir: Path | str = "config") -> AppConfig:
     repositories_raw = _read_yaml(root / "repositories.yaml")
     agents_raw = _read_yaml(root / "agents.yaml")
     mappings_raw = _read_yaml(root / "mappings.yaml")
+    # notifications.yaml is optional during the transition; missing file
+    # falls back to empty templates (which the schema fills with defaults).
+    notifications_path = root / "notifications.yaml"
+    notifications_raw: dict[str, Any] = (
+        _read_yaml(notifications_path) if notifications_path.exists() else {}
+    )
 
     local_path = root / "local.yaml"
     if local_path.exists():
@@ -88,9 +95,16 @@ def load_config(config_dir: Path | str = "config") -> AppConfig:
         )
         agents_raw = _deep_merge(agents_raw, local_raw.get("agents_override", local_raw))
         mappings_raw = _deep_merge(mappings_raw, local_raw.get("mappings_override", {}))
+        notifications_raw = _deep_merge(
+            notifications_raw, local_raw.get("notifications_override", {}),
+        )
 
     repositories = RepositoriesCfg.model_validate(repositories_raw).repositories
     agents = AgentsCfg.model_validate(agents_raw)
     mappings = MappingsCfg.model_validate(mappings_raw)
+    notifications = NotificationsCfg.model_validate(notifications_raw)
 
-    return AppConfig(repositories=repositories, agents=agents, mappings=mappings)
+    return AppConfig(
+        repositories=repositories, agents=agents,
+        mappings=mappings, notifications=notifications,
+    )

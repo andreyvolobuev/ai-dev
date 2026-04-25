@@ -1,0 +1,99 @@
+# Шаблоны всех сообщений, которые бот пишет людям.
+#
+# Все формат-строки используют Python str.format. Список доступных
+# placeholders приведён над каждым шаблоном.
+# Условные секции (когда блок может быть пустым) делает рендер-код:
+# в шаблон передаётся уже готовая строка (`_block`), пустая если
+# секция не нужна.
+#
+# LLM-системные промпты (Analyst / Dev / ThreadResponder) — НЕ здесь,
+# они в коде т.к. жёстко связаны с агентом.
+
+# --- Mattermost ---
+# Reviewer / DevOps пишут в `mappings.team_channels[<repo>]` или DM на
+# `escalation.mattermost_user`. Все доступные placeholders:
+# {repo_key}, {iid}, {title}, {web_url}, {idle_hours} (только в stale/escalation).
+mattermost:
+  review_ping: |
+    [virtual-dev] MR `{repo_key}!{iid}` готов к ревью.
+    {title}
+    {web_url}
+
+  merge_ping: |
+    [virtual-dev] MR `{repo_key}!{iid}` собрал апрувы. Просьба смержить: {web_url}
+
+  stale_ping: |
+    [virtual-dev] MR `{repo_key}!{iid}` ждёт ревью уже {idle_hours}ч. {web_url}
+
+  escalation_dm: |
+    [virtual-dev] MR `{repo_key}!{iid}` без активности {idle_hours}ч — напомни кому-нибудь или переназначь. {web_url}
+
+  # DevOps. {jobs} — csv имён упавших job'ов, {jobs_detail_block} —
+  # многострочный блок job-name + log-tail в ``` блоках, готовый к вставке.
+  pipeline_failed_short: |
+    [virtual-dev] Pipeline FAILED на `{repo_key}!{iid}`: {web_url}
+
+    Failing jobs: {jobs}
+
+  pipeline_failed_full: |
+    [virtual-dev] DevOps: pipeline failed на `{repo_key}!{iid}`.
+
+    {jobs_detail_block}
+    {web_url}
+
+  # Reviewer thread responses (MmThreadListener). {commit_sha_short}, {branch}.
+  thread_reply_no_dev_agent: "Не могу внести правку: Dev-агент для этого репо не сконфигурирован."
+  thread_reply_no_task: "Не нашёл связанный тикет."
+  thread_reply_iteration_crashed: "Попробовал внести правку, но Dev-агент упал. Смотри логи."
+  thread_reply_iteration_done: "Внёс правку: новый коммит `{commit_sha_short}` запушен на `{branch}`. MR обновлён."
+  thread_reply_iteration_no_changes: "Рабочее дерево осталось чистым — правка не потребовалась или модель не смогла внести её. Смотри логи."
+
+# --- Jira (комментарии к тикетам) ---
+# Доступные placeholders:
+#   {tracker}, {external_id}, {status}, {confidence}, {summary},
+#   {iterations}, {target_repo_block}, {steps_block},
+#   {open_questions_block}, {risks_block}, {dashboard_block},
+#   {web_url}, {branch}, {branch_block}, {notes_block}.
+jira:
+  plan_comment: |
+    *[virtual-dev] Analyst produced a plan for this ticket.*
+
+    *Status:* {status}
+    *Confidence:* {confidence}
+    {target_repo_block}
+    *Summary*
+    {summary}
+    {steps_block}
+    {open_questions_block}
+    {risks_block}
+
+    _Turns: {iterations}._
+    {dashboard_block}
+
+  mr_link_comment: |
+    *[virtual-dev] Dev agent opened a draft MR for this ticket.*
+
+    - MR: {web_url}
+    - Branch: `{branch}`
+
+    _Please review and merge when ready._
+
+  failure_comment: |
+    *[virtual-dev] Dev agent could not finish this ticket.*
+    {branch_block}
+    {notes_block}
+
+    _Task kept in FAILED state; a human can take it from here._
+
+# --- GitLab MR (то, что бот сам пишет в title / description / commit) ---
+# {key} — ticket external id, {title} — модель-сабмит, {url} — ticket URL,
+# {description} — модель-сабмит, {plan_block}, {notes_block}.
+merge_request:
+  title: "{key}: {title}"
+  commit_message: "[{key}] {title}"
+  description: |
+    **Ticket:** [{key}]({url})
+
+    {description}
+    {plan_block}
+    {notes_block}
