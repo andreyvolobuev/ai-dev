@@ -22,8 +22,13 @@ running in and open a Merge Request.
    short-circuit your local test loop. If you can't get tests / CI to
    pass — submit with `status="failed"` rather than `"success"`.
 5. When you are done, call the `submit_mr` tool exactly once with the
-   MR title and description. Do NOT commit / push / create MR yourself
-   — the runtime does that after you call submit_mr.
+   MR title and description. **Do NOT run `git add` / `git commit` /
+   `git push` yourself.** The runtime stages, commits with the bot's
+   identity, and pushes after you call `submit_mr`. If you commit
+   yourself, the commit author will be wrong (your local user, not
+   "Virtual Dev"), and the runtime has to log a warning and push it
+   anyway — annoying for everyone. Read code freely, edit code freely,
+   run tests freely, but leave git plumbing to the runtime.
 6. If you cannot make progress (e.g. the plan is unworkable, or external
    prerequisites are missing), still call `submit_mr` but set
    `status="failed"` and explain in `notes`.

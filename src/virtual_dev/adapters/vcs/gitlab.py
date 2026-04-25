@@ -151,14 +151,43 @@ class GitLabVcs(VcsPort):
         await self._run_git(path, "checkout", "-b", branch)
 
     async def commit_all(self, repo_key: str, message: str) -> str:
+        """Stage + commit pending changes; return the SHA to push.
+
+        Two paths:
+
+        * Pending uncommitted changes → ``git add -A`` + commit with the
+          bot's identity. Return the new HEAD sha.
+        * Working tree clean BUT local HEAD is ahead of ``origin/<branch>``
+          → the Dev model committed itself despite being told not to.
+          Return the existing HEAD sha so the caller still pushes the
+          work; we'd rather lose the per-call bot identity than silently
+          drop a commit the LLM made.
+
+        Returns ``""`` only when there's truly nothing to push.
+        """
         path = await self._ensure_local(repo_key)
         await self._run_git(path, "add", "-A")
-        # Nothing to commit? Return an empty sha.
-        if not await self.has_uncommitted_changes(repo_key):
-            return ""
-        await self._run_git_with_identity(path, "commit", "-m", message)
-        sha = (await self._run_git(path, "rev-parse", "HEAD")).strip()
-        return sha
+        if await self.has_uncommitted_changes(repo_key):
+            await self._run_git_with_identity(path, "commit", "-m", message)
+            return (await self._run_git(path, "rev-parse", "HEAD")).strip()
+        # Clean tree — check whether the model already committed.
+        branch = await self.current_branch(repo_key)
+        local_head = (await self._run_git(path, "rev-parse", "HEAD")).strip()
+        try:
+            remote_head = (
+                await self._run_git(path, "rev-parse", f"origin/{branch}")
+            ).strip()
+        except VcsError:
+            # Branch doesn't exist on origin yet → any commit is "new".
+            remote_head = ""
+        if local_head and local_head != remote_head:
+            logger.warning(
+                "VCS: working tree clean but {!r} HEAD {} ≠ origin {!r}; "
+                "Dev appears to have committed itself — pushing anyway",
+                branch, local_head[:12], remote_head[:12] or "(none)",
+            )
+            return local_head
+        return ""
 
     async def push(self, repo_key: str, branch: str) -> None:
         """Push with limited retry.

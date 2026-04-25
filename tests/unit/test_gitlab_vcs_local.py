@@ -84,11 +84,16 @@ async def test_create_branch_and_commit_and_push(tmp_path: Path) -> None:
     (workspace / "new.txt").write_text("hello\n")
     sha = await vcs.commit_all("demo", "Add a file")
     assert sha != ""
-    # Second commit with nothing staged → empty sha.
+    # Second call with nothing new staged: branch still ahead of origin
+    # (we haven't pushed yet), so commit_all returns the same sha — caller
+    # should still push it. HEAD didn't move.
     sha2 = await vcs.commit_all("demo", "noop")
-    assert sha2 == ""
+    assert sha2 == sha
 
     await vcs.push("demo", "ai-dev/dm-1")
+    # After push, local matches origin → commit_all reports nothing to push.
+    sha3 = await vcs.commit_all("demo", "noop")
+    assert sha3 == ""
     # Verify the branch landed on the upstream.
     out = subprocess.run(
         ["git", "branch", "--list", "ai-dev/dm-1"],
