@@ -21,12 +21,19 @@ task_source:
   jql: 'assignee = currentUser() AND labels = "ai-dev" AND status = "To Do"'
   poll_interval_seconds: 120
 
-# Переходы статусов в Jira. Проверь, что имена совпадают с реальным workflow.
+# Переходы статусов в Jira: значения — точные имена ЦЕЛЕВЫХ статусов
+# (`transition.to`), не имён транзишнов. Адаптер находит транзишн по
+# совпадению `to == <имя>`. Если не найдено — логирует доступные
+# варианты и не падает.
+#
+# DM-проект на 2026-04-25 предлагает статусы:
+#   To Do, In Review, Testing, Waiting For Response,
+#   Готово к разработке, Closed.
 jira_transitions:
   to_in_progress: "In Progress"
-  to_review: "Review"
+  to_review: "In Review"
   to_testing: "Testing"
-  to_done: "Done"
+  to_done: "Closed"
 
 # Рабочие часы для общения в Mattermost (Московское время).
 # Вне этих часов Communicator копит задачи и шлёт утром.

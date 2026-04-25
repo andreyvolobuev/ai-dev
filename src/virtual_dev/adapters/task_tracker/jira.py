@@ -86,8 +86,32 @@ class JiraTaskTracker(TaskTrackerPort):
         return self._issue_to_task(issue)
 
     async def transition(self, external_id: str, to_status: str) -> None:
+        """Transition an issue to the given target status.
+
+        Looks up the workflow transition whose ``to`` matches ``to_status``
+        (case-insensitive) and POSTs it by id. atlassian-python-api's
+        ``set_issue_status`` does the same lookup internally but reports
+        a confusing ``transition identifier must be an integer`` error
+        when no match is found — we replace that with a clear message
+        listing the available transitions so config can be fixed quickly.
+        """
         def _run() -> None:
-            self._client.set_issue_status(external_id, to_status)
+            transitions = self._client.get_issue_transitions(external_id) or []
+            target = to_status.strip().lower()
+            match = None
+            for t in transitions:
+                if str(t.get("to") or "").strip().lower() == target:
+                    match = t
+                    break
+            if match is None:
+                available = ", ".join(
+                    f"{t.get('name')!r}→{t.get('to')!r}" for t in transitions
+                ) or "(none)"
+                raise RuntimeError(
+                    f"Jira {external_id}: no workflow transition with target "
+                    f"{to_status!r}. Available: {available}"
+                )
+            self._client.set_issue_status_by_transition_id(external_id, match["id"])
 
         await asyncio.to_thread(_run)
         logger.info("Jira {} transitioned to {!r}", external_id, to_status)
