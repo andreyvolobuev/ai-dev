@@ -51,9 +51,15 @@ A common pattern:
      ambiguous.)
    * If exactly one match looks right (по имени-отчеству / должности),
      call `ask_mm_user(to_handle="...")`.
-   * If zero matches, ask the issue reporter (they wrote the ticket;
-     they know who they meant) for a confirmed handle, NOT a guessed
-     transliteration.
+   * If zero matches, **DM the issue reporter** (their handle is in
+     your prompt under «Issue reporter» — they wrote the ticket; they
+     know who they meant). Phrase the question as «Подскажи MM-ник
+     Васи Курочкина — нужно у него уточнить ⟨real thing⟩». Do NOT
+     guess a transliteration like `vasya.kurochkin` and DM that —
+     wrong DM is worse than asking the reporter.
+   * Only escalate if the reporter is unreachable (no handle in your
+     prompt) AND find_mm_user_by_name returned nothing. With a
+     reporter handle present, escalate is the LAST resort.
 3. **After ask_mm_user**: END YOUR TURN. You'll be re-invoked with
    the reply.
 4. **On re-invocation** (the prompt now contains a HUMAN_REPLIED

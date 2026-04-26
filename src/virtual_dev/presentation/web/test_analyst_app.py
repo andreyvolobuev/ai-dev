@@ -112,9 +112,12 @@ async def _build_state(
     # Auto-route escalation DMs to the operator (they ARE the lead in
     # the test-analyst session). Without this an `escalate_to_lead`
     # decision silently drops the DM and the activity feed shows
-    # nothing — the operator can't tell the bot gave up.
-    if not config.agents.escalation.mattermost_user.strip():
-        config.agents.escalation.mattermost_user = "you"
+    # nothing — the operator can't tell the bot gave up. We always
+    # override here, even if config/local.yaml has a real lead handle
+    # configured — that handle won't exist in the in-memory chat
+    # directory, so the DM would drop. The operator IS the lead in
+    # this session.
+    config.agents.escalation.mattermost_user = "you"
 
     engine = make_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
@@ -345,7 +348,7 @@ async def _run_task(state: TestAnalystState, raw: dict[str, Any]) -> None:
                 priority="medium",
                 external_status="To Do",
                 internal_status=TaskStatus.DISCOVERED.value,
-                reporter_id="test-user",
+                reporter_id="you",
             ))
 
     try:

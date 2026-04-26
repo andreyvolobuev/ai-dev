@@ -36,6 +36,7 @@ def _row_to_task(row: TaskRowClar) -> ClarificationTask:
         is_solved=bool(row.is_solved),
         final_answer=row.final_answer,
         confidence=float(row.confidence or 0.0),
+        reporter_handle=row.reporter_handle,
         depth=int(row.depth or 0),
         iteration_count=int(row.iteration_count or 0),
         tools_tried=list(row.tools_tried_json or []),
@@ -98,6 +99,7 @@ class ClarificationTaskRepository:
         coalesce_window_seconds: int,
         deadline_at: datetime,
         depth: int = 0,
+        reporter_handle: str | None = None,
     ) -> ClarificationTask:
         async with session_scope(self._session_factory) as session:
             row = TaskRowClar(
@@ -111,6 +113,7 @@ class ClarificationTaskRepository:
                 coalesce_window_seconds=coalesce_window_seconds,
                 deadline_at=deadline_at,
                 depth=depth,
+                reporter_handle=reporter_handle,
             )
             session.add(row)
             await session.flush()

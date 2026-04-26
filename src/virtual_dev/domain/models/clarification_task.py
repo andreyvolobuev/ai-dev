@@ -134,6 +134,12 @@ class ClarificationTask:
     final_answer: str | None = None      # validator's synthesized answer
     confidence: float = 0.0
 
+    # Handle of the issue reporter (in Mattermost). Available so the
+    # agent can DM them when it needs to ask "who is X" / "what about
+    # Y" — they wrote the ticket and know the missing context. Set by
+    # the analyst inbox when the task is created.
+    reporter_handle: str | None = None
+
     depth: int = 0
 
     # Loop bookkeeping.

@@ -103,6 +103,11 @@ class TaskOrchestrator:
         deadline = datetime.now(timezone.utc) + timedelta(
             hours=clar_cfg.max_goal_age_hours,
         )
+        # The reporter is the operator who filed the ticket — when the
+        # agent runs out of leads ("who is Vasya?"), they're the
+        # canonical fallback. Pull the handle from the tracker row;
+        # if it looks like an email, take the local part.
+        reporter_handle = _normalize_reporter(task_row.reporter_id)
         created = 0
         for oq in plan.open_questions:
             if oq.question in existing:
@@ -118,6 +123,7 @@ class TaskOrchestrator:
                 coalesce_window_seconds=clar_cfg.coalesce_window_seconds,
                 deadline_at=deadline,
                 depth=0,
+                reporter_handle=reporter_handle,
             )
             self.stats.tasks_created += 1
             created += 1
@@ -648,6 +654,22 @@ class TaskOrchestrator:
             agent_key="clarification",
             payload=body,
         ))
+
+
+def _normalize_reporter(reporter_id: str | None) -> str | None:
+    """Pull a usable Mattermost handle out of TaskRow.reporter_id.
+
+    Tracker fields are inconsistent: some store an email
+    (``ivanov@2gis.ru``), some a username (``i.ivanov``), some a free
+    name. Strip @ and email domain, leave the local part as the
+    handle the bot can ``resolve_user_id(username=...)`` with.
+    """
+    if not reporter_id:
+        return None
+    s = reporter_id.strip().lstrip("@")
+    if "@" in s:
+        s = s.split("@", 1)[0]
+    return s or None
 
 
 __all__ = ["TaskOrchestrator", "TaskOrchestratorStats"]

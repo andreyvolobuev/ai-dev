@@ -234,6 +234,10 @@ class TaskRowClar(Base):
     final_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
 
+    # Handle of the issue reporter — agent uses this to DM them when
+    # it needs context only the reporter has (e.g. "who is Vasya?").
+    reporter_handle: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
     depth: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     iteration_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     tools_tried_json: Mapped[list[str]] = mapped_column(JSON, default=list)

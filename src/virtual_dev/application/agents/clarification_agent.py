@@ -494,6 +494,14 @@ class ClarificationAgent:
                 f"{inp.task.info_source} "
                 f"(class: {inp.task.info_source_class or '?'})"
             )
+        if inp.task.reporter_handle:
+            parts.append("")
+            parts.append(
+                f"**Issue reporter (you can DM them when stuck):** "
+                f"@{inp.task.reporter_handle} — they wrote the ticket "
+                f"and can clarify free-form names ('кто такой Вася?'), "
+                f"missing endpoints, etc."
+            )
         parts.append("")
 
         if inp.issue_summary.strip():
