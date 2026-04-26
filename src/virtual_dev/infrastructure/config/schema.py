@@ -182,6 +182,11 @@ class ClarificationCfg(_StrictModel):
     # revert to READY_TO_REPLAN for retry.
     replanning_stuck_after_minutes: int = 10
 
+    # Sub-goal recursion guard. A goal at depth ``max_subgoal_depth``
+    # can no longer spawn children — orchestrator escalates instead.
+    # Prevents runaway recursive decomposition by the planner.
+    max_subgoal_depth: int = 4
+
 
 class AgentsCfg(_StrictModel):
     models: ModelsCfg = Field(default_factory=ModelsCfg)

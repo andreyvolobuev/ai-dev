@@ -217,6 +217,7 @@ class GoalRow(Base):
         Index("ix_goals_state_nextrun", "state", "next_planner_run_at"),
         Index("ix_goals_state_deadline", "state", "deadline_at"),
         Index("ix_goals_tracker_extid", "tracker", "task_external_id"),
+        Index("ix_goals_parent_state", "parent_goal_id", "state"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -224,6 +225,11 @@ class GoalRow(Base):
     plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     tracker: Mapped[str] = mapped_column(String(32))
     task_external_id: Mapped[str] = mapped_column(String(64))
+
+    # Sub-goal linkage. NULL on top-level goals; non-NULL when this
+    # goal was spawned by a parent's planner via SPAWN_SUBGOALS.
+    parent_goal_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    depth: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     description: Mapped[str] = mapped_column(Text)
     why_it_matters: Mapped[str] = mapped_column(Text, default="")

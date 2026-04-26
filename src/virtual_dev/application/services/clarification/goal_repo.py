@@ -54,6 +54,8 @@ def _row_to_goal(row: GoalRow) -> ClarificationGoal:
         initial_contact_hint=row.initial_contact_hint or "",
         state=state,
         final_answer=row.final_answer,
+        parent_goal_id=row.parent_goal_id,
+        depth=row.depth or 0,
         current_target_user_id=row.current_target_user_id,
         current_target_username=row.current_target_username,
         current_channel_id=row.current_channel_id,
@@ -118,6 +120,8 @@ class GoalRepository:
         initial_contact_hint: str,
         coalesce_window_seconds: int,
         deadline_at: datetime,
+        parent_goal_id: int | None = None,
+        depth: int = 0,
     ) -> ClarificationGoal:
         async with session_scope(self._session_factory) as session:
             row = GoalRow(
@@ -130,6 +134,8 @@ class GoalRepository:
                 state=GoalState.PENDING.value,
                 coalesce_window_seconds=coalesce_window_seconds,
                 deadline_at=deadline_at,
+                parent_goal_id=parent_goal_id,
+                depth=depth,
             )
             session.add(row)
             await session.flush()
@@ -168,6 +174,65 @@ class GoalRepository:
             )
             rows = list((await session.execute(stmt)).scalars().all())
         return [_row_to_goal(r) for r in rows]
+
+    async def list_top_level_for_plan(
+        self, plan_id: int,
+    ) -> list[ClarificationGoal]:
+        """Top-level goals only (parent_goal_id IS NULL). Used by
+        ``_maybe_resettle_plan`` so subgoal terminations don't trigger
+        a premature replan.
+        """
+        async with self._session_factory() as session:
+            stmt = (
+                select(GoalRow)
+                .where(
+                    GoalRow.plan_id == plan_id,
+                    GoalRow.parent_goal_id.is_(None),
+                )
+                .order_by(GoalRow.id.asc())
+            )
+            rows = list((await session.execute(stmt)).scalars().all())
+        return [_row_to_goal(r) for r in rows]
+
+    async def list_subgoals(self, parent_id: int) -> list[ClarificationGoal]:
+        async with self._session_factory() as session:
+            stmt = (
+                select(GoalRow)
+                .where(GoalRow.parent_goal_id == parent_id)
+                .order_by(GoalRow.id.asc())
+            )
+            rows = list((await session.execute(stmt)).scalars().all())
+        return [_row_to_goal(r) for r in rows]
+
+    async def find_blocked_with_all_subgoals_terminal(
+        self,
+    ) -> list[ClarificationGoal]:
+        """BLOCKED_ON_SUBGOAL goals whose every child is in a terminal
+        state (ACHIEVED / ABANDONED / ESCALATED). Sweep flips them to
+        READY_TO_REPLAN so the parent's planner can react."""
+        terminal = [s.value for s in (
+            GoalState.ACHIEVED, GoalState.ABANDONED, GoalState.ESCALATED,
+        )]
+        async with self._session_factory() as session:
+            blocked = list((await session.execute(
+                select(GoalRow).where(
+                    GoalRow.state == GoalState.BLOCKED_ON_SUBGOAL.value,
+                )
+            )).scalars().all())
+            ready: list[GoalRow] = []
+            for parent in blocked:
+                subgoals = list((await session.execute(
+                    select(GoalRow.state)
+                    .where(GoalRow.parent_goal_id == parent.id)
+                )).scalars().all())
+                if not subgoals:
+                    # Parent blocked but has no children — bug; let the
+                    # sweep unblock it so the planner notices and decides.
+                    ready.append(parent)
+                    continue
+                if all(s in terminal for s in subgoals):
+                    ready.append(parent)
+        return [_row_to_goal(r) for r in ready]
 
     async def find_active_by_thread(
         self, asked_post_id: str,
@@ -220,10 +285,10 @@ class GoalRepository:
         return [_row_to_step(r) for r in rows]
 
     async def existing_descriptions_for_plan(self, plan_id: int) -> set[str]:
-        """Used by ``request_clarifications`` to dedupe by description,
-        but only against ACTIVE goals — abandoned goals don't block a
-        replan (per Plan-agent's recommendation).
-        """
+        """Top-level descriptions still active on this plan. Used by
+        ``request_clarifications`` to skip re-creating the same
+        question when the analyst replans (subgoals are excluded —
+        they're internal decomposition, not analyst-authored)."""
         active = [s.value for s in ACTIVE_STATES]
         async with self._session_factory() as session:
             stmt = (
@@ -231,6 +296,7 @@ class GoalRepository:
                 .where(
                     GoalRow.plan_id == plan_id,
                     GoalRow.state.in_(active),
+                    GoalRow.parent_goal_id.is_(None),
                 )
             )
             return set((await session.execute(stmt)).scalars().all())

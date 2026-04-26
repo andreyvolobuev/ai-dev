@@ -51,6 +51,7 @@ from virtual_dev.domain.models.clarification_goal import (
     GoalStepKind,
     PlannerActionKind,
     PlannerDecision,
+    SubgoalSpec,
 )
 from virtual_dev.domain.ports.code_agent import CodeAgentPort, CodeAgentRequest
 from virtual_dev.infrastructure.config import AppConfig
@@ -89,6 +90,20 @@ _SUBMIT_SCHEMA: dict[str, Any] = {
         # WAIT
         "note": {"type": ["string", "null"]},
         "retry_after_minutes": {"type": ["integer", "null"]},
+
+        # SPAWN_SUBGOALS — one or more child goals to learn first.
+        "subgoals": {
+            "type": ["array", "null"],
+            "items": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "why_it_matters": {"type": ["string", "null"]},
+                    "initial_contact_hint": {"type": ["string", "null"]},
+                },
+                "required": ["description"],
+            },
+        },
     },
     "required": ["action", "reasoning"],
 }
@@ -172,6 +187,7 @@ class ClarificationPlanner:
             reason=str(captured.get("reason") or ""),
             note=str(captured.get("note") or ""),
             retry_after_minutes=_int_or_none(captured.get("retry_after_minutes")),
+            subgoals=_parse_subgoals(captured.get("subgoals")),
             cost_usd=result.cost_usd,
         )
 
@@ -213,16 +229,27 @@ class ClarificationPlanner:
                 "mcp__virtual_dev_researcher__search_mr_history",
             ])
 
-        # MM lookup_mm_user. Imported lazily to avoid the
-        # clarification.__init__ → orchestrator → planner → tools
-        # circular when this module is loaded transitively.
-        from virtual_dev.application.services.clarification.planner_tools import (
-            build_planner_mcp_server,
+        # Planner-tagged skills from the registry (lazy import to dodge
+        # the clarification.__init__ → orchestrator → planner cycle).
+        from virtual_dev.application.services.skills import (
+            SkillContext,
+            build_skills_mcp_server,
+            discover_builtin_skills,
         )
 
-        lookup_server, lookup_tools = build_planner_mcp_server(self._communicator)
-        mcp_servers["virtual_dev_planner_tools"] = lookup_server
-        allowed.extend(lookup_tools)
+        registry = discover_builtin_skills()
+        ctx = SkillContext(
+            communicator=self._communicator,
+            config=self._config,
+        )
+        skills_server, skills_tools = build_skills_mcp_server(
+            registry.filter(tag="planner"),
+            ctx,
+            server_name="virtual_dev_skills",
+        )
+        if skills_tools:
+            mcp_servers["virtual_dev_skills"] = skills_server
+            allowed.extend(skills_tools)
 
         # File-system tools so factual questions about the repo can be
         # answered without DM-ing a human.
@@ -297,12 +324,24 @@ class ClarificationPlanner:
             f"- planner_calls_count: {inp.goal.planner_calls_count} "
             f"(circuit breaker after {_max_planner_calls(self._config)})"
         )
+        max_depth = self._config.agents.clarification.max_subgoal_depth
+        parts.append(
+            f"- subgoal depth: {inp.goal.depth} / {max_depth} "
+            f"(can{'not' if inp.goal.depth >= max_depth else ''} spawn children)"
+        )
+        if inp.goal.parent_goal_id is not None:
+            parts.append(
+                f"- this goal IS a subgoal of goal #{inp.goal.parent_goal_id}; "
+                f"its outcome will be folded back into the parent"
+            )
         parts.append("")
 
         parts.append(
             "Use the available tools (Read/Glob/Grep, Researcher MCP, "
-            "lookup_mm_user) for self-research before deciding to DM a "
-            "human. Then call `submit_decision` exactly once."
+            "search_mm_users_by_name, lookup_mm_user) for self-research "
+            "before deciding to DM a human. Spawn sub-goals when you "
+            "need to learn a prerequisite first. Then call "
+            "`submit_decision` exactly once."
         )
         return "\n".join(parts)
 
@@ -349,6 +388,24 @@ def _clamp_confidence(value: Any) -> float:
     except (TypeError, ValueError):
         v = 0.0
     return max(0.0, min(1.0, v))
+
+
+def _parse_subgoals(value: Any) -> list[SubgoalSpec]:
+    if not isinstance(value, list):
+        return []
+    out: list[SubgoalSpec] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        desc = str(entry.get("description") or "").strip()
+        if not desc:
+            continue
+        out.append(SubgoalSpec(
+            description=desc,
+            why_it_matters=str(entry.get("why_it_matters") or "").strip(),
+            initial_contact_hint=str(entry.get("initial_contact_hint") or "").strip(),
+        ))
+    return out
 
 
 def _planner_max_turns(config: AppConfig) -> int | None:

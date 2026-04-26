@@ -174,6 +174,40 @@ Defer the goal — do not DM again immediately.
   orchestrator scheduling sets `next_planner_run_at = now + N min`.
   Default to 60 minutes if you can't tell from the reply.
 
+### `spawn_subgoals`
+
+Decompose the current goal into one or more child goals when answering
+it requires learning something else first. Each child runs its own
+planner loop; this goal blocks (state=BLOCKED_ON_SUBGOAL) until every
+child reaches a terminal state, then this planner runs again with the
+children's outcomes folded into the history as `subgoal_*` steps.
+
+Use when:
+
+* the analyst's goal is composite («какой body использовал Вася для
+  репро» — implicitly: «найди контакт Васи» AND «попроси у него body»);
+* you can't make progress until a prerequisite is known and you can't
+  trivially put that into one question (e.g. resolving a handle from a
+  free-form name where ambiguity is plausible);
+* the prerequisite is itself a real bot job (a DM exchange, code dive,
+  or directory search), not just a one-line lookup you should do
+  inline via the existing tools.
+
+Don't decompose for the sake of decomposition. If `search_mm_users_by_name`
+plus a single DM to the reporter is enough, that's an `ask`, not a
+subgoal. Subgoals are for genuinely separate sub-investigations.
+
+Schema:
+
+* `subgoals`: array of `{description, why_it_matters?, initial_contact_hint?}`.
+  Description is mandatory and should be a self-contained statement
+  of what the child is trying to learn (read by the child's planner
+  cold). `initial_contact_hint` is optional — pass it through if you
+  already know who to start with.
+
+Recursion is bounded: see the `subgoal depth` line in your prompt's
+budget block. When you hit the cap, the orchestrator escalates instead.
+
 ## Output contract
 
 * Exactly one `submit_decision` call. No free-form text after it.

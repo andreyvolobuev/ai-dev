@@ -5,12 +5,16 @@ example "получить пример request body для воспроизве�
 The bot doesn't ask one fixed question and accept whatever comes back;
 it iterates: a planner LLM looks at the goal + the full conversation
 history + the latest reply and decides one next step (ask someone,
-declare goal achieved, escalate, etc.). Each step is appended to
-``GoalStep`` history so the planner has full context next time.
+declare goal achieved, spawn sub-goals, escalate, etc.). Each step is
+appended to ``GoalStep`` history so the planner has full context.
 
-This replaces the Q-tree (``clarification.Question``): copying parent
-question text on redirect was wrong — it loses the goal. With a goal
-the planner re-composes the question for each new recipient.
+Sub-goals: when achieving the parent depends on first learning
+something else (e.g. "before we can ask Vasya, we need his MM handle"),
+the planner can ``spawn_subgoals`` — children with their own
+description, history, and recipients. The parent goes BLOCKED_ON_SUBGOAL
+and unblocks once every child reaches a terminal state. The child's
+final outcome is folded back into the parent's history as a
+``SUBGOAL_*`` step so the parent's planner sees the result.
 """
 
 from __future__ import annotations
@@ -24,20 +28,21 @@ from typing import Any
 class GoalState(str, Enum):
     """States a ``ClarificationGoal`` can be in.
 
-    Active states: ``PENDING``, ``PLANNING``, ``SEND_PENDING``,
+    Active: ``PENDING``, ``PLANNING``, ``SEND_PENDING``,
     ``AWAITING_REPLY``, ``COALESCING``, ``READY_TO_REPLAN``,
-    ``REPLANNING``, ``WAITING``.
-    Terminal states: ``ACHIEVED``, ``ABANDONED``, ``ESCALATED``.
+    ``REPLANNING``, ``WAITING``, ``BLOCKED_ON_SUBGOAL``.
+    Terminal: ``ACHIEVED``, ``ABANDONED``, ``ESCALATED``.
 
     State graph (informal):
 
-        PENDING → PLANNING → ASK→AWAITING_REPLY|SEND_PENDING / ACHIEVED / ESCALATED / ABANDONED / WAITING
-        SEND_PENDING --(retry tick)--> AWAITING_REPLY | SEND_PENDING | ABANDONED(after N retries)
-        AWAITING_REPLY --(fragment)--> COALESCING --(fragment)--> COALESCING (refresh idle)
-        COALESCING --(idle ≥ window)--> READY_TO_REPLAN
-        READY_TO_REPLAN --(coalescer tick)--> REPLANNING --(planner returns)--> ASK / ACHIEVE / ...
+        PENDING → PLANNING → ASK | ACHIEVE | ESCALATE | ABANDON | WAIT | SPAWN_SUBGOAL
+        ASK → AWAITING_REPLY | SEND_PENDING
+        SEND_PENDING --(retry)--> AWAITING_REPLY | SEND_PENDING | ABANDONED(after N retries)
+        AWAITING_REPLY --(fragment)--> COALESCING --(idle window)--> READY_TO_REPLAN
+        READY_TO_REPLAN --(claim)--> REPLANNING --(planner returns)--> ASK | ACHIEVE | ...
         REPLANNING --(timeout sweep)--> READY_TO_REPLAN  # crash-recovery
         WAITING --(next_planner_run_at passed)--> READY_TO_REPLAN
+        SPAWN_SUBGOAL --> BLOCKED_ON_SUBGOAL --(all subgoals terminal)--> READY_TO_REPLAN
         any active --(deadline_at passed)--> ABANDONED
     """
 
@@ -49,6 +54,7 @@ class GoalState(str, Enum):
     READY_TO_REPLAN = "ready_to_replan"
     REPLANNING = "replanning"
     WAITING = "waiting"
+    BLOCKED_ON_SUBGOAL = "blocked_on_subgoal"
     ACHIEVED = "achieved"
     ABANDONED = "abandoned"
     ESCALATED = "escalated"
@@ -63,6 +69,7 @@ ACTIVE_STATES: frozenset[GoalState] = frozenset({
     GoalState.READY_TO_REPLAN,
     GoalState.REPLANNING,
     GoalState.WAITING,
+    GoalState.BLOCKED_ON_SUBGOAL,
 })
 
 TERMINAL_STATES: frozenset[GoalState] = frozenset({
@@ -75,21 +82,30 @@ TERMINAL_STATES: frozenset[GoalState] = frozenset({
 class GoalStepKind(str, Enum):
     """Kinds of audit-log entries appended to a goal's history."""
 
-    BOT_ASKED = "bot_asked"               # the bot sent a DM
-    HUMAN_REPLIED = "human_replied"       # coalesced reply received
-    PLANNER_DECIDED = "planner_decided"   # planner emitted a decision
-    NOTE = "note"                         # any other observation
-    STALE_FRAGMENT = "stale_fragment"     # fragment that arrived but was superseded by a new ask
+    BOT_ASKED = "bot_asked"
+    HUMAN_REPLIED = "human_replied"
+    PLANNER_DECIDED = "planner_decided"
+    NOTE = "note"
+    STALE_FRAGMENT = "stale_fragment"
+    # Sub-goal lifecycle on the PARENT goal's history. The parent's
+    # planner sees these as evidence about what the children learned.
+    SUBGOAL_SPAWNED = "subgoal_spawned"      # parent spawned a child
+    SUBGOAL_ACHIEVED = "subgoal_achieved"    # child finished with answer
+    SUBGOAL_ABANDONED = "subgoal_abandoned"  # child gave up
+    SUBGOAL_ESCALATED = "subgoal_escalated"  # child escalated
 
 
 class PlannerActionKind(str, Enum):
-    """The five actions a planner can decide on."""
+    """Actions a planner can decide on."""
 
     ASK = "ask"
     ACHIEVE = "achieve"
     ESCALATE_TO_LEAD = "escalate_to_lead"
     ABANDON = "abandon"
     WAIT_FOR_HUMAN = "wait_for_human"
+    # Spawn one or more child goals; this goal blocks until they all
+    # reach a terminal state.
+    SPAWN_SUBGOALS = "spawn_subgoals"
 
 
 @dataclass
@@ -112,13 +128,28 @@ class GoalStep:
 
 
 @dataclass
+class SubgoalSpec:
+    """One child goal the planner asks the orchestrator to create."""
+
+    description: str
+    why_it_matters: str = ""
+    initial_contact_hint: str = ""
+
+
+@dataclass
 class ClarificationGoal:
-    """An information need the bot wants to satisfy via humans.
+    """An information need the bot wants to satisfy.
 
     A goal owns at most one outstanding DM at a time (serial mode).
     When the human replies, the planner is invoked again and decides
     the next step. The goal stays alive until the planner declares it
     achieved/escalated/abandoned, or the deadline trips.
+
+    Goals form a tree via ``parent_goal_id``: a planner can spawn
+    children (``SPAWN_SUBGOALS``) to learn prerequisites; the parent
+    goes BLOCKED_ON_SUBGOAL until all children are terminal. Each
+    child runs its own planner loop and folds its outcome back into
+    the parent's history.
     """
 
     id: int
@@ -133,8 +164,13 @@ class ClarificationGoal:
     state: GoalState
     final_answer: str | None = None  # populated when state == ACHIEVED
 
-    # Currently-outstanding DM (set when state in
-    # AWAITING_REPLY|COALESCING|READY_TO_REPLAN|REPLANNING).
+    # Tree linkage. NULL on top-level goals; otherwise points at the
+    # goal that spawned this one. Used by the orchestrator to fold the
+    # child's result back into the parent's history.
+    parent_goal_id: int | None = None
+    depth: int = 0  # 0 for top-level; +1 per nesting level
+
+    # Currently-outstanding DM.
     current_target_user_id: str | None = None
     current_target_username: str | None = None
     current_channel_id: str | None = None
@@ -181,6 +217,9 @@ class PlannerDecision:
     note: str = ""
     retry_after_minutes: int | None = None
 
+    # Only for SPAWN_SUBGOALS
+    subgoals: list[SubgoalSpec] = field(default_factory=list)
+
     # Bookkeeping (set by the agent runtime, not by the LLM)
     cost_usd: float = 0.0
 
@@ -193,5 +232,6 @@ __all__ = [
     "GoalStepKind",
     "PlannerActionKind",
     "PlannerDecision",
+    "SubgoalSpec",
     "TERMINAL_STATES",
 ]

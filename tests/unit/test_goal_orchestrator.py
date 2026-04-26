@@ -762,3 +762,301 @@ async def test_circuit_breaker_after_max_planner_calls(
     # No DMs sent except to lead.
     targets = {uid for uid, _ in chat.sent_dms}
     assert targets == {"uid-lead"}
+
+
+# ============================================================
+#                       Sub-goals
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_spawn_subgoals_creates_children_and_blocks_parent(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``SPAWN_SUBGOALS`` creates children, appends SUBGOAL_SPAWNED
+    steps to the parent's history, and transitions the parent to
+    BLOCKED_ON_SUBGOAL."""
+    from virtual_dev.domain.models.clarification_goal import (
+        SubgoalSpec,
+    )
+
+    await _seed_task_row(session_factory)
+    chat = _FakeChat()
+    # Parent's first decision: spawn 2 children.
+    # Each child's first decision: ACHIEVE (so the test stays simple).
+    planner = _ScriptedPlanner([
+        PlannerDecision(
+            action=PlannerActionKind.SPAWN_SUBGOALS,
+            reasoning="Need both Vasya's handle AND test environment first",
+            subgoals=[
+                SubgoalSpec(
+                    description="узнать MM-handle Васи Курочкина",
+                    why_it_matters="чтобы DMить ему",
+                ),
+                SubgoalSpec(
+                    description="узнать какое тестовое окружение он использовал",
+                    why_it_matters="чтобы воспроизвести",
+                ),
+            ],
+        ),
+        PlannerDecision(
+            action=PlannerActionKind.ACHIEVE,
+            reasoning="found in repo",
+            final_answer="@v.kurochkin",
+            confidence=0.9,
+        ),
+        PlannerDecision(
+            action=PlannerActionKind.ACHIEVE,
+            reasoning="found in repo",
+            final_answer="staging-3",
+            confidence=0.9,
+        ),
+        # When both children done, parent unblocks → planner #4.
+        PlannerDecision(
+            action=PlannerActionKind.ACHIEVE,
+            reasoning="all subgoals achieved, I have what I need",
+            final_answer="DM @v.kurochkin on staging-3",
+            confidence=0.9,
+        ),
+    ])
+    orch = _make_orchestrator(session_factory, chat, planner)
+    repo = GoalRepository(session_factory)
+    goal = await _seed_goal(session_factory)
+
+    await orch._invoke_planner(goal)  # noqa: SLF001
+
+    parent = await repo.get(goal.id)
+    assert parent is not None
+    # Parent eventually achieves once children unblock it (synchronous in tests).
+    assert parent.state == GoalState.ACHIEVED
+    assert parent.final_answer == "DM @v.kurochkin on staging-3"
+
+    # Children exist and are terminal.
+    children = await repo.list_subgoals(goal.id)
+    assert len(children) == 2
+    assert all(c.state == GoalState.ACHIEVED for c in children)
+    assert all(c.parent_goal_id == goal.id for c in children)
+    assert all(c.depth == 1 for c in children)
+
+    # Parent's history now contains SUBGOAL_SPAWNED + SUBGOAL_ACHIEVED steps.
+    parent_steps = await repo.list_steps(goal.id)
+    kinds = [s.kind for s in parent_steps]
+    from virtual_dev.domain.models.clarification_goal import GoalStepKind as K
+    assert K.SUBGOAL_SPAWNED in kinds
+    assert kinds.count(K.SUBGOAL_SPAWNED) == 2
+    assert kinds.count(K.SUBGOAL_ACHIEVED) == 2
+
+
+@pytest.mark.asyncio
+async def test_subgoal_results_appear_in_parent_history(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """When a child achieves, its final_answer is folded into the
+    parent's history as a SUBGOAL_ACHIEVED step (so the parent's next
+    planner call sees the answer)."""
+    from virtual_dev.domain.models.clarification_goal import (
+        GoalStepKind as K,
+        SubgoalSpec,
+    )
+
+    await _seed_task_row(session_factory)
+    chat = _FakeChat()
+    planner = _ScriptedPlanner([
+        PlannerDecision(
+            action=PlannerActionKind.SPAWN_SUBGOALS, reasoning="x",
+            subgoals=[SubgoalSpec(description="узнать handle Васи")],
+        ),
+        PlannerDecision(
+            action=PlannerActionKind.ACHIEVE, reasoning="found",
+            final_answer="@v.kurochkin это handle Васи",
+            confidence=0.95,
+        ),
+        PlannerDecision(
+            action=PlannerActionKind.ACHIEVE, reasoning="parent uses child's answer",
+            final_answer="готово", confidence=0.9,
+        ),
+    ])
+    orch = _make_orchestrator(session_factory, chat, planner)
+    repo = GoalRepository(session_factory)
+    goal = await _seed_goal(session_factory)
+    await orch._invoke_planner(goal)  # noqa: SLF001
+
+    parent_steps = await repo.list_steps(goal.id)
+    achieved_step = next(
+        s for s in parent_steps if s.kind == K.SUBGOAL_ACHIEVED
+    )
+    assert "@v.kurochkin" in achieved_step.text
+    assert achieved_step.metadata.get("subgoal_id") is not None
+    assert achieved_step.metadata.get("subgoal_state") == "achieved"
+
+
+@pytest.mark.asyncio
+async def test_parent_unblocks_only_when_all_subgoals_terminal(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two children: one achieves immediately, the other is still
+    AWAITING_REPLY. Parent stays BLOCKED_ON_SUBGOAL."""
+    from virtual_dev.domain.models.clarification_goal import SubgoalSpec
+
+    await _seed_task_row(session_factory)
+    chat = _FakeChat(users={"alice": "uid-alice"})
+    planner = _ScriptedPlanner([
+        PlannerDecision(
+            action=PlannerActionKind.SPAWN_SUBGOALS, reasoning="2 prereqs",
+            subgoals=[
+                SubgoalSpec(description="A: factual lookup"),
+                SubgoalSpec(description="B: needs DM to alice"),
+            ],
+        ),
+        # Child A: ACHIEVE.
+        PlannerDecision(
+            action=PlannerActionKind.ACHIEVE, reasoning="found in repo",
+            final_answer="A is X", confidence=0.9,
+        ),
+        # Child B: ASK (will leave it AWAITING_REPLY).
+        PlannerDecision(
+            action=PlannerActionKind.ASK, reasoning="need to ask alice",
+            to_handle="alice", message="?", dedupe_key="b:alice",
+        ),
+    ])
+    orch = _make_orchestrator(session_factory, chat, planner)
+    repo = GoalRepository(session_factory)
+    goal = await _seed_goal(session_factory)
+    await orch._invoke_planner(goal)  # noqa: SLF001
+
+    parent = await repo.get(goal.id)
+    assert parent is not None
+    # Parent still blocked: child B is AWAITING_REPLY.
+    assert parent.state == GoalState.BLOCKED_ON_SUBGOAL
+
+    children = await repo.list_subgoals(goal.id)
+    states = {c.description: c.state for c in children}
+    assert states["A: factual lookup"] == GoalState.ACHIEVED
+    assert states["B: needs DM to alice"] == GoalState.AWAITING_REPLY
+
+
+@pytest.mark.asyncio
+async def test_subgoal_depth_limit_escalates(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A goal at the configured max depth refuses to spawn — orchestrator
+    escalates instead of recursing."""
+    from virtual_dev.domain.models.clarification_goal import SubgoalSpec
+
+    await _seed_task_row(session_factory)
+    chat = _FakeChat(users={"lead": "uid-lead"})
+
+    # Configure depth limit to 1 so depth=1 cannot spawn.
+    cfg = _config()
+    cfg.agents.clarification.max_subgoal_depth = 1
+    planner = _ScriptedPlanner([
+        PlannerDecision(
+            action=PlannerActionKind.SPAWN_SUBGOALS, reasoning="recurse",
+            subgoals=[SubgoalSpec(description="more decomposition")],
+        ),
+    ])
+    orch = _make_orchestrator(session_factory, chat, planner, config=cfg)
+    repo = GoalRepository(session_factory)
+
+    # Seed a goal already at depth 1.
+    goal = await repo.create_goal(
+        plan_id=1, tracker="jira", task_external_id="DM-1",
+        description="deep child", why_it_matters="", initial_contact_hint="",
+        coalesce_window_seconds=60,
+        deadline_at=datetime.now(timezone.utc) + timedelta(hours=48),
+        parent_goal_id=42, depth=1,
+    )
+    await orch._invoke_planner(goal)  # noqa: SLF001
+
+    refreshed = await repo.get(goal.id)
+    assert refreshed is not None
+    assert refreshed.state == GoalState.ESCALATED
+
+
+@pytest.mark.asyncio
+async def test_resettle_plan_ignores_subgoals(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``_maybe_resettle_plan`` walks ONLY top-level goals; a subgoal
+    finishing should not flip the plan unless its top-level parent is
+    also terminal."""
+    from virtual_dev.domain.models.clarification_goal import SubgoalSpec
+
+    await _seed_task_row(session_factory)
+    chat = _FakeChat(users={"alice": "uid-alice"})
+    bus = _RecordingBus()
+    planner = _ScriptedPlanner([
+        # Top-level decides SPAWN_SUBGOALS.
+        PlannerDecision(
+            action=PlannerActionKind.SPAWN_SUBGOALS, reasoning="prereq",
+            subgoals=[SubgoalSpec(description="prereq")],
+        ),
+        # Child achieves.
+        PlannerDecision(
+            action=PlannerActionKind.ACHIEVE, reasoning="ok",
+            final_answer="prereq satisfied", confidence=0.9,
+        ),
+        # Parent decides ASK (still active — no plan resettle yet).
+        PlannerDecision(
+            action=PlannerActionKind.ASK, reasoning="need more info",
+            to_handle="alice", message="next?", dedupe_key="parent:next",
+        ),
+    ])
+    orch = _make_orchestrator(session_factory, chat, planner, bus=bus)
+    repo = GoalRepository(session_factory)
+    goal = await _seed_goal(session_factory)
+    await orch._invoke_planner(goal)  # noqa: SLF001
+
+    # The top-level goal is now AWAITING_REPLY (not terminal).
+    refreshed = await repo.get(goal.id)
+    assert refreshed is not None
+    assert refreshed.state == GoalState.AWAITING_REPLY
+    # No re-dispatch yet.
+    publishes = [m for m in bus.published if m.topic == "task.discovered"]
+    assert publishes == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_unblocks_parent_with_all_terminal_children(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """If the parent crashed before noticing its children settled, the
+    sweep step picks it up and unblocks it."""
+    await _seed_task_row(session_factory)
+    chat = _FakeChat()
+    planner = _ScriptedPlanner([
+        PlannerDecision(
+            action=PlannerActionKind.ACHIEVE, reasoning="ok",
+            final_answer="ok", confidence=0.9,
+        ),
+    ])
+    orch = _make_orchestrator(session_factory, chat, planner)
+    repo = GoalRepository(session_factory)
+
+    # Parent with one ACHIEVED child, parent stuck in BLOCKED_ON_SUBGOAL
+    # (simulating a crash mid-unblock).
+    parent = await repo.create_goal(
+        plan_id=1, tracker="jira", task_external_id="DM-1",
+        description="parent", why_it_matters="", initial_contact_hint="",
+        coalesce_window_seconds=60,
+        deadline_at=datetime.now(timezone.utc) + timedelta(hours=48),
+    )
+    child = await repo.create_goal(
+        plan_id=1, tracker="jira", task_external_id="DM-1",
+        description="child", why_it_matters="", initial_contact_hint="",
+        coalesce_window_seconds=60,
+        deadline_at=datetime.now(timezone.utc) + timedelta(hours=48),
+        parent_goal_id=parent.id, depth=1,
+    )
+    await repo.update_state(parent.id, GoalState.BLOCKED_ON_SUBGOAL)
+    await repo.update_state(
+        child.id, GoalState.ACHIEVED, final_answer="ok", closed=True,
+    )
+
+    await orch.sweep_deadlines()
+
+    refreshed = await repo.get(parent.id)
+    assert refreshed is not None
+    # Parent either unblocked into ACHIEVED (planner ran inline) or
+    # at least left BLOCKED_ON_SUBGOAL. Both are valid results.
+    assert refreshed.state != GoalState.BLOCKED_ON_SUBGOAL

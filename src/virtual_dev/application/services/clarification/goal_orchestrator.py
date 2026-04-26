@@ -217,12 +217,15 @@ class GoalOrchestrator:
         * stuck REPLANNING (planner crashed) → revert
         * WAITING due → revert
         * SEND_PENDING → retry the DM
+        * BLOCKED_ON_SUBGOAL with all children terminal → unblock
+          (covers the case where the parent crashed mid-unblock)
         * deadline overdue → ABANDONED + DM lead
         """
         now = datetime.now(timezone.utc)
         await self._recover_stuck_replanning(now=now)
         await self._wake_due_waiting(now=now)
         await self._retry_send_pending()
+        await self._unblock_settled_parents()
         return await self._sweep_deadlines(now=now)
 
     # ---------------------------------------------------------------- internals
@@ -269,6 +272,13 @@ class GoalOrchestrator:
     async def _retry_send_pending(self) -> None:
         for goal in await self._repo.find_pending_send():
             await self._retry_outstanding_send(goal)
+
+    async def _unblock_settled_parents(self) -> None:
+        """Recovery: a parent crashed before noticing its last child
+        terminated. Walk BLOCKED_ON_SUBGOAL goals; if every child is
+        terminal, unblock the parent."""
+        for parent in await self._repo.find_blocked_with_all_subgoals_terminal():
+            await self._maybe_unblock_parent(parent.id)
 
     async def _sweep_deadlines(self, *, now: datetime) -> int:
         overdue = await self._repo.find_overdue(now=now)
@@ -426,6 +436,8 @@ class GoalOrchestrator:
             await self._abandon(goal, reason=decision.reason or "planner_abandon", escalate=False)
         elif decision.action == PlannerActionKind.WAIT_FOR_HUMAN:
             await self._on_wait(goal, decision)
+        elif decision.action == PlannerActionKind.SPAWN_SUBGOALS:
+            await self._on_spawn_subgoals(goal, decision)
         else:
             logger.warning(
                 "Goal {}: unknown action {}; escalating", goal.id, decision.action,
@@ -606,7 +618,7 @@ class GoalOrchestrator:
             "Goal {}: ACHIEVED (confidence={:.2f}): {}",
             goal.id, decision.confidence, final[:160],
         )
-        await self._maybe_resettle_plan(goal)
+        await self._on_terminal(goal, GoalStepKind.SUBGOAL_ACHIEVED, final)
 
     async def _on_wait(
         self, goal: ClarificationGoal, decision: PlannerDecision,
@@ -624,6 +636,81 @@ class GoalOrchestrator:
             goal.id, retry_min, decision.note[:120],
         )
 
+    async def _on_spawn_subgoals(
+        self, goal: ClarificationGoal, decision: PlannerDecision,
+    ) -> None:
+        """Create child goals, append SUBGOAL_SPAWNED to the parent's
+        history, transition parent to BLOCKED_ON_SUBGOAL, run the
+        planner on each new child immediately.
+        """
+        max_depth = self._config.agents.clarification.max_subgoal_depth
+        if goal.depth >= max_depth:
+            logger.warning(
+                "Goal {}: subgoal depth limit ({}) reached; escalating",
+                goal.id, max_depth,
+            )
+            await self._escalate(goal, reason="max_subgoal_depth")
+            return
+
+        specs = [s for s in decision.subgoals if s.description.strip()]
+        if not specs:
+            await self._escalate(goal, reason="spawn_subgoals_empty")
+            return
+
+        clar_cfg = self._config.agents.clarification
+        # Children inherit the parent's deadline (no later than parent's)
+        # so a stuck child can't outlive its blocking parent.
+        deadline = goal.deadline_at or (
+            datetime.now(timezone.utc) + timedelta(hours=clar_cfg.max_goal_age_hours)
+        )
+
+        children: list[ClarificationGoal] = []
+        for spec in specs:
+            child = await self._repo.create_goal(
+                plan_id=goal.plan_id,
+                tracker=goal.tracker,
+                task_external_id=goal.task_external_id,
+                description=spec.description.strip(),
+                why_it_matters=spec.why_it_matters.strip(),
+                initial_contact_hint=spec.initial_contact_hint.strip(),
+                coalesce_window_seconds=clar_cfg.coalesce_window_seconds,
+                deadline_at=deadline,
+                parent_goal_id=goal.id,
+                depth=goal.depth + 1,
+            )
+            await self._repo.append_step(
+                goal_id=goal.id,
+                kind=GoalStepKind.SUBGOAL_SPAWNED,
+                text=spec.description.strip(),
+                metadata={
+                    "subgoal_id": child.id,
+                    "why_it_matters": spec.why_it_matters,
+                    "initial_contact_hint": spec.initial_contact_hint,
+                },
+            )
+            children.append(child)
+            await self._emit("subgoal_spawned", goal, payload={
+                "subgoal_id": child.id,
+                "subgoal_description": spec.description,
+            })
+
+        # Block parent until every child is terminal.
+        await self._repo.update_state(
+            goal.id, GoalState.BLOCKED_ON_SUBGOAL,
+            clear_outstanding=True,
+            clear_planning_started=True,
+        )
+        logger.info(
+            "Goal {}: spawned {} subgoal(s) → BLOCKED_ON_SUBGOAL",
+            goal.id, len(children),
+        )
+
+        # Kick off each child's planner. If a child achieves immediately
+        # (synchronous self-research), the unblock check runs on the
+        # last child in this loop too.
+        for child in children:
+            await self._invoke_planner(child)
+
     async def _abandon(
         self,
         goal: ClarificationGoal,
@@ -640,7 +727,7 @@ class GoalOrchestrator:
         logger.info("Goal {}: ABANDONED ({})", goal.id, reason)
         if escalate:
             await self._send_lead_escalation(goal, reason=reason)
-        await self._maybe_resettle_plan(goal)
+        await self._on_terminal(goal, GoalStepKind.SUBGOAL_ABANDONED, reason)
 
     async def _escalate(
         self, goal: ClarificationGoal, *, reason: str,
@@ -653,7 +740,63 @@ class GoalOrchestrator:
         self.stats.escalations += 1
         await self._send_lead_escalation(goal, reason=reason)
         logger.info("Goal {}: ESCALATED ({})", goal.id, reason)
-        await self._maybe_resettle_plan(goal)
+        await self._on_terminal(goal, GoalStepKind.SUBGOAL_ESCALATED, reason)
+
+    async def _on_terminal(
+        self,
+        goal: ClarificationGoal,
+        parent_kind: GoalStepKind,
+        summary: str,
+    ) -> None:
+        """Goal just hit a terminal state. If it has a parent, fold
+        the result into the parent's history and try to unblock the
+        parent. Then run the plan-level resettle check (top-level only).
+        """
+        # Re-fetch so we record the *post-update* state in the parent's
+        # SUBGOAL_* metadata. The ``goal`` arg is the pre-update copy.
+        latest = await self._repo.get(goal.id) or goal
+        if latest.parent_goal_id is not None:
+            await self._repo.append_step(
+                goal_id=latest.parent_goal_id,
+                kind=parent_kind,
+                text=(summary or "").strip(),
+                metadata={
+                    "subgoal_id": latest.id,
+                    "subgoal_description": latest.description,
+                    "subgoal_state": latest.state.value,
+                },
+            )
+            await self._maybe_unblock_parent(latest.parent_goal_id)
+        await self._maybe_resettle_plan(latest)
+
+    async def _maybe_unblock_parent(self, parent_id: int) -> None:
+        """If every subgoal of ``parent_id`` is terminal, flip the
+        parent from BLOCKED_ON_SUBGOAL to READY_TO_REPLAN so its
+        planner runs again with the new SUBGOAL_* steps in history.
+        """
+        siblings = await self._repo.list_subgoals(parent_id)
+        if any(s.state in ACTIVE_STATES for s in siblings):
+            return
+        parent = await self._repo.get(parent_id)
+        if parent is None or parent.state != GoalState.BLOCKED_ON_SUBGOAL:
+            return
+        await self._repo.update_state(parent_id, GoalState.READY_TO_REPLAN)
+        logger.info(
+            "Goal {}: all subgoals terminal → READY_TO_REPLAN", parent_id,
+        )
+        # Drive immediately so we don't wait for the next sweep.
+        claimed = await self._repo.claim_for_replan(parent_id)
+        if claimed is not None:
+            try:
+                await self._invoke_planner(claimed)
+            except Exception:
+                logger.exception(
+                    "Goal {}: parent replan failed", parent_id,
+                )
+                await self._repo.update_state(
+                    parent_id, GoalState.READY_TO_REPLAN,
+                    clear_planning_started=True,
+                )
 
     # ---------------------------------------------------------------- helpers
 
@@ -798,23 +941,24 @@ class GoalOrchestrator:
         return str(Path(repo_cfg.local_path).expanduser().resolve())
 
     async def _maybe_resettle_plan(self, goal: ClarificationGoal) -> None:
-        """When ALL goals on this plan are terminal AND at least one
-        ACHIEVED, fold answers into task description, supersede plan,
-        re-publish ``task.discovered`` so Analyst replans.
+        """When ALL TOP-LEVEL goals on this plan are terminal AND at
+        least one ACHIEVED, fold answers into task description,
+        supersede plan, re-publish ``task.discovered`` so Analyst
+        replans. Subgoals are excluded — they're internal decomposition.
         """
         if goal.plan_id is None:
             return
-        siblings = await self._repo.list_for_plan(goal.plan_id)
-        if any(s.state in ACTIVE_STATES for s in siblings):
+        top_level = await self._repo.list_top_level_for_plan(goal.plan_id)
+        if any(s.state in ACTIVE_STATES for s in top_level):
             return
-        if not any(s.state == GoalState.ACHIEVED for s in siblings):
+        if not any(s.state == GoalState.ACHIEVED for s in top_level):
             logger.info(
-                "Plan {}: all goals terminal, none ACHIEVED — not re-dispatching",
+                "Plan {}: all top-level goals terminal, none ACHIEVED — not re-dispatching",
                 goal.plan_id,
             )
             return
 
-        await self._reseed_task_description(goal, siblings)
+        await self._reseed_task_description(goal, top_level)
         if self._message_bus is not None:
             await self._message_bus.publish(AgentMessage(
                 id=uuid.uuid4().hex,
