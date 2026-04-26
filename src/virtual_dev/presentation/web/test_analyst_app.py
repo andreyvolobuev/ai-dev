@@ -249,6 +249,16 @@ def build_test_analyst_app(
                         thread_root_id=raw.get("thread_root_id"),
                         author_username=(raw.get("speaking_as") or None),
                     )
+                elif kind == "register_user":
+                    handle = str(raw.get("handle") or "").strip()
+                    if handle:
+                        state.chat.register_user(
+                            handle,
+                            first_name=(raw.get("first_name") or None),
+                            last_name=(raw.get("last_name") or None),
+                            display_name=(raw.get("display_name") or None),
+                            position=(raw.get("position") or None),
+                        )
                 elif kind == "reset":
                     await _reset_state(state)
                 else:

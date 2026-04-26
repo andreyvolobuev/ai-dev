@@ -61,3 +61,47 @@ async def test_known_users_are_consistent_across_email_and_username() -> None:
     by_email = await chat.find_user_by_email("v.kura@2gis.ru")
     assert by_handle is not None and by_email is not None
     assert by_handle.id == by_email.id
+
+
+@pytest.mark.asyncio
+async def test_search_users_by_name_matches_first_and_last_name() -> None:
+    """search_users_by_name does substring (case-insensitive) match
+    on first_name / last_name / display_name / username."""
+    chat = InMemoryChat()
+    chat.register_user(
+        "v.kurochkin", first_name="Василий", last_name="Курочкин",
+        display_name="Vasiliy Kurochkin", position="QA Engineer",
+    )
+    chat.register_user(
+        "d.shvarts", first_name="Дмитрий", last_name="Шварц",
+        display_name="Dmitry Shvarts",
+    )
+
+    by_surname = await chat.search_users_by_name("курочкин")
+    assert {u.username for u in by_surname} == {"v.kurochkin"}
+
+    by_first = await chat.search_users_by_name("Василий")
+    assert {u.username for u in by_first} == {"v.kurochkin"}
+
+    by_partial = await chat.search_users_by_name("шварц")
+    assert {u.username for u in by_partial} == {"d.shvarts"}
+
+    none = await chat.search_users_by_name("ivanov")
+    assert list(none) == []
+
+
+@pytest.mark.asyncio
+async def test_search_users_by_name_respects_limit() -> None:
+    chat = InMemoryChat()
+    for i in range(5):
+        chat.register_user(f"u{i}", first_name="Тест", last_name=f"User{i}")
+    results = await chat.search_users_by_name("Тест", limit=2)
+    assert len(list(results)) == 2
+
+
+@pytest.mark.asyncio
+async def test_search_users_by_name_empty_query_returns_empty() -> None:
+    chat = InMemoryChat()
+    chat.register_user("alice", first_name="Alice")
+    assert list(await chat.search_users_by_name("")) == []
+    assert list(await chat.search_users_by_name("   ")) == []

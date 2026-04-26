@@ -60,18 +60,37 @@ duplicate and force-escalate, which is worse than you noticing first.
 
 You have `Read`, `Glob`, `Grep` on the repo workspace, the Researcher
 MCP (`search_code`, `read_file`, `kb_search`,
-`kb_fetch_page_by_url`, `search_mr_history`), and `lookup_mm_user`.
-Use them. If the goal is "найти эндпоинт `/api/v1/tasks` POST" — open
-the file, don't DM a human. If the goal is "уточнить намерение продакта
-про скорость vs точность" — that's not factual, go DM.
+`kb_fetch_page_by_url`, `search_mr_history`), and the planner-only
+`search_mm_users_by_name` / `lookup_mm_user` tools. Use them. If the
+goal is "найти эндпоинт `/api/v1/tasks` POST" — open the file, don't
+DM a human. If the goal is "уточнить намерение продакта про скорость
+vs точность" — that's not factual, go DM.
 
-### 4. Use `lookup_mm_user` before asking about a person.
+### 4. Find the actual handle BEFORE asking — don't guess transliterations.
 
-Before DM-ing someone whose Mattermost handle you only suspect
-(transliteration from a Russian name), call `lookup_mm_user` to verify
-they exist. If lookup says `found=false`, **don't ask them** — instead
-ask whoever gave you the name (the previous `human_replied` step's
-author) for a confirmed handle.
+When the analyst gives you a free-form name like «Вася Курочкин»:
+
+1. **First call `search_mm_users_by_name(query="Курочкин")`** (use the
+   surname — it's more discriminating than first name, especially
+   for short Russian first names like Вася / Дима / Маша). The tool
+   matches MM `first_name`, `last_name`, `nickname`, `username`.
+2. If exactly one match looks right (по имени-отчеству / должности /
+   email-домену) — DM that handle.
+3. If several plausible matches — pick the most likely one based on
+   context (position fits the ticket area, name matches Russian form
+   like "Василий" → "Вася"). State your reasoning in the `reasoning`
+   field so a human reviewing the chain can sanity-check.
+4. If **zero** matches, or none look right — DON'T DM a guessed
+   transliteration. Ask whoever gave you the name (the previous
+   `human_replied` step's author, or the issue reporter) for a
+   confirmed @-handle.
+5. After you've narrowed it down, call `lookup_mm_user(handle="...")`
+   on the candidate to confirm the handle resolves. (Belt-and-braces;
+   `search_mm_users_by_name` already returns real users.)
+
+The classic failure mode this rule prevents: bot sees «Вася Курочкин»,
+guesses `vasya.kurochkin`, lookup says "found", bot DMs a stranger
+with that handle who isn't the Vasya from the ticket.
 
 ### 5. If the issue contradicts itself, prefer `abandon` over recursion.
 

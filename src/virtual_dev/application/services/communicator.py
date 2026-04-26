@@ -33,7 +33,7 @@ from virtual_dev.application.services.injection_filter import (
     InjectionFilter,
     WrappedUntrusted,
 )
-from virtual_dev.domain.models.chat import ChatMessage
+from virtual_dev.domain.models.chat import ChatMessage, ChatUser
 from virtual_dev.domain.ports.chat import ChatPort
 
 if TYPE_CHECKING:
@@ -218,6 +218,19 @@ class CommunicatorService:
             if user is not None:
                 return user.id
         return None
+
+    async def search_users_by_name(
+        self, query: str, *, limit: int = 25,
+    ) -> list[ChatUser]:
+        """Forward to ChatPort.search_users_by_name. Used by the
+        ClarificationPlanner's ``search_mm_users_by_name`` MCP tool to
+        find candidates by free-form (Russian) name when the analyst
+        only got "Вася Курочкин" out of the ticket.
+        """
+        if self._chat is None:
+            return []
+        results = await self._chat.search_users_by_name(query, limit=limit)
+        return list(results)
 
     # --- Reads (Phase 1) ---
 

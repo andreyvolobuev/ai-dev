@@ -39,6 +39,18 @@ class ChatPort(ABC):
     async def find_user_by_username(self, username: str) -> ChatUser | None:
         """Resolve a user by username. Returns ``None`` if not found."""
 
+    async def search_users_by_name(
+        self, query: str, *, limit: int = 25,
+    ) -> Sequence[ChatUser]:
+        """Fuzzy-search the chat directory by free-form name.
+
+        Real adapters (Mattermost) hit ``/api/v4/users/autocomplete``
+        which matches against username, first/last name, nickname.
+        Returns up to ``limit`` matches. Default impl returns ``[]``
+        so test fakes that don't need search can ignore the method.
+        """
+        return []
+
     @abstractmethod
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
         """Add an emoji reaction (by name, e.g. ``white_check_mark``) to a post.

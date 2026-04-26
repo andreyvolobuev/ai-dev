@@ -8,12 +8,22 @@ from datetime import datetime
 
 @dataclass
 class ChatUser:
-    """Пользователь чата."""
+    """Пользователь чата.
+
+    Дополнительные поля (first_name / last_name / position) заполняются
+    only when the chat backend exposes them — Mattermost's
+    ``/api/v4/users/autocomplete`` returns all of these. The planner's
+    ``search_mm_users_by_name`` tool relies on them so the model can
+    pick the right user when several match a free-form name.
+    """
 
     id: str
     username: str
     email: str | None = None
     display_name: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    position: str | None = None
     is_bot: bool = False
 
 

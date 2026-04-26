@@ -268,6 +268,46 @@ class MattermostChat(ChatPort):
 
         return await asyncio.to_thread(_fetch)
 
+    async def search_users_by_name(
+        self, query: str, *, limit: int = 25,
+    ) -> Sequence[ChatUser]:
+        """Fuzzy-search MM directory: matches username, first/last name,
+        nickname. Wraps ``GET /api/v4/users/autocomplete?name=<query>``.
+        """
+        query = query.strip()
+        if not query:
+            return []
+        capped = max(1, min(limit, 100))
+
+        def _fetch() -> list[ChatUser]:
+            self._ensure_login()
+            try:
+                raw = self._driver.users.autocomplete_users(
+                    params={"name": query, "limit": capped},
+                )
+            except Exception:
+                logger.debug(
+                    "mattermost autocomplete_users {!r} failed", query,
+                )
+                return []
+            # MM returns either a flat list or
+            # {"users": [...], "out_of_channel": [...]} depending on
+            # whether in_team/in_channel were supplied. Handle both.
+            entries: list[Any] = []
+            if isinstance(raw, list):
+                entries = list(raw)
+            elif isinstance(raw, dict):
+                entries.extend(raw.get("users") or [])
+                entries.extend(raw.get("out_of_channel") or [])
+            users: list[ChatUser] = []
+            for entry in entries[:capped]:
+                user = self._user_from_raw(entry)
+                if user is not None:
+                    users.append(user)
+            return users
+
+        return await asyncio.to_thread(_fetch)
+
     # --- Writes (Phase 3) ---
 
     async def send_direct(self, user_id: str, text: str) -> ChatMessage:
@@ -502,5 +542,8 @@ class MattermostChat(ChatPort):
             username=str(raw.get("username") or ""),
             email=str(raw.get("email") or "") or None,
             display_name=str(raw.get("nickname") or raw.get("first_name") or "") or None,
+            first_name=str(raw.get("first_name") or "") or None,
+            last_name=str(raw.get("last_name") or "") or None,
+            position=str(raw.get("position") or "") or None,
             is_bot=bool(raw.get("is_bot")),
         )

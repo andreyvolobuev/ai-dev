@@ -61,12 +61,14 @@ class InMemoryChat(ChatPort):
         self._posts: dict[str, ChatMessage] = {}
         # post_id → list[bot_emoji]
         self._reactions: dict[str, list[str]] = {}
-        # username → user_id for handles the operator has actually
-        # spoken as (or is, by default). Distinguishes "real" people
-        # from fictional names the planner might guess — without this,
-        # ``lookup_mm_user`` would say everyone exists and Vasya
-        # Kurochkin (who isn't on the team) gets DM'd.
-        self._known_users: dict[str, str] = {user_name: user_id}
+        # username → ChatUser for handles the operator has actually
+        # spoken as (or registered via ``register_user``). Distinguishes
+        # "real" people from fictional names the planner might guess —
+        # without this, ``lookup_mm_user`` would say everyone exists and
+        # Vasya Kurochkin (who isn't on the team) gets DM'd.
+        self._known_users: dict[str, ChatUser] = {
+            user_name: ChatUser(id=user_id, username=user_name),
+        }
         self._counter = 0
 
     # --- ChatPort implementation -----------------------------------
@@ -97,16 +99,66 @@ class InMemoryChat(ChatPort):
 
     async def find_user_by_email(self, email: str) -> ChatUser | None:
         local = email.split("@", 1)[0] or "user"
-        if local not in self._known_users:
+        existing = self._known_users.get(local)
+        if existing is None:
             return None
+        # Stamp the email in the returned ChatUser even if it wasn't
+        # known at register time.
         return ChatUser(
-            id=self._known_users[local], username=local, email=email,
+            id=existing.id, username=existing.username,
+            email=email, display_name=existing.display_name,
+            first_name=existing.first_name, last_name=existing.last_name,
+            position=existing.position, is_bot=existing.is_bot,
         )
 
     async def find_user_by_username(self, username: str) -> ChatUser | None:
-        if username not in self._known_users:
-            return None
-        return ChatUser(id=self._known_users[username], username=username)
+        return self._known_users.get(username)
+
+    async def search_users_by_name(
+        self, query: str, *, limit: int = 25,
+    ) -> Sequence[ChatUser]:
+        """Substring-match against username / first_name / last_name /
+        display_name (case-insensitive). Mirrors what the real MM
+        adapter does so the planner sees the same shape of output."""
+        needle = query.strip().lower()
+        if not needle:
+            return []
+        out: list[ChatUser] = []
+        for user in self._known_users.values():
+            haystack = " ".join(
+                v for v in (
+                    user.username, user.first_name, user.last_name,
+                    user.display_name,
+                ) if v
+            ).lower()
+            if needle in haystack:
+                out.append(user)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def register_user(
+        self,
+        username: str,
+        *,
+        user_id: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        display_name: str | None = None,
+        position: str | None = None,
+    ) -> ChatUser:
+        """Pre-seed a directory entry so the planner can find this
+        person via ``search_users_by_name`` even if the operator hasn't
+        yet spoken as them. Test-analyst UI uses this to mirror a real
+        Mattermost team list."""
+        uid = user_id or f"uid-{username}"
+        user = ChatUser(
+            id=uid, username=username,
+            first_name=first_name, last_name=last_name,
+            display_name=display_name, position=position,
+        )
+        self._known_users[username] = user
+        return user
 
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
         self._reactions.setdefault(post_id, []).append(emoji_name)
@@ -171,7 +223,10 @@ class InMemoryChat(ChatPort):
             author_id = f"uid-{author_username}"
             default_channel = f"dm-{author_id}"
             # Register: from now on lookup_mm_user finds this handle.
-            self._known_users.setdefault(author_username, author_id)
+            self._known_users.setdefault(
+                author_username,
+                ChatUser(id=author_id, username=author_username),
+            )
         else:
             author_id = self._user_id
             default_channel = f"dm-{self._user_id}"
