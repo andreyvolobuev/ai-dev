@@ -180,6 +180,22 @@ class CommunicatorService:
 
         return SendOutcome(sent=True, message=message)
 
+    async def add_reaction(self, post_id: str, emoji_name: str) -> None:
+        """Pass-through to ChatPort.add_reaction.
+
+        Reactions are technical idempotency markers, not user-facing
+        messages — no rate limit, no working-hours gate.
+        """
+        if self._chat is None:
+            return
+        try:
+            await self._chat.add_reaction(post_id, emoji_name)
+        except Exception:
+            logger.warning(
+                "Communicator: add_reaction({!r}, {!r}) failed",
+                post_id, emoji_name,
+            )
+
     # --- User lookup (Phase 3 helper) ---
 
     async def resolve_user_id(

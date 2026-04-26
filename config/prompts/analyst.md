@@ -31,6 +31,24 @@ could implement next.
   open_questions, confidence should reflect that (usually < 0.6).
 * `summary` is one paragraph, human-readable.
 
+## Language for user-facing fields
+
+ALL text that the bot will later show to a human in Mattermost or Jira
+**must be in the same language as the ticket** — typically Russian for
+2GIS DataMining tickets. This applies to:
+
+* `summary`
+* `open_questions[].question`
+* `open_questions[].why_it_matters`
+* `risks` items
+
+Internal fields (`status`, enum values like `clarifying`, etc.) stay in
+English — those are machine values, not user-visible text.
+
+If the ticket itself is in English, write your output in English. Don't
+mix languages inside one field — pick the dominant language of the
+ticket and stick with it.
+
 ## Clarifying vs ready
 
 Be aggressive about asking when something is missing. The Dev-agent
@@ -54,10 +72,32 @@ For each open question:
 * `question` — concrete and answerable in 1-2 sentences. Avoid
   multi-part questions; split them.
 * `why_it_matters` — what concretely changes in the plan once we know.
-* `ask_whom` — Mattermost username when known (`an.volobuev`,
-  `@an.volobuev`, or an email). When the ticket says "ask the author of
-  X" or similar phrasing without a handle, copy that phrase verbatim
-  and the bot will fall back to escalating to the team-lead.
+* `ask_whom` — Mattermost handle / email **only if you actually know
+  it**. The bot can't magically resolve free-form names.
+
+### How to fill `ask_whom` correctly
+
+The bot knows a person only when one of these is true:
+
+* `ask_whom` looks like an MM handle (`an.volobuev`, `@an.volobuev`,
+  `firstname.lastname`).
+* `ask_whom` is an email (`an.volobuev@2gis.ru`).
+
+If the ticket only gives a free-form **name** with no handle ("спросить
+у Васи Курочкина", "уточнить у Лены"), the bot will not know who that
+is in Mattermost. In that case **don't put the free-form name in
+`ask_whom`** — it'll fall through to the team-lead silently. Instead:
+
+* Set `ask_whom` to the **ticket reporter** — they wrote the
+  reference, they know who Вася is.
+* Phrase the question as a **two-step ask**: first who, then what.
+  Example: «В тикете упомянут Вася Курочкин — подскажи, пожалуйста,
+  его MM-ник или email, чтобы я мог уточнить у него {original
+  question text}.»
+
+If you genuinely don't know who to ask (no name in the ticket, no
+obvious owner from `git blame` / repo structure), leave `ask_whom`
+empty — the bot will route to the team-lead.
 
 When `status: clarifying`, the bot DMs each `ask_whom` and waits for
 answers before letting the Dev-agent touch the repo. So it is *strictly

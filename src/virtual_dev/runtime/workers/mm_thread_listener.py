@@ -472,18 +472,11 @@ class MmThreadListener:
                 question.id,
             )
             return
-
-        # React ✅ as soon as the fragment is persisted — don't wait for
-        # classification (we don't want to re-process on coalescer
-        # retry). The orchestrator will post the contextual ack
-        # (DIRECT/REDIRECT/etc.) once classification runs.
-        try:
-            await self._chat.add_reaction(event.id, _PROCESSED_REACTION)
-        except Exception:
-            logger.warning(
-                "MmThreadListener: add_reaction failed for fragment post {}",
-                event.id,
-            )
+        # No ✅-reaction here. Mid-message reactions look like the bot
+        # is interrupting ("yeah-yeah, got it") on every fragment.
+        # Reaction goes on the *last* fragment when the coalescer
+        # actually classifies the merged answer (see
+        # ClarificationOrchestrator._flush_one).
 
     async def _run_iteration(
         self,

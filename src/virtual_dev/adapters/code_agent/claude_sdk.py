@@ -31,6 +31,11 @@ from claude_agent_sdk.types import (
 )
 from loguru import logger
 
+from virtual_dev.application.services.agent_trace import (
+    AgentTrace,
+    AgentTraceEvent,
+    emit_if,
+)
 from virtual_dev.domain.ports.code_agent import (
     CodeAgentPort,
     CodeAgentRequest,
@@ -53,12 +58,17 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
         cli_path: str | None = None,
         rate_limit_max_retries: int = 2,
         rate_limit_initial_backoff_seconds: int = 60,
+        trace: AgentTrace | None = None,
     ) -> None:
         self._default_model = default_model
         self._permission_mode = permission_mode
         self._cli_path = cli_path
         self._rate_limit_max_retries = max(0, rate_limit_max_retries)
         self._rate_limit_initial_backoff = max(1, rate_limit_initial_backoff_seconds)
+        # Optional debug-trace channel — UI subscribers see every
+        # tool_use, every TextBlock, and the system+user prompts.
+        # In production code-paths trace=None and the cost is zero.
+        self._trace = trace
 
     async def run_task(self, request: CodeAgentRequest) -> CodeAgentResult:
         # Wrap the actual run in a retry loop that catches Claude Max
@@ -100,6 +110,21 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
         stop_reason = "unknown"
         got_result = False
 
+        # Trace: announce start with both prompts so the UI can show
+        # exactly what we sent to the model. We don't truncate here —
+        # the browser side decides how to render long blocks.
+        await emit_if(self._trace, AgentTraceEvent(
+            type="agent_started",
+            agent_key=request.agent_key,
+            payload={
+                "model": request.model or self._default_model or "(default)",
+                "max_turns": request.max_turns,
+                "system_prompt": request.system_prompt or "",
+                "user_prompt": request.user_prompt,
+                "working_dir": request.working_dir,
+            },
+        ))
+
         tool_use_count = 0
         try:
             async for event in query(prompt=request.user_prompt, options=options):
@@ -107,6 +132,11 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
                     for block in event.content:
                         if isinstance(block, TextBlock):
                             final_text_parts.append(block.text)
+                            await emit_if(self._trace, AgentTraceEvent(
+                                type="llm_text",
+                                agent_key=request.agent_key,
+                                payload={"text": block.text},
+                            ))
                         elif isinstance(block, ToolUseBlock):
                             tool_use_count += 1
                             logger.info(
@@ -116,6 +146,15 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
                                 block.name,
                                 _tool_input_preview(block.input),
                             )
+                            await emit_if(self._trace, AgentTraceEvent(
+                                type="tool_use",
+                                agent_key=request.agent_key,
+                                payload={
+                                    "n": tool_use_count,
+                                    "name": block.name,
+                                    "input": _tool_input_for_trace(block.input),
+                                },
+                            ))
                 elif isinstance(event, ResultMessage):
                     got_result = True
                     cost_usd = float(event.total_cost_usd or 0.0)
@@ -169,6 +208,19 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
                     request.agent_key,
                     len(stderr_lines),
                 )
+
+        await emit_if(self._trace, AgentTraceEvent(
+            type="agent_finished",
+            agent_key=request.agent_key,
+            payload={
+                "turns": turns,
+                "stop_reason": stop_reason,
+                "cost_usd": cost_usd,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "tool_use_count": tool_use_count,
+            },
+        ))
 
         return CodeAgentResult(
             final_text="\n".join(final_text_parts),
@@ -238,6 +290,18 @@ def _looks_like_rate_limit(text: str) -> bool:
     if not text:
         return False
     return bool(_RATE_LIMIT_RE.search(text))
+
+
+def _tool_input_for_trace(tool_input: Any) -> Any:
+    """Sanitise tool_input for the AgentTrace JSON payload.
+
+    Claude Agent SDK passes plain dicts for most tools; we pass them
+    through untouched so the UI can render full text. Non-dict values
+    are stringified to keep ``json.dumps`` happy.
+    """
+    if isinstance(tool_input, dict):
+        return tool_input
+    return str(tool_input)
 
 
 def _tool_input_preview(tool_input: Any) -> str:

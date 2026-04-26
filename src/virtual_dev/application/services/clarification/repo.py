@@ -231,7 +231,25 @@ class QuestionRepository:
         extracted: dict[str, Any],
         cost_usd: float,
     ) -> None:
+        """Persist (or replace) the answer for a question.
+
+        UPSERT semantics: a question can be re-classified after going
+        back through the COUNTER_PENDING → ASKING cycle (bot answered
+        the counter, human now responds again). The new flush replaces
+        the previous answer on the same question_id. We delete-then-
+        insert because SQLite ON CONFLICT for ORM models is more
+        moving parts than it's worth here, and answers are write-once
+        per logical "settle" event.
+        """
         async with session_scope(self._session_factory) as session:
+            existing = (await session.execute(
+                select(QuestionAnswerRow).where(
+                    QuestionAnswerRow.question_id == question_id,
+                )
+            )).scalar_one_or_none()
+            if existing is not None:
+                await session.delete(existing)
+                await session.flush()
             row = QuestionAnswerRow(
                 question_id=question_id,
                 coalesced_text=coalesced_text,

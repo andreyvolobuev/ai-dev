@@ -187,8 +187,16 @@ class ClarificationOrchestrator:
     # ---------------------------------------------------------------- coalescer ticks
 
     async def flush_idle(self) -> int:
-        """Tick: classify all questions whose idle window has elapsed."""
+        """Tick: classify all questions whose idle window has elapsed.
+
+        Also recovers questions stuck in ``CLASSIFYING`` for more than
+        a few minutes — happens when ``_flush_one`` crashed mid-run
+        (e.g. a transient DB error on save_answer) and the soft-lock
+        wasn't released. Without recovery the question would sit
+        zombie until the deadline_sweep killed it 48h later.
+        """
         now = datetime.now(timezone.utc)
+        await self._recover_stuck_classifying(now=now)
         idle = await self._repo.find_idle_coalescing(now=now)
         if not idle:
             return 0
@@ -201,7 +209,49 @@ class ClarificationOrchestrator:
                 logger.exception(
                     "Clarification: flush failed for question {}", question.id,
                 )
+                # Crucially, revert the soft-lock so the next tick can
+                # retry. Otherwise the question stays in CLASSIFYING
+                # forever and looks "muted" to the human.
+                try:
+                    await self._repo.update_state(
+                        question.id, QuestionState.COALESCING,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Clarification: failed to revert soft-lock on {}",
+                        question.id,
+                    )
         return flushed
+
+    async def _recover_stuck_classifying(self, *, now: datetime) -> None:
+        """Find questions in CLASSIFYING for too long — assume their
+        flush_one crashed and revert to COALESCING so they get retried.
+        """
+        from sqlalchemy import select as _select
+        from virtual_dev.infrastructure.db import QuestionRow
+
+        cutoff = now - timedelta(minutes=10)
+        async with self._session_factory() as session:
+            stuck_ids = list((await session.execute(
+                _select(QuestionRow.id).where(
+                    QuestionRow.state == QuestionState.CLASSIFYING.value,
+                    QuestionRow.last_fragment_at.is_not(None),
+                    QuestionRow.last_fragment_at <= cutoff,
+                )
+            )).scalars().all())
+        if not stuck_ids:
+            return
+        logger.warning(
+            "Clarification: recovering {} stuck CLASSIFYING question(s): {}",
+            len(stuck_ids), stuck_ids,
+        )
+        for qid in stuck_ids:
+            try:
+                await self._repo.update_state(qid, QuestionState.COALESCING)
+            except Exception:
+                logger.exception(
+                    "Clarification: revert stuck classify on {} failed", qid,
+                )
 
     async def sweep_deadlines(self) -> int:
         """Tick: abandon questions whose ``deadline_at`` has passed."""
@@ -272,6 +322,14 @@ class ClarificationOrchestrator:
             cost_usd=result.cost_usd,
         )
         await self._repo.mark_fragments_flushed(question.id)
+
+        # Single ✅-reaction on the LAST fragment — visible signal to
+        # the human that "I read your whole reply, processing now".
+        # Mid-message reactions (one per fragment) read as
+        # interrupting; this is the natural place.
+        last_post_id = fragments[-1].mm_post_id
+        if last_post_id:
+            await self._communicator.add_reaction(last_post_id, "white_check_mark")
 
         await self._apply_classification(question, result, coalesced)
 
@@ -743,6 +801,7 @@ class ClarificationOrchestrator:
         # If the resolved stakeholder is the team-lead (UNRESOLVED_NAME
         # path's terminal fallback), DM the lead — same channel logic.
         target_user_id = question.stakeholder.resolved_mm_user_id
+        unresolved_fallback = False
         if target_user_id is None:
             target_user_id = await self._lead_user_id()
             if target_user_id is None:
@@ -750,8 +809,24 @@ class ClarificationOrchestrator:
                     question, reason="no_target_user",
                 )
                 return
+            # Mark so we can prefix the DM with "couldn't find X" — the
+            # lead shouldn't get a question that looks routed to them.
+            unresolved_fallback = (
+                question.stakeholder.kind == StakeholderKind.UNRESOLVED_NAME
+            )
 
         body = self._render_question_body(question, task_row)
+        if unresolved_fallback:
+            raw_name = (
+                question.stakeholder.display_name
+                or question.stakeholder.raw_hint
+                or "(unknown)"
+            )
+            body = (
+                f"_(не нашёл `{raw_name}` в Mattermost — перенаправил "
+                f"вам как тимлиду; если знаете правильный handle, "
+                f"подскажите его в ответ)_\n\n" + body
+            )
         outcome = await self._communicator.send_dm(target_user_id, body)
         if not (outcome.sent and outcome.message is not None):
             logger.warning(

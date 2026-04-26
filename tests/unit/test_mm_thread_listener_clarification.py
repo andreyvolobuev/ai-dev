@@ -176,9 +176,11 @@ async def test_thread_reply_appends_fragment_no_ack(
     fragments = await QuestionRepository(session_factory).list_unflushed_fragments(q.id)
     assert [f.mm_post_id for f in fragments] == ["m-1"]
 
-    # ✅ reacted; no "thanks!" channel message yet (that lands later
-    # via apply_classification).
-    assert ("m-1", _PROCESSED_REACTION) in chat.reactions
+    # NO ✅ at this point — reactions are now placed by the
+    # orchestrator on the LAST fragment when the coalescer flushes
+    # (i.e. after the human stops typing). Mid-message reactions look
+    # like the bot is interrupting after every line.
+    assert ("m-1", _PROCESSED_REACTION) not in chat.reactions
     # Only thing the bot might have sent is the question DM dispatch
     # — but we did NOT call request_clarifications here, so chat.sent
     # should be empty.

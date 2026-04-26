@@ -15,9 +15,7 @@
 # {repo_key}, {iid}, {title}, {web_url}, {idle_hours} (только в stale/escalation).
 mattermost:
   review_ping: |
-    [virtual-dev] MR `{repo_key}!{iid}` готов к ревью.
-    {title}
-    {web_url}
+    Ребята, приглашаю на [МР]({web_url}): {title}
 
   merge_ping: |
     [virtual-dev] MR `{repo_key}!{iid}` собрал апрувы. Просьба смержить: {web_url}

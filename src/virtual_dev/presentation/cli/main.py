@@ -62,6 +62,34 @@ def run(
     uvicorn.run(fastapi_app, host=bind_host, port=bind_port, log_config=None)
 
 
+@app.command("test-analyst-ui")
+def test_analyst_ui(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind host"),
+    port: int = typer.Option(8090, "--port", help="Bind port"),
+) -> None:
+    """Standalone web UI for iterating on the Analyst + clarification flow.
+
+    Runs in-process — no Mattermost, no Jira, no GitLab. The browser
+    page lets the operator paste a ticket description, click Run, and
+    watch every Claude tool_use and prompt in real time. Clarification
+    questions land in a mock chat panel.
+
+    Useful for debugging Analyst behaviour without burning a real Jira
+    ticket on every iteration.
+    """
+    _bootstrap()
+    from virtual_dev.presentation.web.test_analyst_app import build_test_analyst_app
+
+    fastapi_app = build_test_analyst_app("config")
+    console.print(
+        f"[bold]Test Analyst UI[/bold] on http://{host}:{port}\n"
+        f"  • paste a ticket on the left\n"
+        f"  • watch tool_uses + prompts in the middle\n"
+        f"  • answer clarifying questions in the chat on the right"
+    )
+    uvicorn.run(fastapi_app, host=host, port=port, log_config=None)
+
+
 @app.command("poll-once")
 def poll_once() -> None:
     """Run one orchestrator iteration and exit.

@@ -1,0 +1,372 @@
+{% extends "base.html" %}
+{% block title %}Test Analyst — Virtual Dev{% endblock %}
+{% block content %}
+<style>
+  body { background: #0e1116; color: #d4d4d4; font-family: 'SF Mono', Menlo, monospace; }
+  .test-grid {
+    display: grid;
+    grid-template-columns: 360px 1fr 360px;
+    gap: 12px;
+    height: calc(100vh - 80px);
+  }
+  .panel {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .panel-header {
+    padding: 8px 12px;
+    background: #21262d;
+    border-bottom: 1px solid #30363d;
+    font-weight: 600;
+    color: #c9d1d9;
+    font-size: 13px;
+  }
+  .panel-body { flex: 1; overflow-y: auto; padding: 8px 12px; font-size: 12px; }
+  textarea, input[type=text] {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    color: #c9d1d9;
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-family: inherit;
+    font-size: 12px;
+  }
+  textarea { width: 100%; min-height: 120px; resize: vertical; }
+  button {
+    background: #238636;
+    border: 0;
+    color: #fff;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+  }
+  button:hover { background: #2ea043; }
+  button:disabled { background: #484f58; cursor: not-allowed; }
+  .form-row { margin-bottom: 8px; }
+  label { display: block; font-size: 11px; color: #8b949e; margin-bottom: 4px; }
+
+  /* Activity feed events */
+  .event {
+    padding: 6px 8px;
+    border-left: 3px solid #30363d;
+    margin-bottom: 6px;
+    background: #0d1117;
+    border-radius: 0 4px 4px 0;
+  }
+  .event-meta {
+    display: flex;
+    justify-content: space-between;
+    color: #8b949e;
+    font-size: 10px;
+    margin-bottom: 4px;
+  }
+  .event-agent_started { border-color: #3fb950; }
+  .event-tool_use { border-color: #58a6ff; }
+  .event-llm_text { border-color: #d29922; }
+  .event-agent_finished { border-color: #f85149; }
+  .event-chat_post { border-color: #bc8cff; }
+  .event-chat_reaction { border-color: #6e7681; }
+  .event-orchestrator { border-color: #f97583; }
+  .event-pre { white-space: pre-wrap; word-break: break-word; }
+  .event-collapsed { max-height: 80px; overflow: hidden; position: relative; cursor: pointer; }
+  .event-collapsed::after {
+    content: "▼ click to expand";
+    position: absolute; bottom: 0; right: 0;
+    padding: 1px 4px; font-size: 10px; background: #161b22;
+    color: #8b949e;
+  }
+  details > summary { cursor: pointer; color: #8b949e; font-size: 11px; }
+  details[open] > summary { color: #c9d1d9; }
+
+  /* Chat messages */
+  .chat-msg {
+    padding: 6px 10px;
+    border-radius: 8px;
+    margin-bottom: 6px;
+    max-width: 90%;
+    white-space: pre-wrap;
+  }
+  .chat-msg-bot { background: #1f2937; align-self: flex-start; }
+  .chat-msg-user { background: #1e3a5f; align-self: flex-end; margin-left: auto; }
+  .chat-meta { font-size: 10px; color: #8b949e; margin-bottom: 2px; }
+  #chat-messages { display: flex; flex-direction: column; }
+
+  .status-line {
+    padding: 4px 8px;
+    background: #0d1117;
+    border-radius: 4px;
+    font-size: 11px;
+    color: #8b949e;
+    margin-bottom: 6px;
+  }
+  .status-running { color: #d29922; }
+  .status-done { color: #3fb950; }
+  .status-error { color: #f85149; }
+</style>
+
+<h1 style="font-size: 16px; margin: 8px 0;">🧪 Test Analyst (mock chat + live trace)</h1>
+
+<div class="test-grid">
+  <!-- LEFT: task input + status -->
+  <div class="panel">
+    <div class="panel-header">Task</div>
+    <div class="panel-body">
+      <div class="form-row">
+        <label>External id (e.g. DM-9999)</label>
+        <input type="text" id="task-id" value="DM-TEST-1" />
+      </div>
+      <div class="form-row">
+        <label>Title</label>
+        <input type="text" id="task-title" value="" style="width:100%" />
+      </div>
+      <div class="form-row">
+        <label>Description</label>
+        <textarea id="task-desc"></textarea>
+      </div>
+      <div class="form-row">
+        <button id="run-btn" type="button">▶ Run analyst</button>
+        <button id="reset-btn" type="button" style="background:#6e7681">⟲ Reset</button>
+      </div>
+      <div id="status" class="status-line">idle</div>
+      <div style="margin-top:12px;">
+        <label>Connection</label>
+        <div id="ws-status" class="status-line">connecting…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- CENTER: activity feed -->
+  <div class="panel">
+    <div class="panel-header">
+      Activity feed
+      <span id="event-count" style="float:right;color:#8b949e;font-weight:normal">0 events</span>
+    </div>
+    <div class="panel-body" id="activity"></div>
+  </div>
+
+  <!-- RIGHT: chat -->
+  <div class="panel">
+    <div class="panel-header">Chat with bot (DM)</div>
+    <div class="panel-body" id="chat-messages"></div>
+    <form id="chat-form" style="display:flex; gap:6px; padding: 8px 12px; border-top: 1px solid #30363d; background: #21262d;">
+      <input type="text" id="chat-input" placeholder="Type a reply…" style="flex:1" />
+      <button type="submit">Send</button>
+    </form>
+  </div>
+</div>
+
+<script>
+(function () {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${proto}//${location.host}/ws/test-analyst`;
+  let ws = null;
+  let eventCount = 0;
+  // Map post_id → DOM element so we can update reaction state.
+  const chatPosts = new Map();
+  // active question's thread_root_id (asked_post_id from the bot)
+  let activeThreadRoot = null;
+
+  const $ = id => document.getElementById(id);
+  const activity = $('activity');
+  const chat = $('chat-messages');
+  const wsStatus = $('ws-status');
+
+  function setStatus(text, cls) {
+    const el = $('status');
+    el.textContent = text;
+    el.className = 'status-line ' + (cls || '');
+  }
+
+  function addEvent(ev) {
+    eventCount += 1;
+    $('event-count').textContent = eventCount + ' events';
+    const div = document.createElement('div');
+    div.className = 'event event-' + ev.type;
+    const meta = document.createElement('div');
+    meta.className = 'event-meta';
+    meta.innerHTML = `<span>${ev.type} · ${ev.agent_key}</span><span>${ev.timestamp.slice(11, 19)}</span>`;
+    div.appendChild(meta);
+    div.appendChild(renderPayload(ev));
+    activity.appendChild(div);
+    activity.scrollTop = activity.scrollHeight;
+  }
+
+  function renderPayload(ev) {
+    const wrap = document.createElement('div');
+    const p = ev.payload || {};
+    if (ev.type === 'agent_started') {
+      wrap.innerHTML = `model=<code>${p.model}</code> max_turns=${p.max_turns}`;
+      wrap.appendChild(collapsible('system_prompt', p.system_prompt || ''));
+      wrap.appendChild(collapsible('user_prompt', p.user_prompt || ''));
+    } else if (ev.type === 'tool_use') {
+      const head = document.createElement('div');
+      head.innerHTML = `#${p.n} <code>${p.name}</code>`;
+      wrap.appendChild(head);
+      wrap.appendChild(collapsible('input', JSON.stringify(p.input, null, 2)));
+    } else if (ev.type === 'llm_text') {
+      const pre = document.createElement('pre');
+      pre.className = 'event-pre';
+      pre.textContent = p.text;
+      wrap.appendChild(pre);
+    } else if (ev.type === 'agent_finished') {
+      wrap.innerHTML = `stop=<code>${p.stop_reason}</code> turns=${p.turns} tools=${p.tool_use_count} cost=$${(p.cost_usd||0).toFixed(4)}`;
+    } else if (ev.type === 'chat_post') {
+      wrap.innerHTML = `${p.author} → <code>${p.channel_id}</code>${p.thread_root_id ? ' (thread)' : ''}`;
+      const pre = document.createElement('pre');
+      pre.className = 'event-pre';
+      pre.textContent = p.text;
+      wrap.appendChild(pre);
+    } else if (ev.type === 'chat_reaction') {
+      wrap.innerHTML = `react :${p.emoji}: on <code>${p.post_id}</code>`;
+    } else if (ev.type === 'orchestrator') {
+      wrap.innerHTML = `<strong>${p.action || ''}</strong> ${p.detail || ''}`;
+    } else {
+      const pre = document.createElement('pre');
+      pre.className = 'event-pre';
+      pre.textContent = JSON.stringify(p, null, 2);
+      wrap.appendChild(pre);
+    }
+    return wrap;
+  }
+
+  function collapsible(label, text) {
+    const det = document.createElement('details');
+    const sum = document.createElement('summary');
+    sum.textContent = `${label} (${(text || '').length} chars)`;
+    det.appendChild(sum);
+    const pre = document.createElement('pre');
+    pre.className = 'event-pre';
+    pre.style.fontSize = '11px';
+    pre.style.background = '#0a0d12';
+    pre.style.padding = '6px';
+    pre.style.borderRadius = '4px';
+    pre.style.marginTop = '4px';
+    pre.textContent = text || '(empty)';
+    det.appendChild(pre);
+    return det;
+  }
+
+  function addChatMessage(post, fromBot) {
+    const div = document.createElement('div');
+    div.className = 'chat-msg ' + (fromBot ? 'chat-msg-bot' : 'chat-msg-user');
+    div.dataset.postId = post.post_id;
+    const meta = document.createElement('div');
+    meta.className = 'chat-meta';
+    const tag = fromBot ? 'bot' : 'you';
+    meta.textContent = `${tag} · ${post.post_id}`;
+    div.appendChild(meta);
+    const body = document.createElement('div');
+    body.textContent = post.text;
+    div.appendChild(body);
+    const reactions = document.createElement('div');
+    reactions.className = 'chat-reactions';
+    reactions.style.marginTop = '4px';
+    reactions.style.fontSize = '12px';
+    div.appendChild(reactions);
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+    chatPosts.set(post.post_id, { el: div, reactions });
+    if (fromBot && post.thread_root_id == null && post.text) {
+      // Bot just opened a question — track the thread root so user
+      // replies attach to it.
+      activeThreadRoot = post.post_id;
+    }
+  }
+
+  function applyReaction(postId, emoji) {
+    const item = chatPosts.get(postId);
+    if (!item) return;
+    const span = document.createElement('span');
+    span.textContent = `:${emoji}:`;
+    span.style.background = '#30363d';
+    span.style.padding = '1px 6px';
+    span.style.borderRadius = '10px';
+    span.style.marginRight = '4px';
+    span.style.fontSize = '11px';
+    item.reactions.appendChild(span);
+  }
+
+  function connect() {
+    wsStatus.textContent = 'connecting…';
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => { wsStatus.textContent = 'connected'; wsStatus.className = 'status-line status-done'; };
+    ws.onclose = () => {
+      wsStatus.textContent = 'disconnected — retrying in 2s';
+      wsStatus.className = 'status-line status-error';
+      setTimeout(connect, 2000);
+    };
+    ws.onerror = () => {};
+    ws.onmessage = (raw) => {
+      let ev;
+      try { ev = JSON.parse(raw.data); } catch { return; }
+      // Surface every event in the activity feed
+      addEvent(ev);
+      // Also route chat events to the chat panel
+      if (ev.type === 'chat_post') {
+        addChatMessage(ev.payload, ev.payload.author === 'bot');
+      } else if (ev.type === 'chat_reaction') {
+        applyReaction(ev.payload.post_id, ev.payload.emoji);
+      } else if (ev.type === 'orchestrator' && ev.payload.action === 'task_done') {
+        setStatus('done · ' + (ev.payload.detail || ''), 'status-done');
+      } else if (ev.type === 'orchestrator' && ev.payload.action === 'task_failed') {
+        setStatus('error · ' + (ev.payload.detail || ''), 'status-error');
+      }
+    };
+  }
+
+  $('run-btn').onclick = async () => {
+    const id = $('task-id').value.trim();
+    const title = $('task-title').value.trim();
+    const desc = $('task-desc').value.trim();
+    if (!id || !title) {
+      alert('Need both id and title');
+      return;
+    }
+    setStatus('running…', 'status-running');
+    activity.innerHTML = '';
+    chat.innerHTML = '';
+    chatPosts.clear();
+    activeThreadRoot = null;
+    eventCount = 0;
+    $('event-count').textContent = '0 events';
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'run_task', external_id: id, title, description: desc }));
+    } else {
+      setStatus('ws not connected', 'status-error');
+    }
+  };
+
+  $('reset-btn').onclick = () => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'reset' }));
+    }
+    activity.innerHTML = '';
+    chat.innerHTML = '';
+    chatPosts.clear();
+    activeThreadRoot = null;
+    eventCount = 0;
+    $('event-count').textContent = '0 events';
+    setStatus('reset', '');
+  };
+
+  $('chat-form').onsubmit = (e) => {
+    e.preventDefault();
+    const input = $('chat-input');
+    const text = input.value.trim();
+    if (!text) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'chat', text, thread_root_id: activeThreadRoot }));
+      input.value = '';
+    }
+  };
+
+  connect();
+})();
+</script>
+{% endblock %}
