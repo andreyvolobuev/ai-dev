@@ -107,6 +107,12 @@ async def _build_state(
     # production 10 min) — when iterating on the analyst manually we
     # don't want to wait that long after each reply.
     config.agents.clarification.coalesce_window_seconds = coalesce_window_seconds
+    # Auto-route escalation DMs to the operator (they ARE the lead in
+    # the test-analyst session). Without this an `escalate_to_lead`
+    # decision silently drops the DM and the activity feed shows
+    # nothing — the operator can't tell the bot gave up.
+    if not config.agents.escalation.mattermost_user.strip():
+        config.agents.escalation.mattermost_user = "you"
 
     engine = make_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
@@ -115,6 +121,15 @@ async def _build_state(
 
     trace = AgentTrace()
     chat = InMemoryChat(trace=trace)
+    # Seed the operator into the directory with a real first/last name
+    # so search_mm_users_by_name("you" / "operator") returns them and
+    # the planner has SOMEONE to ask when the analyst's hint is empty.
+    chat.register_user(
+        "you",
+        first_name="Тестировщик",
+        last_name="Оператор",
+        position="Issue reporter (test-analyst session)",
+    )
     injection_filter = InjectionFilter()
 
     code_agent = ClaudeAgentSdkCodeAgent(

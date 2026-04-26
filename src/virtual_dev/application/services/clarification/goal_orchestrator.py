@@ -855,12 +855,6 @@ class GoalOrchestrator:
         self, goal: ClarificationGoal, *, reason: str,
     ) -> None:
         lead_user_id = await self._lead_user_id()
-        if lead_user_id is None:
-            logger.warning(
-                "Goal {}: no team-lead configured; escalation lost",
-                goal.id,
-            )
-            return
         chain = await self._render_chain(goal)
         task_url = await self._task_url(goal)
         body_template = (
@@ -878,7 +872,44 @@ class GoalOrchestrator:
             chain_summary=chain,
             reason=reason,
         )
-        await self._communicator.send_dm(lead_user_id, body)
+        if lead_user_id is None:
+            logger.warning(
+                "Goal {}: no team-lead configured; escalation visible "
+                "in trace only", goal.id,
+            )
+            await emit_if(self._trace, AgentTraceEvent(
+                type="escalation_dropped",
+                agent_key="clarification",
+                payload={
+                    "goal_id": goal.id,
+                    "description": goal.description,
+                    "reason": reason,
+                    "configured_handle": (
+                        self._config.agents.escalation.mattermost_user or ""
+                    ),
+                    "body": body,
+                    "note": (
+                        "No team-lead handle configured "
+                        "(agents.escalation.mattermost_user). The bot "
+                        "would have DM'd them this body."
+                    ),
+                },
+            ))
+            return
+        outcome = await self._communicator.send_dm(lead_user_id, body)
+        await emit_if(self._trace, AgentTraceEvent(
+            type="escalation_sent" if outcome.sent else "escalation_dropped",
+            agent_key="clarification",
+            payload={
+                "goal_id": goal.id,
+                "description": goal.description,
+                "reason": reason,
+                "lead_user_id": lead_user_id,
+                "sent": outcome.sent,
+                "skip_reason": outcome.skip_reason,
+                "body": body,
+            },
+        ))
 
     async def _render_chain(self, goal: ClarificationGoal) -> str:
         steps = await self._repo.list_steps(goal.id)
