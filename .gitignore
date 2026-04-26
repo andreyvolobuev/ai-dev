@@ -12,6 +12,10 @@ __pycache__/
 coverage.xml
 htmlcov/
 
+# Local debug logs (the operator dumps the activity feed here for sharing)
+logs*.txt
+*.log
+
 # Virtual envs / uv
 .venv/
 venv/
