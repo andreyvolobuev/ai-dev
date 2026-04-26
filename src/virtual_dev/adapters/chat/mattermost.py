@@ -322,6 +322,57 @@ class MattermostChat(ChatPort):
 
         await asyncio.to_thread(_run)
 
+    async def read_channel_since(
+        self, channel_id: str, since: datetime,
+    ) -> list[ChatMessage]:
+        """Pull posts in ``channel_id`` strictly newer than ``since``.
+
+        Used by the catch-up worker to fill the gap when our WebSocket
+        was disconnected. Mattermost's ``GET /channels/{id}/posts?since``
+        endpoint returns posts that were created OR updated at or after
+        the timestamp; we re-filter on ``create_at`` so we don't surface
+        edits as new fragments.
+
+        Returned in chronological order (oldest first).
+        """
+        def _fetch() -> list[ChatMessage]:
+            self._ensure_login()
+            bot_id = self._bot_user_id()
+            since_ms = int(since.timestamp() * 1000)
+            try:
+                raw = self._driver.posts.get_posts_for_channel(
+                    channel_id, params={"since": since_ms},
+                )
+            except Exception:
+                logger.exception(
+                    "MattermostChat: get_posts_for_channel failed for {} since {}",
+                    channel_id, since.isoformat(),
+                )
+                return []
+            if not isinstance(raw, dict):
+                return []
+            posts = cast(dict[str, dict[str, Any]], raw.get("posts") or {})
+            # MM returns ``order`` sorted newest-first; we want chronological
+            # for the catch-up dispatch loop, and we filter strictly newer.
+            entries: list[tuple[int, dict[str, Any]]] = []
+            for post_id, post in posts.items():
+                if not isinstance(post, dict):
+                    continue
+                create_at = int(post.get("create_at") or 0)
+                if create_at <= since_ms:
+                    continue
+                entries.append((create_at, post))
+            entries.sort(key=lambda t: t[0])
+            out: list[ChatMessage] = []
+            for _create_at, post in entries:
+                message = self._post_to_message(post)
+                if str(post.get("user_id") or "") == bot_id:
+                    message.trusted = True
+                out.append(message)
+            return out
+
+        return await asyncio.to_thread(_fetch)
+
     async def get_post(self, post_id: str) -> ChatMessage | None:
         def _run() -> ChatMessage | None:
             self._ensure_login()

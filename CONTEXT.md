@@ -219,6 +219,15 @@ Markdown-файлы `config/rules/<agent>.md`. Подкладываются в s
 
 - ✅ **Фаза 3.5** — MM-тред как канал ревью. Бот слушает WebSocket (с SSL-фиксом от poker-planning-bot), при каждом реплае в "please review"-треде спрашивает у `ThreadResponderAgent` (LLM через claude-agent-sdk): ответить текстом / внести правку / молча проигнорировать. Агент знает про injection-фильтр, может послать коллег "погуляй" если фидбек бредовый. Для правок: `DevAgent.handle_iteration` — checkout существующей ветки (`VcsPort.checkout_existing_branch`), новый коммит поверх, push. GitLab автоматически обновляет MR. Идемпотентность через реакцию ✅ (`white_check_mark`) на обработанном посте. Новые колонки `MergeRequestRow.review_thread_{channel_id,root_id}`. Новый worker `MmThreadListener` в web lifespan. 97 unit-тестов.
 
+- ✅ **Phase 3.8.1 (2026-04-26)** — фикс single-point-of-failure на MM WebSocket.
+  WS-разрыв больше не теряет сообщения; листенер перезапускает subscription на крэшах.
+  - **`ChatPort.read_channel_since(channel_id, since)`** + реализация в MattermostChat через REST `GET /channels/{id}/posts?since=<epoch_ms>`. Возвращает посты в хронологическом порядке, помечает `trusted=True` для собственных постов бота.
+  - **`MmThreadListener.catch_up()`** — публичный метод, дёргается отдельным `PollerWorker` (`mm-catchup`, default 60s tick). Алгоритм: собирает все каналы, где у нас есть active state (clarification questions + open MR review threads), для каждого канала берёт earliest cursor (oldest `last_fragment_at`/`asked_at` или `last_activity_at`/`created_at`), пуллит посты через REST, **переигрывает каждый non-bot-пост через `_dispatch`**. Идемпотентность бесплатно: clarification fragments — UNIQUE на `mm_post_id`; review-thread комменты — ✅-реакция фильтрует уже-обработанные. Lookback ограничен 7 днями.
+  - **Resilient `run_forever`** — outer retry-loop с exponential backoff (5s → 5min). `subscribe()` вынесен в `_consume_subscription`; крэши ловятся, логируются, перезапускаются. Параметры backoff'а конструкторные (для тестов 0.05s..0.1s).
+  - **Settings**: `mm_catchup_poll_interval_seconds: int = 60` в `.env`.
+  - **Тесты: 142** (было 137): +5 в `test_mm_catchup.py` — replay missed fragment, идемпотентность, фильтр bot-постов, oldest-cursor-per-channel, восстановление после subscribe-крэша.
+  - **Эффект**: WS теперь — *latency optimization*, не *correctness requirement*. Даже если WS лежит час, catch-up закрывает gap в течение 1 минуты после восстановления. Plus: parse-error в `_parse_posted_event` или другой single-shot crash больше не убивает листенер до перезапуска процесса.
+
 - ✅ **Phase 3.8 (2026-04-26)** — переписан clarification flow в нормальную доменную модель.
   Старый `ClarifierService` (один DM = один ответ, всё первое сообщение в DM) удалён, заменён на дерево вопросов с LLM-классификацией ответов.
   - **Доменные модели** (`src/virtual_dev/domain/models/clarification.py`):

@@ -78,3 +78,11 @@ class Settings(BaseSettings):
     # default we use when constructing the worker.
     answer_coalesce_poll_interval_seconds: int = 60
     answer_coalesce_window_seconds: int = 600
+    # MM REST catch-up cadence. The bot's WebSocket can miss events
+    # during reconnects; this safety-net replays missed posts via
+    # ``GET /channels/{id}/posts?since=...`` — both clarification
+    # fragments (idempotent on mm_post_id UNIQUE) and review-thread
+    # comments (idempotent via the bot's ✅-reaction). Tighter than
+    # the WS reconnect cap so we close the gap within ~1 min even
+    # when the WS is fully down.
+    mm_catchup_poll_interval_seconds: int = 60

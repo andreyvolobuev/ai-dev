@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy import select
@@ -54,7 +55,16 @@ class MmListenerStats:
     events_routed: int = 0
     replies_posted: int = 0
     iterations_dispatched: int = 0
+    catchup_posts_replayed: int = 0
+    catchup_runs: int = 0
     errors: int = 0
+    subscription_restarts: int = 0
+
+
+# How far back catch-up will fetch a channel's history when a
+# question/MR was created longer ago than this. Keeps the API call
+# bounded for very busy channels after a long downtime.
+_CATCHUP_MAX_LOOKBACK = timedelta(days=7)
 
 
 class MmThreadListener:
@@ -72,6 +82,8 @@ class MmThreadListener:
         settings: Settings,
         vcs: VcsPort | None = None,
         clarification_orchestrator: ClarificationOrchestrator | None = None,
+        subscription_initial_backoff: float = 5.0,
+        subscription_max_backoff: float = 300.0,
     ) -> None:
         self._chat = chat
         self._communicator = communicator
@@ -84,6 +96,12 @@ class MmThreadListener:
         self._clarification = clarification_orchestrator
         self._stop_event = asyncio.Event()
         self._running = False
+        # Reconnect cadence after subscribe() crashes. Defaults are
+        # 5s..5min exponential. Tests pass tiny values to keep wall-time
+        # short. Operationally these match the WS-level backoff in
+        # _ServerAuthSSLWebsocket so we don't have two layers fighting.
+        self._sub_initial_backoff = subscription_initial_backoff
+        self._sub_max_backoff = subscription_max_backoff
         self.stats = MmListenerStats()
 
     @property
@@ -94,49 +112,222 @@ class MmThreadListener:
         self._stop_event.set()
 
     async def run_forever(self) -> None:
+        """Drive the WS subscription, restart on crash with backoff.
+
+        The underlying Mattermost WebSocket already reconnects internally
+        on transient drops (see ``_ServerAuthSSLWebsocket``). But if
+        ``subscribe()`` itself raises — e.g. a parse error in
+        ``_parse_posted_event``, or the queue task dies — we used to
+        ``break`` and the listener stayed dead until the process
+        restarted.
+
+        This outer loop re-subscribes with exponential backoff. The
+        catch-up worker (separate PollerWorker) covers any messages
+        missed during the gap, so we don't lose data even if the
+        backoff is several minutes.
+        """
         if self._running:
             raise RuntimeError("MmThreadListener already running")
         self._running = True
         self._stop_event.clear()
         logger.info("MmThreadListener started")
+
+        backoff = self._sub_initial_backoff
+        max_backoff = self._sub_max_backoff
         try:
-            subscription = self._chat.subscribe()
-            pending = asyncio.create_task(_anext(subscription))
-            stopper = asyncio.create_task(self._stop_event.wait())
-            try:
-                while not self._stop_event.is_set():
-                    done, _ = await asyncio.wait(
-                        {pending, stopper}, return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if stopper in done:
+            while not self._stop_event.is_set():
+                try:
+                    await self._consume_subscription()
+                    # Clean exit (StopAsyncIteration / stop_event) — fall through.
+                    if self._stop_event.is_set():
                         break
-                    if pending in done:
-                        try:
-                            event = pending.result()
-                        except StopAsyncIteration:
-                            break
-                        except Exception:
-                            logger.exception("MmThreadListener: subscribe raised")
-                            self.stats.errors += 1
-                            break
-                        self.stats.events_seen += 1
-                        try:
-                            await self._dispatch(event)
-                        except Exception:
-                            logger.exception("MmThreadListener: dispatch raised")
-                            self.stats.errors += 1
-                        pending = asyncio.create_task(_anext(subscription))
-            finally:
-                for task in (pending, stopper):
-                    if not task.done():
-                        task.cancel()
-                        try:
-                            await task
-                        except (asyncio.CancelledError, Exception):
-                            pass
+                    # Subscription ended without an error AND we weren't asked
+                    # to stop: the underlying iterator ran out. Treat as a
+                    # transient and retry.
+                    logger.warning(
+                        "MmThreadListener: subscription ended cleanly; restarting"
+                    )
+                except Exception:
+                    self.stats.errors += 1
+                    logger.exception(
+                        "MmThreadListener: subscription crashed; restarting in {}s",
+                        backoff,
+                    )
+                self.stats.subscription_restarts += 1
+
+                # Wait before reconnecting; bail early if stop was signalled.
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=backoff,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, max_backoff)
         finally:
             self._running = False
             logger.info("MmThreadListener stopped")
+
+    async def _consume_subscription(self) -> None:
+        """Single subscribe() lifetime. Returns cleanly when iterator ends
+        or stop_event fires; raises on subscription crash so the outer
+        loop can backoff + retry.
+        """
+        subscription = self._chat.subscribe()
+        pending = asyncio.create_task(_anext(subscription))
+        stopper = asyncio.create_task(self._stop_event.wait())
+        try:
+            while not self._stop_event.is_set():
+                done, _ = await asyncio.wait(
+                    {pending, stopper}, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stopper in done:
+                    return
+                if pending in done:
+                    try:
+                        event = pending.result()
+                    except StopAsyncIteration:
+                        return
+                    # Other exceptions propagate — outer loop logs + backs off.
+                    self.stats.events_seen += 1
+                    try:
+                        await self._dispatch(event)
+                    except Exception:
+                        logger.exception("MmThreadListener: dispatch raised")
+                        self.stats.errors += 1
+                    pending = asyncio.create_task(_anext(subscription))
+        finally:
+            for task in (pending, stopper):
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+    # ----------------------------------------------------- catch-up tick
+
+    async def catch_up(self) -> int:
+        """Replay missed MM posts via REST.
+
+        For each channel we care about (active clarification questions
+        + open MR review threads), pull posts since the channel's
+        earliest relevant cursor and replay through ``_dispatch``.
+        Idempotency comes for free:
+
+        * Clarification fragments: ``UNIQUE(mm_post_id)`` on
+          ``question_fragments`` collapses duplicates.
+        * Review thread comments: ``_dispatch`` checks the bot's
+          ✅-reaction before doing anything.
+
+        This makes the WebSocket subscription a *latency optimisation*
+        rather than a correctness requirement — even if the WS dies for
+        an hour, a single catch-up sweep restores state.
+
+        Returns total posts dispatched (mostly for tests / dashboard).
+        """
+        if self._chat is None:
+            return 0
+        try:
+            cursors = await self._gather_channel_cursors()
+        except Exception:
+            logger.exception("MmThreadListener: gather catch-up cursors failed")
+            return 0
+        self.stats.catchup_runs += 1
+
+        total = 0
+        for channel_id, since in cursors.items():
+            try:
+                posts = await self._chat.read_channel_since(
+                    channel_id, since=since,
+                )
+            except Exception:
+                logger.exception(
+                    "MmThreadListener: catch-up fetch failed for {} since {}",
+                    channel_id, since.isoformat(),
+                )
+                continue
+            for post in posts:
+                if post.trusted:
+                    continue
+                try:
+                    await self._dispatch(post)
+                    total += 1
+                except Exception:
+                    logger.exception(
+                        "MmThreadListener: catch-up dispatch raised for {}",
+                        post.id,
+                    )
+                    self.stats.errors += 1
+
+        if total:
+            self.stats.catchup_posts_replayed += total
+            logger.info(
+                "MmThreadListener: catch-up replayed {} post(s) across {} channel(s)",
+                total, len(cursors),
+            )
+        return total
+
+    async def _gather_channel_cursors(self) -> dict[str, datetime]:
+        """For each channel of interest, return the oldest relevant since.
+
+        Earliest cursor across all our active state in that channel.
+        Bounded by ``_CATCHUP_MAX_LOOKBACK`` so a long-stale question
+        doesn't trigger a multi-month REST pull.
+        """
+        from virtual_dev.domain.models.clarification import ACTIVE_STATES
+
+        out: dict[str, datetime] = {}
+        now = datetime.now(timezone.utc)
+        floor = now - _CATCHUP_MAX_LOOKBACK
+
+        active_states = [s.value for s in ACTIVE_STATES]
+        async with self._session_factory() as session:
+            q_rows = list((await session.execute(
+                select(MergeRequestRow).where(
+                    MergeRequestRow.status.in_(["open", "draft"]),
+                    MergeRequestRow.review_thread_channel_id.is_not(None),
+                )
+            )).scalars().all())
+            from virtual_dev.infrastructure.db import QuestionRow
+            qs = list((await session.execute(
+                select(QuestionRow).where(
+                    QuestionRow.state.in_(active_states),
+                    QuestionRow.mm_channel_id.is_not(None),
+                )
+            )).scalars().all())
+
+        # Active clarification questions.
+        for q in qs:
+            ch = q.mm_channel_id
+            if not ch:
+                continue
+            cursor = _aware(q.last_fragment_at or q.asked_at) or now
+            if cursor < floor:
+                cursor = floor
+            existing = out.get(ch)
+            if existing is None or cursor < existing:
+                out[ch] = cursor
+
+        # Open MR review threads — channel + thread root id are kept on the row.
+        for mr in q_rows:
+            ch = mr.review_thread_channel_id
+            if not ch:
+                continue
+            # Use the latest of last_activity_at / created_at; the WS
+            # death we're recovering from is at most a few minutes
+            # back, so anchoring at last_activity_at narrows the
+            # pull window and avoids re-processing weeks of channel
+            # chatter on long-lived MRs.
+            anchor = _aware(mr.last_activity_at) or _aware(mr.created_at) or now
+            if anchor < floor:
+                anchor = floor
+            existing = out.get(ch)
+            if existing is None or anchor < existing:
+                out[ch] = anchor
+
+        return out
+
+    # ----------------------------------------------------- main dispatch
 
     async def _dispatch(self, event: ChatMessage) -> None:
         if event.trusted:
@@ -414,6 +605,18 @@ class MmThreadListener:
 
 async def _anext(iterator):
     return await iterator.__anext__()
+
+
+def _aware(dt: datetime | None) -> datetime | None:
+    """Normalise possibly-naive SQLite datetimes to UTC-aware ones.
+
+    Returns None for None input so callers can ``or`` it with a default.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 __all__ = ["MmThreadListener", "MmListenerStats"]

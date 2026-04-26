@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Sequence
+from datetime import datetime
 
 from virtual_dev.domain.models.chat import ChatMessage, ChatUser
 
@@ -53,3 +54,18 @@ class ChatPort(ABC):
     @abstractmethod
     def subscribe(self) -> AsyncIterator[ChatMessage]:
         """Stream incoming chat messages (WebSocket-backed in real adapters)."""
+
+    async def read_channel_since(
+        self, channel_id: str, since: datetime,
+    ) -> Sequence[ChatMessage]:
+        """REST catch-up: return posts in ``channel_id`` newer than ``since``.
+
+        Used by ``MmCatchupWorker`` to fill the gap when the WebSocket
+        was disconnected and dropped events. Posts come back in
+        chronological order (oldest first). Bot-authored posts are
+        marked ``trusted=True``.
+
+        Default impl returns ``[]`` so test fakes that don't need
+        catch-up can ignore this method. Real adapters MUST implement it.
+        """
+        return []

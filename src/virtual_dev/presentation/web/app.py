@@ -117,6 +117,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
     )
 
     mm_listener: MmThreadListener | None = None
+    mm_catchup_poller: PollerWorker | None = None
     if container.chat is not None and container.vcs is not None:
         mm_listener = MmThreadListener(
             chat=container.chat,
@@ -128,6 +129,14 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             settings=container.settings,
             vcs=container.vcs,
             clarification_orchestrator=container.clarification_orchestrator,
+        )
+        # Catch-up tick — runs independently of the WS health, so
+        # missed posts get replayed even if the listener's
+        # subscription is in its backoff window.
+        mm_catchup_poller = PollerWorker(
+            name="mm-catchup",
+            interval_seconds=container.settings.mm_catchup_poll_interval_seconds,
+            ticks={"catch_up": mm_listener.catch_up},
         )
 
     @asynccontextmanager
@@ -152,9 +161,13 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                 background.append(asyncio.create_task(
                     mm_listener.run_forever(), name="mm-thread-listener",
                 ))
+            if mm_catchup_poller is not None:
+                background.append(asyncio.create_task(
+                    mm_catchup_poller.run_forever(), name="mm-catchup-poller",
+                ))
             logger.info(
                 "Started: orchestrator + analyst-runner + {} dev runner(s) "
-                "+ reviewer/devops/coalescer pollers + mm-thread-listener={}",
+                "+ reviewer/devops/coalescer/mm-catchup pollers + mm-thread-listener={}",
                 len(dev_runners), mm_listener is not None,
             )
         try:
@@ -169,6 +182,8 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             await coalescer_poller.stop()
             if mm_listener is not None:
                 await mm_listener.stop()
+            if mm_catchup_poller is not None:
+                await mm_catchup_poller.stop()
             for task in background:
                 try:
                     await asyncio.wait_for(task, timeout=5)
