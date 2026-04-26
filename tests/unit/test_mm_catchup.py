@@ -21,19 +21,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from virtual_dev.application.services import (
     CommunicatorService,
     InjectionFilter,
-    PromptsLoader,
 )
-from virtual_dev.application.services.clarification import ClarificationOrchestrator
-from virtual_dev.application.services.clarification.repo import QuestionRepository
-from virtual_dev.application.services.clarification.stakeholder_resolver import (
-    StakeholderResolver,
+from virtual_dev.application.services.clarification import (
+    GoalOrchestrator,
+    GoalRepository,
 )
 from virtual_dev.domain.models.chat import ChatMessage, ChatUser
-from virtual_dev.domain.models.clarification import (
-    Question,
-    QuestionState,
-    Stakeholder,
-    StakeholderKind,
+from virtual_dev.domain.models.clarification_goal import (
+    ClarificationGoal,
+    GoalState,
 )
 from virtual_dev.domain.ports.chat import ChatPort
 from virtual_dev.infrastructure.config import (
@@ -155,52 +151,45 @@ def _config() -> AppConfig:
         repositories=[RepositoryCfg(key="x", url="git@x:x.git")],
         agents=AgentsCfg(),
         mappings=MappingsCfg(),
-        notifications=NotificationsCfg(mattermost=MmTemplatesCfg(
-            clarifier_question="Q: {question}",
-        )),
+        notifications=NotificationsCfg(mattermost=MmTemplatesCfg()),
     )
 
 
-async def _seed_question(
+async def _seed_goal(
     session_factory: async_sessionmaker[AsyncSession],
-) -> Question:
-    """Seed an active clarification Question waiting on alice."""
-    repo = QuestionRepository(session_factory)
-    q = await repo.create_root(
-        tracker="jira", task_external_id="DM-1", plan_id=1,
-        text="Q", why_it_matters="",
-        stakeholder=Stakeholder(
-            kind=StakeholderKind.EXPLICIT_HANDLE, raw_hint="alice",
-            resolved_mm_user_id="uid-alice",
-        ),
+) -> ClarificationGoal:
+    """Seed an active clarification goal waiting on alice."""
+    repo = GoalRepository(session_factory)
+    goal = await repo.create_goal(
+        plan_id=1,
+        tracker="jira", task_external_id="DM-1",
+        description="нужен пример body", why_it_matters="",
+        initial_contact_hint="alice",
         coalesce_window_seconds=600,
         deadline_at=datetime.now(timezone.utc) + timedelta(hours=48),
     )
     await repo.update_state(
-        q.id, QuestionState.ASKING,
-        asked_post_id="bot-post-q",
-        mm_user_id="uid-alice",
-        mm_channel_id="dm-uid-alice",
+        goal.id, GoalState.AWAITING_REPLY,
+        outstanding_post_id="bot-post-q",
+        outstanding_user_id="uid-alice",
+        outstanding_username="alice",
+        outstanding_channel="dm-uid-alice",
+        outstanding_text="дай пример body",
     )
-    return q
+    return goal
 
 
 def _orchestrator(
     session_factory: async_sessionmaker[AsyncSession],
     chat: ChatPort,
-) -> ClarificationOrchestrator:
+) -> GoalOrchestrator:
     communicator = CommunicatorService(
         chat, InjectionFilter(), respect_working_hours=False,
     )
-    return ClarificationOrchestrator(
-        repo=QuestionRepository(session_factory),
+    return GoalOrchestrator(
+        repo=GoalRepository(session_factory),
         communicator=communicator,
-        classifier=_StubClassifier(),                 # type: ignore[arg-type]
-        counter_answerer=_StubCounter(),              # type: ignore[arg-type]
-        stakeholder_resolver=StakeholderResolver(
-            communicator=communicator, code_agent=None,  # type: ignore[arg-type]
-            config=_config(), prompts_loader=PromptsLoader("config/prompts"),
-        ),
+        planner=_StubPlanner(),                       # type: ignore[arg-type]
         config=_config(),
         session_factory=session_factory,
         message_bus=None,
@@ -210,7 +199,7 @@ def _orchestrator(
 def _listener(
     session_factory: async_sessionmaker[AsyncSession],
     chat: ChatPort,
-    orchestrator: ClarificationOrchestrator | None,
+    orchestrator: GoalOrchestrator | None,
 ) -> MmThreadListener:
     return MmThreadListener(
         chat=chat,
@@ -222,18 +211,13 @@ def _listener(
         session_factory=session_factory,
         config=_config(),
         settings=Settings(),
-        clarification_orchestrator=orchestrator,
+        goal_orchestrator=orchestrator,
     )
 
 
-class _StubClassifier:
-    async def classify(self, **kwargs: Any) -> Any:  # pragma: no cover
-        raise AssertionError("classifier should not run during catch-up tests")
-
-
-class _StubCounter:
-    async def answer(self, **kwargs: Any) -> Any:  # pragma: no cover
-        raise AssertionError
+class _StubPlanner:
+    async def decide(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+        raise AssertionError("planner should not run during catch-up tests")
 
 
 # ============================================================
@@ -246,7 +230,7 @@ async def test_catchup_replays_missed_clarification_fragment(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """A post that arrived while the WS was down lands as a fragment."""
-    q = await _seed_question(session_factory)
+    q = await _seed_goal(session_factory)
     missed = ChatMessage(
         id="missed-1", channel_id="dm-uid-alice", author_id="uid-alice",
         text="вот ответ который бот пропустил",
@@ -258,7 +242,7 @@ async def test_catchup_replays_missed_clarification_fragment(
 
     total = await listener.catch_up()
     assert total == 1
-    fragments = await QuestionRepository(session_factory).list_unflushed_fragments(q.id)
+    fragments = await GoalRepository(session_factory).list_unflushed_fragments(q.id)
     assert [f.mm_post_id for f in fragments] == ["missed-1"]
 
 
@@ -267,7 +251,7 @@ async def test_catchup_idempotent_on_replayed_fragment(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Running catch-up twice doesn't double-insert (UNIQUE on mm_post_id)."""
-    q = await _seed_question(session_factory)
+    q = await _seed_goal(session_factory)
     missed = ChatMessage(
         id="missed-2", channel_id="dm-uid-alice", author_id="uid-alice",
         text="ответ",
@@ -279,7 +263,7 @@ async def test_catchup_idempotent_on_replayed_fragment(
 
     await listener.catch_up()
     await listener.catch_up()
-    fragments = await QuestionRepository(session_factory).list_unflushed_fragments(q.id)
+    fragments = await GoalRepository(session_factory).list_unflushed_fragments(q.id)
     assert [f.mm_post_id for f in fragments] == ["missed-2"]
 
 
@@ -288,7 +272,7 @@ async def test_catchup_skips_bot_authored_posts(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """trusted=True posts (bot's own) are filtered out, never appended."""
-    q = await _seed_question(session_factory)
+    q = await _seed_goal(session_factory)
     own = ChatMessage(
         id="own-1", channel_id="dm-uid-alice", author_id="uid-bot",
         text="мой собственный пост",
@@ -300,7 +284,7 @@ async def test_catchup_skips_bot_authored_posts(
 
     total = await listener.catch_up()
     assert total == 0
-    fragments = await QuestionRepository(session_factory).list_unflushed_fragments(q.id)
+    fragments = await GoalRepository(session_factory).list_unflushed_fragments(q.id)
     assert fragments == []
 
 
@@ -308,50 +292,46 @@ async def test_catchup_skips_bot_authored_posts(
 async def test_catchup_uses_oldest_relevant_cursor_per_channel(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Multiple active questions in same channel → cursor is the oldest."""
-    repo = QuestionRepository(session_factory)
+    """Multiple active goals in the same DM channel → cursor is the oldest."""
+    repo = GoalRepository(session_factory)
     deadline = datetime.now(timezone.utc) + timedelta(hours=48)
     older_t = datetime.now(timezone.utc) - timedelta(hours=2)
     newer_t = datetime.now(timezone.utc) - timedelta(hours=1)
 
-    q_old = await repo.create_root(
-        tracker="jira", task_external_id="DM-1", plan_id=1,
-        text="old", why_it_matters="",
-        stakeholder=Stakeholder(
-            kind=StakeholderKind.EXPLICIT_HANDLE, raw_hint="alice",
-            resolved_mm_user_id="uid-alice",
-        ),
+    g_old = await repo.create_goal(
+        plan_id=1, tracker="jira", task_external_id="DM-1",
+        description="old", why_it_matters="", initial_contact_hint="alice",
         coalesce_window_seconds=600, deadline_at=deadline,
     )
     await repo.update_state(
-        q_old.id, QuestionState.ASKING,
-        asked_post_id="post-old", mm_user_id="uid-alice",
-        mm_channel_id="dm-uid-alice",
+        g_old.id, GoalState.AWAITING_REPLY,
+        outstanding_post_id="post-old",
+        outstanding_user_id="uid-alice",
+        outstanding_username="alice",
+        outstanding_channel="dm-uid-alice",
     )
-    q_new = await repo.create_root(
-        tracker="jira", task_external_id="DM-2", plan_id=2,
-        text="new", why_it_matters="",
-        stakeholder=Stakeholder(
-            kind=StakeholderKind.EXPLICIT_HANDLE, raw_hint="alice",
-            resolved_mm_user_id="uid-alice",
-        ),
+    g_new = await repo.create_goal(
+        plan_id=2, tracker="jira", task_external_id="DM-2",
+        description="new", why_it_matters="", initial_contact_hint="alice",
         coalesce_window_seconds=600, deadline_at=deadline,
     )
     await repo.update_state(
-        q_new.id, QuestionState.ASKING,
-        asked_post_id="post-new", mm_user_id="uid-alice",
-        mm_channel_id="dm-uid-alice",
+        g_new.id, GoalState.AWAITING_REPLY,
+        outstanding_post_id="post-new",
+        outstanding_user_id="uid-alice",
+        outstanding_username="alice",
+        outstanding_channel="dm-uid-alice",
     )
     # Manually adjust asked_at so the oldest is older_t and the newer is newer_t.
-    from virtual_dev.infrastructure.db import QuestionRow
+    from virtual_dev.infrastructure.db import GoalRow
     from sqlalchemy import select
     from virtual_dev.infrastructure.db.base import session_scope
     async with session_scope(session_factory) as session:
         row_old = (await session.execute(
-            select(QuestionRow).where(QuestionRow.id == q_old.id)
+            select(GoalRow).where(GoalRow.id == g_old.id)
         )).scalar_one()
         row_new = (await session.execute(
-            select(QuestionRow).where(QuestionRow.id == q_new.id)
+            select(GoalRow).where(GoalRow.id == g_new.id)
         )).scalar_one()
         row_old.asked_at = older_t
         row_new.asked_at = newer_t
@@ -364,7 +344,6 @@ async def test_catchup_uses_oldest_relevant_cursor_per_channel(
     assert len(chat.read_channel_calls) == 1
     channel, since = chat.read_channel_calls[0]
     assert channel == "dm-uid-alice"
-    # Allow tiny floating delta vs the row datetime.
     assert abs((since - older_t).total_seconds()) < 1.0
 
 
@@ -384,7 +363,7 @@ async def test_run_forever_restarts_after_subscribe_crash(
         session_factory=session_factory,
         config=_config(),
         settings=Settings(),
-        clarification_orchestrator=None,
+        goal_orchestrator=None,
         subscription_initial_backoff=0.05,
         subscription_max_backoff=0.1,
     )

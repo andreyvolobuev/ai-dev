@@ -200,98 +200,106 @@ class MrHistoryRow(Base):
     indexed_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
 
-class QuestionRow(Base):
-    """One node in the clarification Q-tree.
+class GoalRow(Base):
+    """A clarification goal: the information the bot needs to learn.
 
-    Phase 3.8 replaces the flat ``clarifications`` table with a tree
-    that supports redirects (a→b→c…), counter-questions (where we owe
-    the asker a reply), and "ask back for the missing handle" loops.
-    The application source of truth is :class:`virtual_dev.domain.
-    models.clarification.Question`; this row is its projection.
+    Phase 3.9 replaces the Q-tree with a goal-driven model. The
+    planner agent reads the goal description + full step history on
+    each tick and decides one next action. The state machine is a
+    direct projection of the
+    :class:`virtual_dev.domain.models.clarification_goal.GoalState`
+    enum.
     """
 
-    __tablename__ = "questions"
-    __table_args__ = (Index("ix_questions_state_lastfrag", "state", "last_fragment_at"),)
+    __tablename__ = "clarification_goals"
+    __table_args__ = (
+        Index("ix_goals_state_lastfrag", "state", "last_fragment_at"),
+        Index("ix_goals_state_nextrun", "state", "next_planner_run_at"),
+        Index("ix_goals_state_deadline", "state", "deadline_at"),
+        Index("ix_goals_tracker_extid", "tracker", "task_external_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
-    # Tree shape. ``root_id == id`` for roots. ``chain_depth`` is the
-    # redirect depth (root=0); used by the loop-guard.
-    root_id: Mapped[int] = mapped_column(Integer, index=True)
-    parent_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    chain_depth: Mapped[int] = mapped_column(Integer, default=0)
-
-    tracker: Mapped[str] = mapped_column(String(32), index=True)
-    task_external_id: Mapped[str] = mapped_column(String(64), index=True)
-    # Only populated on the root. Children leave it null — they belong
-    # to the same plan via the root.
     plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    tracker: Mapped[str] = mapped_column(String(32))
+    task_external_id: Mapped[str] = mapped_column(String(64))
 
-    text: Mapped[str] = mapped_column(Text)
+    description: Mapped[str] = mapped_column(Text)
     why_it_matters: Mapped[str] = mapped_column(Text, default="")
+    initial_contact_hint: Mapped[str] = mapped_column(String(256), default="")
 
-    state: Mapped[str] = mapped_column(String(32), index=True, default="pending")
+    state: Mapped[str] = mapped_column(String(32), default="pending")
+    final_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    stakeholder_kind: Mapped[str] = mapped_column(String(32), default="explicit_handle")
-    stakeholder_raw_hint: Mapped[str] = mapped_column(String(256), default="")
-    stakeholder_resolved_mm_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    stakeholder_resolved_mm_channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    stakeholder_display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
-
-    # MM bookkeeping. ``asked_post_id`` is the bot's question DM —
-    # used as the thread root for incoming replies and for posting acks.
-    mm_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    mm_channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    asked_post_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-
-    # Coalescer hot-path: refreshed on every incoming fragment.
+    # Currently-outstanding DM (set when state is in
+    # AWAITING_REPLY|COALESCING|READY_TO_REPLAN|REPLANNING).
+    current_target_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_target_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    current_channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_asked_post_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    current_asked_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_dedupe_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_fragment_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     coalesce_window_seconds: Mapped[int] = mapped_column(Integer, default=600)
 
     asked_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_planner_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    planner_calls_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    send_retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_planning_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
-class QuestionFragmentRow(Base):
-    """Raw MM message buffered for coalescing.
+class GoalStepRow(Base):
+    """Append-only history entry for a goal.
 
-    ``mm_post_id`` is UNIQUE so duplicate WebSocket deliveries collapse
-    cleanly; this is what lets us safely append on every event without
-    worrying about double-counting after a reconnect.
+    ``seq`` is monotonic per-goal; ``UNIQUE(goal_id, seq)`` guarantees
+    we never get two steps with the same ordinal even under racing
+    inserts (we serialise inside the orchestrator, but the constraint
+    is the safety net).
     """
 
-    __tablename__ = "question_fragments"
-    __table_args__ = (UniqueConstraint("mm_post_id", name="uq_fragment_post_id"),)
+    __tablename__ = "goal_steps"
+    __table_args__ = (UniqueConstraint("goal_id", "seq", name="uq_goal_step_seq"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    question_id: Mapped[int] = mapped_column(Integer, index=True)
+    goal_id: Mapped[int] = mapped_column(Integer, index=True)
+    seq: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    text: Mapped[str] = mapped_column(Text, default="")
+    target_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    target_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    metadata_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
+
+
+class GoalFragmentRow(Base):
+    """Raw MM message buffered for the goal's CURRENT outstanding question.
+
+    ``UNIQUE(goal_id, mm_post_id)`` (not global) — two goals waiting
+    in the same DM channel can legitimately see the same human reply
+    if the human accidentally hits both threads, and we want each
+    goal's coalescer to see it independently.
+
+    On a new ASK from the planner the buffered fragments either
+    coalesce into the previous question's HUMAN_REPLIED step or are
+    archived as STALE_FRAGMENT (when the new ask invalidates them as
+    contextual evidence).
+    """
+
+    __tablename__ = "goal_fragments"
+    __table_args__ = (UniqueConstraint("goal_id", "mm_post_id", name="uq_goal_fragment_post"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    goal_id: Mapped[int] = mapped_column(Integer, index=True)
     mm_post_id: Mapped[str] = mapped_column(String(64))
+    asked_post_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     text: Mapped[str] = mapped_column(Text, default="")
     received_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     flushed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-
-
-class QuestionAnswerRow(Base):
-    """Final classified answer for one Question.
-
-    Separate from ``questions`` because (a) the row only exists once
-    classification has run, (b) it's the audit trail of what the LLM
-    decided. ``extracted_json`` carries the structured payload from
-    ``submit_classification`` — the orchestrator reads from it when
-    spawning child questions, posting acks, etc.
-    """
-
-    __tablename__ = "question_answers"
-    __table_args__ = (UniqueConstraint("question_id", name="uq_question_answer"),)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    question_id: Mapped[int] = mapped_column(Integer, index=True)
-    coalesced_text: Mapped[str] = mapped_column(Text, default="")
-    classification: Mapped[str] = mapped_column(String(32), index=True)
-    extracted_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
-    classified_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
 
 
 class EventRow(Base):

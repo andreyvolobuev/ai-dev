@@ -27,9 +27,8 @@ from virtual_dev.application.agents.dev import DevAgent
 from virtual_dev.application.agents.devops import DevOpsAgent
 from virtual_dev.application.agents.orchestrator import dev_agent_key
 from virtual_dev.application.agents.reviewer import ReviewerAgent
+from virtual_dev.application.agents.clarification_planner import ClarificationPlanner
 from virtual_dev.application.agents.thread_responder import ThreadResponderAgent
-from virtual_dev.application.agents.answer_classifier import AnswerClassifier
-from virtual_dev.application.agents.counter_answerer import CounterQuestionAnswerer
 from virtual_dev.application.services import (
     CommunicatorService,
     InjectionFilter,
@@ -38,9 +37,8 @@ from virtual_dev.application.services import (
     RulesLoader,
 )
 from virtual_dev.application.services.clarification import (
-    ClarificationOrchestrator,
-    QuestionRepository,
-    StakeholderResolver,
+    GoalOrchestrator,
+    GoalRepository,
 )
 from virtual_dev.domain.ports.chat import ChatPort
 from virtual_dev.domain.ports.code_agent import CodeAgentPort
@@ -89,12 +87,10 @@ class Container:
     reviewer: ReviewerAgent
     devops: DevOpsAgent
     thread_responder: ThreadResponderAgent
-    # Phase 3.8: clarification subsystem.
-    question_repo: QuestionRepository
-    answer_classifier: AnswerClassifier
-    counter_answerer: CounterQuestionAnswerer
-    stakeholder_resolver: StakeholderResolver
-    clarification_orchestrator: ClarificationOrchestrator
+    # Phase 3.9: goal-driven clarification subsystem.
+    goal_repo: GoalRepository
+    clarification_planner: ClarificationPlanner
+    goal_orchestrator: GoalOrchestrator
 
     async def init_db(self) -> None:
         """Create all tables. Used by ``virtual-dev db init``."""
@@ -268,35 +264,20 @@ def build_container(config_dir: Path | str = "config") -> Container:
         prompts_loader=prompts_loader,
     )
 
-    # Phase 3.8: clarification subsystem.
-    question_repo = QuestionRepository(session_factory=session_factory)
-    answer_classifier = AnswerClassifier(
+    # Phase 3.9: goal-driven clarification subsystem.
+    goal_repo = GoalRepository(session_factory=session_factory)
+    clarification_planner = ClarificationPlanner(
         code_agent=code_agent,
         config=config,
         prompts_loader=prompts_loader,
-        injection_filter=injection_filter,
-    )
-    counter_answerer = CounterQuestionAnswerer(
-        code_agent=code_agent,
-        config=config,
-        prompts_loader=prompts_loader,
-        researcher=researcher if mr_history else researcher,
-        injection_filter=injection_filter,
-    )
-    stakeholder_resolver = StakeholderResolver(
         communicator=communicator,
-        code_agent=code_agent,
-        config=config,
-        prompts_loader=prompts_loader,
+        researcher=researcher,
         injection_filter=injection_filter,
-        confidence_threshold=0.8,
     )
-    clarification_orchestrator = ClarificationOrchestrator(
-        repo=question_repo,
+    goal_orchestrator = GoalOrchestrator(
+        repo=goal_repo,
         communicator=communicator,
-        classifier=answer_classifier,
-        counter_answerer=counter_answerer,
-        stakeholder_resolver=stakeholder_resolver,
+        planner=clarification_planner,
         config=config,
         session_factory=session_factory,
         message_bus=message_bus,
@@ -353,11 +334,9 @@ def build_container(config_dir: Path | str = "config") -> Container:
         reviewer=reviewer,
         devops=devops,
         thread_responder=thread_responder,
-        question_repo=question_repo,
-        answer_classifier=answer_classifier,
-        counter_answerer=counter_answerer,
-        stakeholder_resolver=stakeholder_resolver,
-        clarification_orchestrator=clarification_orchestrator,
+        goal_repo=goal_repo,
+        clarification_planner=clarification_planner,
+        goal_orchestrator=goal_orchestrator,
     )
 
 

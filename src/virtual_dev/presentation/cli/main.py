@@ -66,6 +66,10 @@ def run(
 def test_analyst_ui(
     host: str = typer.Option("127.0.0.1", "--host", help="Bind host"),
     port: int = typer.Option(8090, "--port", help="Bind port"),
+    coalesce_seconds: int = typer.Option(
+        30, "--coalesce-seconds",
+        help="Idle window before LLM classifies a coalesced answer (production default is 600).",
+    ),
 ) -> None:
     """Standalone web UI for iterating on the Analyst + clarification flow.
 
@@ -80,12 +84,16 @@ def test_analyst_ui(
     _bootstrap()
     from virtual_dev.presentation.web.test_analyst_app import build_test_analyst_app
 
-    fastapi_app = build_test_analyst_app("config")
+    fastapi_app = build_test_analyst_app(
+        "config", coalesce_window_seconds=coalesce_seconds,
+    )
     console.print(
         f"[bold]Test Analyst UI[/bold] on http://{host}:{port}\n"
         f"  • paste a ticket on the left\n"
         f"  • watch tool_uses + prompts in the middle\n"
-        f"  • answer clarifying questions in the chat on the right"
+        f"  • answer clarifying questions in the chat on the right\n"
+        f"  • coalesce window: {coalesce_seconds}s of silence "
+        f"before classifying the merged answer"
     )
     uvicorn.run(fastapi_app, host=host, port=port, log_config=None)
 
@@ -318,7 +326,7 @@ def plan_task(
         task_tracker=container.task_tracker if post_to_tracker else None,
         config=container.config,
         post_to_tracker=post_to_tracker,
-        clarification_orchestrator=container.clarification_orchestrator,
+        goal_orchestrator=container.goal_orchestrator,
         session_factory=container.session_factory,
     )
 
@@ -397,7 +405,7 @@ async def _ensure_task_in_db(
     return True
 
 
-clarifications_app = typer.Typer(help="Inspect the clarification Q-tree")
+clarifications_app = typer.Typer(help="Inspect clarification goals + history")
 app.add_typer(clarifications_app, name="clarifications")
 
 
@@ -406,62 +414,52 @@ def clarifications_show(
     external_id: str = typer.Argument(..., help="Tracker task id, e.g. DM-1234"),
     tracker: str = typer.Option("jira", help="Tracker name"),
 ) -> None:
-    """Print the question tree for one task as ASCII.
+    """Print the goal-step timeline for one task.
 
-    Each node shows ``state | stakeholder | text``. Indentation reflects
-    ``chain_depth`` (root depth=0, redirects deeper). Includes the
-    classified answer if there is one. Read-only; useful when
-    escalation reaches the team-lead and they need to see what the bot
-    actually asked / heard.
+    For each ClarificationGoal on the task, shows the goal description,
+    state, and the append-only history (every bot ask + every coalesced
+    human reply + every planner decision). Read-only; useful when
+    escalation reaches the team-lead and they want to see what the bot
+    actually asked / heard / decided.
     """
     _bootstrap()
     container = build_container()
 
     async def _run() -> None:
-        repo = container.question_repo
-        questions = await repo.list_for_task(tracker, external_id)
-        if not questions:
+        repo = container.goal_repo
+        goals = await repo.list_for_task(tracker, external_id)
+        if not goals:
             console.print(
-                f"[yellow]No clarifications for {tracker}:{external_id}[/yellow]"
+                f"[yellow]No clarification goals for {tracker}:{external_id}[/yellow]"
             )
+            await container.dispose()
             return
 
         from rich.tree import Tree
 
-        # Build a parent_id → children map.
-        children_map: dict[int | None, list] = {}
-        for q in questions:
-            children_map.setdefault(q.parent_id, []).append(q)
-
-        def _node_label(q):  # type: ignore[no-untyped-def]
-            who = (
-                q.stakeholder.display_name
-                or q.stakeholder.raw_hint
-                or "(team-lead)"
+        for goal in goals:
+            steps = await repo.list_steps(goal.id)
+            header = (
+                f"[bold]Goal #{goal.id} — {goal.state.value}[/bold]\n"
+                f"  description: {goal.description[:240]}\n"
+                f"  why_it_matters: {(goal.why_it_matters or '')[:200]}\n"
+                f"  initial_contact_hint: {goal.initial_contact_hint or '(none)'}\n"
+                f"  planner_calls: {goal.planner_calls_count}"
             )
-            label = (
-                f"[bold]{q.state.value}[/bold] "
-                f"| @{who} ({q.stakeholder.kind.value}) "
-                f"| {q.text[:140]}"
-            )
-            if q.answer is not None and q.answer.classification is not None:
-                label += (
-                    f"\n   [dim]→ {q.answer.classification.value}: "
-                    f"{q.answer.coalesced_text[:140]}[/dim]"
+            if goal.final_answer:
+                header += f"\n  [green]final_answer:[/green] {goal.final_answer[:300]}"
+            tree = Tree(header)
+            for s in steps:
+                who = s.target_username or s.target_user_id or "(internal)"
+                label = (
+                    f"[dim]\\[{s.seq}][/dim] "
+                    f"[bold]{s.kind.value}[/bold] → @{who}"
                 )
-            return label
-
-        def _build_tree(parent_id: int | None, parent_node) -> None:
-            for q in children_map.get(parent_id, []):
-                node = parent_node.add(_node_label(q))
-                _build_tree(q.id, node)
-
-        # Roots are the children of None.
-        roots = children_map.get(None, [])
-        for root in roots:
-            tree = Tree(_node_label(root))
-            _build_tree(root.id, tree)
+                if s.text:
+                    label += f"\n   {s.text[:300]}"
+                tree.add(label)
             console.print(tree)
+            console.print()
         await container.dispose()
 
     asyncio.run(_run())

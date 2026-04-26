@@ -33,7 +33,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents import DevAgent, ResponderAction, ThreadResponderAgent
-from virtual_dev.application.services.clarification import ClarificationOrchestrator
+from virtual_dev.application.services.clarification import GoalOrchestrator
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
@@ -81,7 +81,7 @@ class MmThreadListener:
         config: AppConfig,
         settings: Settings,
         vcs: VcsPort | None = None,
-        clarification_orchestrator: ClarificationOrchestrator | None = None,
+        goal_orchestrator: GoalOrchestrator | None = None,
         subscription_initial_backoff: float = 5.0,
         subscription_max_backoff: float = 300.0,
     ) -> None:
@@ -93,7 +93,7 @@ class MmThreadListener:
         self._config = config
         self._settings = settings
         self._vcs = vcs
-        self._clarification = clarification_orchestrator
+        self._goals = goal_orchestrator
         self._stop_event = asyncio.Event()
         self._running = False
         # Reconnect cadence after subscribe() crashes. Defaults are
@@ -274,7 +274,7 @@ class MmThreadListener:
         Bounded by ``_CATCHUP_MAX_LOOKBACK`` so a long-stale question
         doesn't trigger a multi-month REST pull.
         """
-        from virtual_dev.domain.models.clarification import ACTIVE_STATES
+        from virtual_dev.domain.models.clarification_goal import ACTIVE_STATES
 
         out: dict[str, datetime] = {}
         now = datetime.now(timezone.utc)
@@ -288,17 +288,17 @@ class MmThreadListener:
                     MergeRequestRow.review_thread_channel_id.is_not(None),
                 )
             )).scalars().all())
-            from virtual_dev.infrastructure.db import QuestionRow
+            from virtual_dev.infrastructure.db import GoalRow
             qs = list((await session.execute(
-                select(QuestionRow).where(
-                    QuestionRow.state.in_(active_states),
-                    QuestionRow.mm_channel_id.is_not(None),
+                select(GoalRow).where(
+                    GoalRow.state.in_(active_states),
+                    GoalRow.current_channel_id.is_not(None),
                 )
             )).scalars().all())
 
-        # Active clarification questions.
+        # Active clarification goals.
         for q in qs:
-            ch = q.mm_channel_id
+            ch = q.current_channel_id
             if not ch:
                 continue
             cursor = _aware(q.last_fragment_at or q.asked_at) or now
@@ -333,29 +333,30 @@ class MmThreadListener:
         if event.trusted:
             return
 
-        # Clarification fragment? Phase 3.8 model: each MM event under a
-        # bot-asked question is one *fragment* — we append, restart the
-        # idle timer, and let the AnswerCoalescerWorker eventually
-        # classify the merged text. NO immediate ack here (mid-message
-        # acks read as the bot interrupting).
+        # Clarification fragment? Phase 3.9 (goal-driven) model: each
+        # MM event under a bot-asked question is one *fragment* of the
+        # current goal's outstanding answer — we append it; the
+        # coalescer will eventually invoke the planner with the
+        # merged text. NO immediate ack here (mid-message acks read
+        # as the bot interrupting).
         #
         # Two routing forms:
         #   * Thread-reply → match by ``asked_post_id``.
-        #   * Plain DM (no thread root) → FIFO oldest active question
-        #     for this channel + author.
-        if self._clarification is not None:
-            question = None
+        #   * Plain DM (no thread root) → most-recent active goal for
+        #     this channel + author.
+        if self._goals is not None:
+            goal = None
             if event.thread_root_id:
-                question = await self._clarification.find_question_by_thread(
+                goal = await self._goals.find_goal_by_thread(
                     event.thread_root_id,
                 )
-            if question is None:
-                question = await self._clarification.find_question_by_channel(
+            if goal is None:
+                goal = await self._goals.find_goal_by_channel(
                     mm_channel_id=event.channel_id,
                     mm_user_id=event.author_id,
                 )
-            if question is not None:
-                await self._handle_clarification_fragment(question, event)
+            if goal is not None:
+                await self._handle_goal_fragment(goal, event)
                 return
 
         # Below this point we only act on threaded replies (review thread routing).
@@ -433,50 +434,48 @@ class MmThreadListener:
         except Exception:
             logger.warning("MmThreadListener: add_reaction failed for post {}", event.id)
 
-    async def _handle_clarification_fragment(
-        self, question: object, event: ChatMessage,
+    async def _handle_goal_fragment(
+        self, goal: object, event: ChatMessage,
     ) -> None:
-        """Append the incoming MM event as a fragment of this Question.
+        """Append the incoming MM event as a fragment of this Goal.
 
-        This is the new Phase 3.8 contract: we DON'T classify here. The
-        AnswerCoalescerWorker is the one that calls the LLM after the
-        idle window has passed. Here we just persist + restart the
-        timer.
+        Phase 3.9 contract: we DON'T classify here. The
+        AnswerCoalescerWorker invokes the planner after the idle
+        window has passed. Here we just persist + restart the timer.
 
         Idempotency is ensured at two levels:
         * The bot's ✅-reaction acts as a fast no-op for replays.
-        * The DB has UNIQUE on ``mm_post_id`` so even without the
-          reaction, a duplicate WS-delivery collapses cleanly.
+        * ``goal_fragments.UNIQUE(goal_id, mm_post_id)`` makes a
+          duplicate WS-delivery a silent no-op.
         """
-        from virtual_dev.domain.models.clarification import (
-            Question as _Question,
+        from virtual_dev.domain.models.clarification_goal import (
+            ClarificationGoal as _Goal,
         )
 
-        assert self._clarification is not None
-        assert isinstance(question, _Question)
+        assert self._goals is not None
+        assert isinstance(goal, _Goal)
 
         # Fast path: skip if we already reacted on this exact post.
         fresh_post = await self._chat.get_post(event.id)
         if fresh_post is not None and _PROCESSED_REACTION in fresh_post.bot_reactions:
             logger.debug(
-                "MmThreadListener: clarification fragment {} already processed",
+                "MmThreadListener: goal fragment {} already processed",
                 event.id,
             )
             return
 
         try:
-            await self._clarification.append_fragment(question.id, event)
+            await self._goals.append_fragment(goal.id, event)
         except Exception:
             logger.exception(
-                "MmThreadListener: append_fragment crashed for question {}",
-                question.id,
+                "MmThreadListener: append_fragment crashed for goal {}",
+                goal.id,
             )
             return
         # No ✅-reaction here. Mid-message reactions look like the bot
-        # is interrupting ("yeah-yeah, got it") on every fragment.
-        # Reaction goes on the *last* fragment when the coalescer
-        # actually classifies the merged answer (see
-        # ClarificationOrchestrator._flush_one).
+        # is interrupting on every fragment. Reaction goes on the
+        # *last* fragment when the coalescer actually invokes the
+        # planner with the merged answer (see GoalOrchestrator._replan_after_reply).
 
     async def _run_iteration(
         self,

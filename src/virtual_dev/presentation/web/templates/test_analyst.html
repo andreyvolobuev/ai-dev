@@ -73,6 +73,20 @@
   .event-chat_post { border-color: #bc8cff; }
   .event-chat_reaction { border-color: #6e7681; }
   .event-orchestrator { border-color: #f97583; }
+  .event-question_dispatched { border-color: #ff7b72; background: #2d1d1d; }
+  .event-classification_applied { border-color: #79c0ff; background: #15243a; }
+  .stakeholder-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    background: #21262d;
+    border-radius: 10px;
+    font-size: 10px;
+    color: #79c0ff;
+    margin-left: 4px;
+  }
+  .stakeholder-unresolved { color: #f97583; }
+  .field-row { margin: 2px 0; font-size: 11px; }
+  .field-label { color: #8b949e; }
   .event-pre { white-space: pre-wrap; word-break: break-word; }
   .event-collapsed { max-height: 80px; overflow: hidden; position: relative; cursor: pointer; }
   .event-collapsed::after {
@@ -92,7 +106,9 @@
     max-width: 90%;
     white-space: pre-wrap;
   }
-  .chat-msg-bot { background: #1f2937; align-self: flex-start; }
+  .chat-msg-bot { background: #1f2937; align-self: flex-start; cursor: pointer; }
+  .chat-msg-bot:hover { background: #2a3949; }
+  .chat-msg-bot.selected { background: #2c4a6b; outline: 2px solid #58a6ff; }
   .chat-msg-user { background: #1e3a5f; align-self: flex-end; margin-left: auto; }
   .chat-meta { font-size: 10px; color: #8b949e; margin-bottom: 2px; }
   #chat-messages { display: flex; flex-direction: column; }
@@ -154,6 +170,17 @@
   <div class="panel">
     <div class="panel-header">Chat with bot (DM)</div>
     <div class="panel-body" id="chat-messages"></div>
+    <div style="padding: 6px 12px; border-top: 1px solid #30363d; background: #21262d;">
+      <div id="reply-target" style="font-size: 11px; color: #79c0ff; margin-bottom: 4px;">
+        click a bot message to choose which question you're answering
+      </div>
+      <label style="font-size:10px; color:#8b949e;">
+        speaking as
+        <input type="text" id="speaking-as" placeholder="(auto from selected question)"
+               style="width: 200px; margin-left: 6px;" />
+        <span style="margin-left: 6px; color:#6e7681;">— leave empty to use auto</span>
+      </label>
+    </div>
     <form id="chat-form" style="display:flex; gap:6px; padding: 8px 12px; border-top: 1px solid #30363d; background: #21262d;">
       <input type="text" id="chat-input" placeholder="Type a reply…" style="flex:1" />
       <button type="submit">Send</button>
@@ -171,11 +198,24 @@
   const chatPosts = new Map();
   // active question's thread_root_id (asked_post_id from the bot)
   let activeThreadRoot = null;
+  // post_id → {question_id, target_user_id, target_username, text}
+  // populated from question_dispatched events; used to auto-fill
+  // speaking_as and to render the "replying to" status.
+  const questionsByPostId = new Map();
 
   const $ = id => document.getElementById(id);
   const activity = $('activity');
   const chat = $('chat-messages');
   const wsStatus = $('ws-status');
+
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s)
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;');
+  }
 
   function setStatus(text, cls) {
     const el = $('status');
@@ -217,15 +257,55 @@
     } else if (ev.type === 'agent_finished') {
       wrap.innerHTML = `stop=<code>${p.stop_reason}</code> turns=${p.turns} tools=${p.tool_use_count} cost=$${(p.cost_usd||0).toFixed(4)}`;
     } else if (ev.type === 'chat_post') {
-      wrap.innerHTML = `${p.author} → <code>${p.channel_id}</code>${p.thread_root_id ? ' (thread)' : ''}`;
+      const target = p.target_user_id ? ` to <code>${p.target_user_id}</code>` : '';
+      wrap.innerHTML = `${p.author} → <code>${p.channel_id}</code>${p.thread_root_id ? ' (thread)' : ''}${target}`;
       const pre = document.createElement('pre');
       pre.className = 'event-pre';
       pre.textContent = p.text;
       wrap.appendChild(pre);
     } else if (ev.type === 'chat_reaction') {
       wrap.innerHTML = `react :${p.emoji}: on <code>${p.post_id}</code>`;
+    } else if (ev.type === 'question_dispatched') {
+      const sh = p.stakeholder || {};
+      const fb = p.unresolved_fallback ? ' <span class="stakeholder-badge stakeholder-unresolved">UNRESOLVED → fallback</span>' : '';
+      wrap.innerHTML = `
+        <div><strong>Q#${p.question_id}</strong> depth=${p.chain_depth}${p.parent_id ? ' parent=' + p.parent_id : ''}${fb}</div>
+        <div class="field-row"><span class="field-label">to:</span> <code>${escapeHtml(sh.display_name || sh.raw_hint || '(team-lead)')}</code> <span class="stakeholder-badge">${sh.kind}</span> resolved=<code>${sh.resolved_mm_user_id || '∅'}</code></div>
+        <div class="field-row"><span class="field-label">post_id:</span> <code>${p.asked_post_id}</code></div>
+        <div class="field-row"><span class="field-label">question:</span></div>
+      `;
+      const qpre = document.createElement('pre');
+      qpre.className = 'event-pre';
+      qpre.textContent = p.question_text || '';
+      wrap.appendChild(qpre);
+      if (p.why_it_matters) {
+        const why = document.createElement('div');
+        why.className = 'field-row';
+        why.innerHTML = `<span class="field-label">why_it_matters:</span> ${escapeHtml(p.why_it_matters)}`;
+        wrap.appendChild(why);
+      }
+    } else if (ev.type === 'classification_applied') {
+      const sh = p.stakeholder || {};
+      wrap.innerHTML = `
+        <div><strong>Q#${p.question_id}</strong> classified as <code>${p.classification}</code></div>
+        <div class="field-row"><span class="field-label">from:</span> <code>${escapeHtml(sh.display_name || sh.raw_hint || '(team-lead)')}</code></div>
+        <div class="field-row"><span class="field-label">reasoning:</span> ${escapeHtml(p.reasoning || '')}</div>
+      `;
+      wrap.appendChild(collapsible('coalesced_answer', p.coalesced_answer || ''));
+      wrap.appendChild(collapsible('extracted', JSON.stringify(p.extracted, null, 2)));
     } else if (ev.type === 'orchestrator') {
-      wrap.innerHTML = `<strong>${p.action || ''}</strong> ${p.detail || ''}`;
+      let extra = '';
+      if (p.action === 'plan_received') {
+        const oqs = (p.open_questions || []).map(q => `\n  • ${q.q} (ask: ${q.ask_whom || '∅'})`).join('');
+        extra = `\nstatus=${p.status} target=${p.target_repo || '∅'}` + (oqs ? '\nopen_questions:' + oqs : '');
+      }
+      wrap.innerHTML = `<strong>${p.action || ''}</strong> ${escapeHtml(p.detail || '')}`;
+      if (extra) {
+        const pre = document.createElement('pre');
+        pre.className = 'event-pre';
+        pre.textContent = extra;
+        wrap.appendChild(pre);
+      }
     } else {
       const pre = document.createElement('pre');
       pre.className = 'event-pre';
@@ -259,7 +339,13 @@
     const meta = document.createElement('div');
     meta.className = 'chat-meta';
     const tag = fromBot ? 'bot' : 'you';
-    meta.textContent = `${tag} · ${post.post_id}`;
+    let detail = '';
+    if (fromBot && post.target_user_id) {
+      detail = ` → ${post.target_user_id}`;
+    } else if (!fromBot && post.author_id) {
+      detail = ` (as ${post.author_id})`;
+    }
+    meta.textContent = `${tag}${detail} · ${post.post_id}`;
     div.appendChild(meta);
     const body = document.createElement('div');
     body.textContent = post.text;
@@ -273,9 +359,31 @@
     chat.scrollTop = chat.scrollHeight;
     chatPosts.set(post.post_id, { el: div, reactions });
     if (fromBot && post.thread_root_id == null && post.text) {
-      // Bot just opened a question — track the thread root so user
-      // replies attach to it.
-      activeThreadRoot = post.post_id;
+      // Bot just opened a top-level question — track the thread root
+      // so user replies attach to it. Default-select the latest one,
+      // but click on any earlier bot message to switch.
+      selectReplyTarget(post.post_id);
+      // Click a bot message → make THAT the active reply target.
+      div.addEventListener('click', () => {
+        selectReplyTarget(post.post_id);
+      });
+    }
+  }
+
+  function selectReplyTarget(postId) {
+    activeThreadRoot = postId;
+    // Visual: highlight the selected bot message.
+    document.querySelectorAll('.chat-msg-bot').forEach(el => el.classList.remove('selected'));
+    const item = chatPosts.get(postId);
+    if (item) item.el.classList.add('selected');
+    // Status line under "speaking as".
+    const q = questionsByPostId.get(postId);
+    const status = $('reply-target');
+    if (q) {
+      const username = (q.target_username || q.target_user_id || '').replace(/^uid-/, '');
+      status.textContent = `↪ replying to Q#${q.question_id} (sent to @${username || '?'})`;
+    } else {
+      status.textContent = `↪ replying under post ${postId}`;
     }
   }
 
@@ -316,6 +424,23 @@
         setStatus('done · ' + (ev.payload.detail || ''), 'status-done');
       } else if (ev.type === 'orchestrator' && ev.payload.action === 'task_failed') {
         setStatus('error · ' + (ev.payload.detail || ''), 'status-error');
+      } else if (ev.type === 'question_dispatched') {
+        // Cache so reply-as can derive automatically when the user
+        // selects a bot message in the chat.
+        const p = ev.payload;
+        if (p.asked_post_id) {
+          questionsByPostId.set(p.asked_post_id, {
+            question_id: p.question_id,
+            target_user_id: p.target_user_id,
+            target_username: (p.target_user_id || '').replace(/^uid-/, ''),
+            text: p.question_text,
+          });
+          // If this is the active selection (default = latest), refresh
+          // the status line so it reflects the new question.
+          if (activeThreadRoot === p.asked_post_id) {
+            selectReplyTarget(p.asked_post_id);
+          }
+        }
       }
     };
   }
@@ -332,7 +457,9 @@
     activity.innerHTML = '';
     chat.innerHTML = '';
     chatPosts.clear();
+    questionsByPostId.clear();
     activeThreadRoot = null;
+    $('reply-target').textContent = 'click a bot message to choose which question you\'re answering';
     eventCount = 0;
     $('event-count').textContent = '0 events';
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -349,7 +476,9 @@
     activity.innerHTML = '';
     chat.innerHTML = '';
     chatPosts.clear();
+    questionsByPostId.clear();
     activeThreadRoot = null;
+    $('reply-target').textContent = 'click a bot message to choose which question you\'re answering';
     eventCount = 0;
     $('event-count').textContent = '0 events';
     setStatus('reset', '');
@@ -360,8 +489,24 @@
     const input = $('chat-input');
     const text = input.value.trim();
     if (!text) return;
+    // Resolution order for "who is speaking":
+    //   1. Explicit speaking-as input (user-typed username, e.g. v.kura).
+    //   2. Auto from the selected question's target_user_id.
+    //   3. None → backend defaults to test-user (team-lead).
+    let speakingAs = ($('speaking-as').value || '').trim() || null;
+    if (!speakingAs && activeThreadRoot) {
+      const q = questionsByPostId.get(activeThreadRoot);
+      if (q && q.target_username) {
+        speakingAs = q.target_username;
+      }
+    }
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'chat', text, thread_root_id: activeThreadRoot }));
+      ws.send(JSON.stringify({
+        type: 'chat',
+        text,
+        thread_root_id: activeThreadRoot,
+        speaking_as: speakingAs,
+      }));
       input.value = '';
     }
   };

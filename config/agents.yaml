@@ -75,23 +75,14 @@ agents:
   devops:
     model: default
 
-  # Phase 3.8 — clarification subsystem agents.
-  # answer_classifier: классификатор ответов от стейкхолдеров.
-  # Лёгкая задача (структурированный enum + извлечение полей) → Haiku.
-  answer_classifier:
-    model: lightweight
-
-  # counter_answerer: бот сам отвечает на factual counter-questions
-  # (читает Issue + код), для business-counter — эскалирует.
-  # Sonnet потому что нужны Read/Glob/Grep + понимание кода.
-  counter_answerer:
+  # Phase 3.9 — goal-driven clarification.
+  # Один агент-планировщик решает каждый шаг: задать вопрос
+  # (с заново сформулированным текстом), достичь цели, эскалировать,
+  # сдаться, подождать. Имеет Read/Grep + Researcher MCP +
+  # lookup_mm_user — для self-research до DM-инга людей.
+  clarification_planner:
     model: default
     max_iterations_per_task: 20
-
-  # stakeholder_resolver: получает свободно-формное имя ("Вася Курочкин")
-  # + список MM-кандидатов и выбирает совпадение, или говорит "не знаю".
-  stakeholder_resolver:
-    model: lightweight
 
 # Ревью-политика.
 review_policy:
@@ -109,17 +100,21 @@ pipeline_policy:
 escalation:
   mattermost_user: ""  # твой MM-хендл — переопредели в config/local.yaml (gitignored)
 
-# Параметры цикла уточнений (Phase 3.8).
-# coalesce_window_seconds: сколько ждать «тишины» перед классификацией ответа.
-#   Если человек пишет в 5 сообщений с паузами — мы не дёргаем LLM на каждом.
-# max_chain_depth: a→b→c→d (depth=3); пятый редирект → эскалация.
-# max_question_age_hours: timeout per Question (deadline_sweep тика coalescer'а).
-# max_subquestions_per_root: страховка от runaway-дерева.
-# counter_question_confidence_threshold: ниже этого — fallback на эскалацию автору.
+# Параметры цикла уточнений (Phase 3.9, goal-driven).
+# coalesce_window_seconds: сколько ждать «тишины» перед вызовом
+#   планировщика на собранных фрагментах ответа. Человек пишет
+#   несколько сообщений подряд — мы дёргаем LLM один раз, не на каждом.
+# max_planner_calls_per_goal: circuit breaker — после N вызовов
+#   планировщика без успеха цели мы её эскалируем.
+# max_goal_age_hours: hard deadline (overrides всё остальное).
+# send_retry_max: сколько раз ретраить DM, который Communicator
+#   отказался отправлять (rate-limit / нерабочее время).
+# replanning_stuck_after_minutes: если goal сидит в REPLANNING дольше
+#   — sweep'ер реверсит обратно в READY_TO_REPLAN (планировщик упал).
 clarification:
   coalesce_window_seconds: 600
   poll_interval_seconds: 60
-  max_chain_depth: 4
-  max_question_age_hours: 48
-  max_subquestions_per_root: 10
-  counter_question_confidence_threshold: 0.6
+  max_planner_calls_per_goal: 8
+  max_goal_age_hours: 48
+  send_retry_max: 5
+  replanning_stuck_after_minutes: 10

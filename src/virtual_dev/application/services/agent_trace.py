@@ -15,6 +15,7 @@ emitting, so the cost is zero when unused.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -42,15 +43,29 @@ class AgentTraceEvent:
 
 
 class AgentTrace:
-    """Fan-out broadcaster. Each subscriber gets an independent queue."""
+    """Fan-out broadcaster + ring-buffer of recent events.
 
-    def __init__(self, *, queue_size: int = 1000) -> None:
+    A new subscriber receives the last ``history_size`` events first
+    (so refreshing the test-analyst page doesn't lose the activity
+    feed) and then keeps streaming live. ``clear()`` wipes the
+    history — use it when "reset" is hit on the UI so the next page
+    load starts fresh.
+    """
+
+    def __init__(
+        self,
+        *,
+        queue_size: int = 1000,
+        history_size: int = 500,
+    ) -> None:
         self._subscribers: list[asyncio.Queue[AgentTraceEvent]] = []
         self._queue_size = queue_size
+        self._history: deque[AgentTraceEvent] = deque(maxlen=history_size)
 
     async def emit(self, event: AgentTraceEvent) -> None:
-        """Push to every subscriber. Drop if any queue is full (slow
-        subscriber's problem, not ours)."""
+        """Push to every subscriber (and append to history). Drop if
+        any subscriber queue is full (slow subscriber's problem)."""
+        self._history.append(event)
         for queue in list(self._subscribers):
             try:
                 queue.put_nowait(event)
@@ -60,9 +75,21 @@ class AgentTrace:
                     event.type,
                 )
 
+    def clear(self) -> None:
+        """Wipe history. Live subscribers keep their queue contents."""
+        self._history.clear()
+
     def subscribe(self) -> AsyncIterator[AgentTraceEvent]:
-        """Return an iterator yielding every future event until cancelled."""
+        """Yield history first, then every future event until cancelled."""
         queue: asyncio.Queue[AgentTraceEvent] = asyncio.Queue(maxsize=self._queue_size)
+        # Front-load history before any new emit can land. We don't
+        # bother growing the queue — history_size <= queue_size is the
+        # invariant we keep at construction time.
+        for past in list(self._history):
+            try:
+                queue.put_nowait(past)
+            except asyncio.QueueFull:
+                break
         self._subscribers.append(queue)
 
         async def _iter() -> AsyncIterator[AgentTraceEvent]:
@@ -79,6 +106,10 @@ class AgentTrace:
     @property
     def subscriber_count(self) -> int:
         return len(self._subscribers)
+
+    @property
+    def history_count(self) -> int:
+        return len(self._history)
 
 
 # Convenience helpers — agents/services use these and pass `None` to

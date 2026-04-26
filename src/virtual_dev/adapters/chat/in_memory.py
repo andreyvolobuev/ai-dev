@@ -90,17 +90,16 @@ class InMemoryChat(ChatPort):
         return msg
 
     async def find_user_by_email(self, email: str) -> ChatUser | None:
-        # Always resolve to "the operator" — we only have one human in
-        # the test UI. Lets the StakeholderResolver succeed for any
-        # email-shaped ask_whom.
-        return ChatUser(id=self._user_id, username=self._user_name, email=email)
+        # Each email maps to its own synthetic user. Critical for the
+        # orchestrator's cycle detection: if everyone resolves to the
+        # same id, every redirect looks like a cycle. The UI side
+        # picks "speaking as <handle>" so the operator can play
+        # multiple roles in one session.
+        local = email.split("@", 1)[0] or "user"
+        return ChatUser(id=f"uid-{local}", username=local, email=email)
 
     async def find_user_by_username(self, username: str) -> ChatUser | None:
-        # Resolve everything that looks like a real handle to the UI's
-        # only human. The clarifier logic still works (DM goes to
-        # dm-test-user), and we get a much smoother "I always end up
-        # asking the operator" experience while debugging.
-        return ChatUser(id=self._user_id, username=self._user_name)
+        return ChatUser(id=f"uid-{username}", username=username)
 
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
         self._reactions.setdefault(post_id, []).append(emoji_name)
@@ -148,19 +147,29 @@ class InMemoryChat(ChatPort):
         self,
         text: str,
         *,
+        author_username: str | None = None,
         channel_id: str | None = None,
         thread_root_id: str | None = None,
     ) -> ChatMessage:
         """Inject a message FROM the operator into the chat.
 
-        The UI calls this when the test-user types a reply. It lands on
-        the WS inbox just like a real Mattermost ``posted`` event.
+        ``author_username`` lets the UI play multiple roles in one
+        session: when the bot DMs ``v.kura`` (after a redirect), the
+        operator switches "speaking as" to ``v.kura`` and the reply
+        is attributed to ``uid-v.kura`` and lands in
+        ``dm-uid-v.kura`` — exactly where the bot is waiting.
         """
         self._counter += 1
+        if author_username:
+            author_id = f"uid-{author_username}"
+            default_channel = f"dm-{author_id}"
+        else:
+            author_id = self._user_id
+            default_channel = f"dm-{self._user_id}"
         msg = ChatMessage(
             id=f"user-{self._counter}-{uuid.uuid4().hex[:8]}",
-            channel_id=channel_id or f"dm-{self._user_id}",
-            author_id=self._user_id,
+            channel_id=channel_id or default_channel,
+            author_id=author_id,
             text=text,
             timestamp=datetime.now(timezone.utc),
             thread_root_id=thread_root_id,
@@ -174,6 +183,7 @@ class InMemoryChat(ChatPort):
             payload={
                 "post_id": msg.id,
                 "author": "user",
+                "author_id": author_id,
                 "channel_id": msg.channel_id,
                 "thread_root_id": msg.thread_root_id,
                 "text": msg.text,

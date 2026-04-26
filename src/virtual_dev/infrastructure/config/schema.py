@@ -123,20 +123,11 @@ class MmTemplatesCfg(_StrictModel):
     # Used when the review feedback came in a GitLab MR comment instead
     # of a Mattermost thread — bot answers in the same medium.
     gitlab_reply_iteration_done: str = ""
-    # Clarification flow (Analyst → DM → answer → re-plan). The first is
-    # the question DM body itself; the others are sent as thread replies
-    # under the question DM when the user answers. All can use
-    # str.format placeholders documented in config/notifications.yaml.
-    clarifier_question: str = ""
-    clarifier_answer_ack: str = ""
-    clarifier_all_answered_ack: str = ""
-    # Phase 3.8 — tree-aware clarification templates.
-    clarifier_redirect_ack: str = ""           # "Спасибо, перенаправил на @{handle}"
-    clarifier_handle_request: str = ""         # "Подскажи MM-ник {raw_name}?"
-    clarifier_counter_factual_intro: str = ""  # bot's self-answer to a factual counter-Q
-    clarifier_out_of_scope_ack: str = ""       # OUT_OF_SCOPE acknowledgement
-    clarifier_escalation_to_lead: str = ""     # DM to team-lead with the chain
-    clarifier_dont_know_ack: str = ""          # DONT_KNOW acknowledgement to respondent
+    # Phase 3.9 — goal-driven clarification. Planner composes the
+    # bodies of all DMs itself, so the only template still kept here
+    # is the lead-escalation DM (which has structured placeholders the
+    # operator may want to customise).
+    clarifier_escalation_to_lead: str = ""
 
 
 class JiraTemplatesCfg(_StrictModel):
@@ -165,20 +156,31 @@ class NotificationsCfg(_StrictModel):
 
 
 class ClarificationCfg(_StrictModel):
-    """Tunables for the clarification subsystem (Phase 3.8).
+    """Tunables for the goal-driven clarification subsystem (Phase 3.9).
 
-    All durations are in seconds except ``max_question_age_hours``.
+    All durations are in seconds except ``max_goal_age_hours``.
     Defaults are conservative — long enough that someone in a meeting
     won't time-out, short enough that stuck Issues escalate within a
     working day.
     """
 
-    coalesce_window_seconds: int = 600              # idle before flushing fragments to LLM
+    coalesce_window_seconds: int = 600              # idle before invoking planner on collected fragments
     poll_interval_seconds: int = 60                 # how often the worker ticks
-    max_chain_depth: int = 4                        # redirect-chain depth guard
-    max_question_age_hours: int = 48                # per-Question timeout
-    max_subquestions_per_root: int = 10             # tree-size guard
-    counter_question_confidence_threshold: float = 0.6   # FACTUAL→bot vs fallback
+    max_goal_age_hours: int = 48                    # per-Goal hard deadline (overrides anything else)
+
+    # Planner circuit breaker: how many decisions per goal before we
+    # forcibly escalate to lead. Prevents runaway loops.
+    max_planner_calls_per_goal: int = 8
+
+    # SEND_PENDING retry: how many times to retry a DM that
+    # Communicator refused (rate-limited / outside working hours)
+    # before giving up the goal.
+    send_retry_max: int = 5
+
+    # REPLANNING soft-lock recovery: if a goal sat in REPLANNING longer
+    # than this without progress, assume the planner crashed and
+    # revert to READY_TO_REPLAN for retry.
+    replanning_stuck_after_minutes: int = 10
 
 
 class AgentsCfg(_StrictModel):

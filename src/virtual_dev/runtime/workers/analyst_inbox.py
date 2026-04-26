@@ -22,7 +22,7 @@ from virtual_dev.application.agents.orchestrator import (
     TOPIC_PLAN_READY,
     dev_agent_key,
 )
-from virtual_dev.application.services.clarification import ClarificationOrchestrator
+from virtual_dev.application.services.clarification import GoalOrchestrator
 from virtual_dev.domain.models.plan import Plan, PlanStatus
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
@@ -93,7 +93,7 @@ class AnalystInbox:
         message_bus: MessageBusPort | None = None,
         post_to_tracker: bool = True,
         dev_specialisation: str = "backend",
-        clarification_orchestrator: ClarificationOrchestrator | None = None,
+        goal_orchestrator: GoalOrchestrator | None = None,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self._analyst = analyst
@@ -102,7 +102,7 @@ class AnalystInbox:
         self._message_bus = message_bus
         self._post_to_tracker = post_to_tracker
         self._dev_specialisation = dev_specialisation
-        self._clarification = clarification_orchestrator
+        self._goals = goal_orchestrator
         self._session_factory = session_factory
 
     async def handle(self, message: AgentMessage) -> None:
@@ -148,14 +148,15 @@ class AnalystInbox:
                     "AnalystInbox: failed to comment plan on {}", external_id,
                 )
 
-        # CLARIFYING plan with open questions → spawn root Questions in
-        # the clarification subsystem. The Dev-agent does NOT get
-        # ``plan.ready`` until the human answers come back and the
-        # Analyst re-plans (Phase 3.8 contract).
+        # CLARIFYING plan with open questions → spawn one
+        # ClarificationGoal per question. Phase 3.9 (goal-driven): the
+        # planner agent decides each next step (ask, achieve, escalate,
+        # abandon, wait). Dev-agent does NOT get ``plan.ready`` until
+        # human answers come back and Analyst re-plans.
         if (
             plan.status == PlanStatus.CLARIFYING
             and plan.open_questions
-            and self._clarification is not None
+            and self._goals is not None
             and self._session_factory is not None
         ):
             task_row, plan_row_id = await self._load_task_and_plan_id(
@@ -163,12 +164,12 @@ class AnalystInbox:
             )
             if task_row is not None and plan_row_id is not None:
                 try:
-                    await self._clarification.request_clarifications(
+                    await self._goals.request_clarifications(
                         task_row=task_row, plan=plan, plan_row_id=plan_row_id,
                     )
                 except Exception:
                     logger.exception(
-                        "AnalystInbox: clarification dispatch failed for {}",
+                        "AnalystInbox: goal dispatch failed for {}",
                         external_id,
                     )
             return

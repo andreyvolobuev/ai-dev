@@ -86,18 +86,32 @@ The bot knows a person only when one of these is true:
 If the ticket only gives a free-form **name** with no handle ("спросить
 у Васи Курочкина", "уточнить у Лены"), the bot will not know who that
 is in Mattermost. In that case **don't put the free-form name in
-`ask_whom`** — it'll fall through to the team-lead silently. Instead:
+`ask_whom`** — the bot can't DM Mattermost-handle-less people.
 
-* Set `ask_whom` to the **ticket reporter** — they wrote the
-  reference, they know who Вася is.
-* Phrase the question as a **two-step ask**: first who, then what.
-  Example: «В тикете упомянут Вася Курочкин — подскажи, пожалуйста,
-  его MM-ник или email, чтобы я мог уточнить у него {original
-  question text}.»
+What to do instead:
 
-If you genuinely don't know who to ask (no name in the ticket, no
-obvious owner from `git blame` / repo structure), leave `ask_whom`
-empty — the bot will route to the team-lead.
+* Default: set `ask_whom` to the **ticket reporter's username or
+  email** (whatever the task tracker gives you for the reporter).
+  They wrote the reference, they know who Вася is. Phrase the
+  question as a **two-step ask**: first identify, then ask the
+  real thing. Example:
+
+  > «В тикете упомянут Вася Курочкин — подскажи, пожалуйста, его
+  > MM-ник или email, чтобы я мог уточнить у него ⟨the actual
+  > thing you wanted to ask Vasya⟩.»
+
+  The bot then resolves the ticket reporter to MM, DMs them, and
+  when they reply with the handle the orchestrator spawns a
+  follow-up question to the actual person.
+
+* Fallback: if no obvious reporter (e.g. system-generated ticket)
+  and you genuinely don't know who to ask, leave `ask_whom`
+  empty / null — the bot routes to the team-lead.
+
+**Do not** put a guessed handle (`vasya.kurochkin` from
+transliteration) in `ask_whom` — the bot doesn't know if that user
+exists, and a wrong DM is worse than asking the reporter "who is
+this?".
 
 When `status: clarifying`, the bot DMs each `ask_whom` and waits for
 answers before letting the Dev-agent touch the repo. So it is *strictly

@@ -7,13 +7,13 @@ the FastAPI lifespan.
 
 from __future__ import annotations
 
-from virtual_dev.application.services.clarification import ClarificationOrchestrator
+from virtual_dev.application.services.clarification import GoalOrchestrator
 from virtual_dev.runtime.workers.poller import PollerWorker
 
 
 def make_answer_coalescer_worker(
     *,
-    orchestrator: ClarificationOrchestrator,
+    orchestrator: GoalOrchestrator,
     interval_seconds: int,
 ) -> PollerWorker:
     """Build a :class:`PollerWorker` that ticks the orchestrator's

@@ -48,33 +48,34 @@
     {% endif %}
 
     {% if questions %}
-        <h3>Уточнения (Q-tree)</h3>
-        <ul style="list-style:none; padding-left:0;">
-            {% for q in questions %}
-                {% set row = q.row %}
-                {% set ans = q.answer %}
-                <li style="padding:0.4rem 0; padding-left:{{ q.indent * 1.5 }}rem; border-left:2px solid #eee;">
-                    <span class="status status-{{ row.state }}">{{ row.state }}</span>
-                    {% if row.chain_depth %}<small>↳ depth {{ row.chain_depth }}</small>{% endif %}
-                    <strong>{{ row.text | truncate(180) }}</strong>
-                    <br><small>
-                        к: {{ row.stakeholder_display_name or row.stakeholder_raw_hint or "—" }}
-                        ({{ row.stakeholder_kind }})
-                        {% if row.asked_at %}· asked {{ row.asked_at.strftime("%Y-%m-%d %H:%M") }}{% endif %}
-                        {% if row.deadline_at %}· deadline {{ row.deadline_at.strftime("%Y-%m-%d %H:%M") }}{% endif %}
-                    </small>
-                    {% if row.why_it_matters %}
-                        <br><small><em>{{ row.why_it_matters }}</em></small>
-                    {% endif %}
-                    {% if ans %}
-                        <br><small>
-                            <strong>A ({{ ans.classification }}):</strong>
-                            {{ ans.coalesced_text | truncate(300) }}
-                        </small>
-                    {% endif %}
-                </li>
-            {% endfor %}
-        </ul>
+        <h3>Уточнения (goals + steps)</h3>
+        {% for q in questions %}
+            {% set goal = q.row %}
+            {% set steps = q.steps %}
+            <section style="border:1px solid #e5e5e5; border-radius:4px; padding:0.75rem; margin-bottom:1rem;">
+                <p>
+                    <span class="status status-{{ goal.state }}">{{ goal.state }}</span>
+                    · planner_calls: {{ goal.planner_calls_count }}
+                    {% if goal.deadline_at %}· deadline: {{ goal.deadline_at.strftime("%Y-%m-%d %H:%M") }}{% endif %}
+                </p>
+                <p><strong>{{ goal.description }}</strong></p>
+                {% if goal.why_it_matters %}<p><small><em>{{ goal.why_it_matters }}</em></small></p>{% endif %}
+                {% if goal.final_answer %}
+                    <p><small><strong>final_answer:</strong> {{ goal.final_answer | truncate(400) }}</small></p>
+                {% endif %}
+                {% if steps %}
+                    <ol style="font-size: 0.85rem; padding-left: 1.5rem;">
+                        {% for s in steps %}
+                            <li>
+                                <strong>{{ s.kind }}</strong>
+                                {% if s.target_username %}→ @{{ s.target_username }}{% elif s.target_user_id %}→ {{ s.target_user_id }}{% endif %}
+                                {% if s.text %}<br><small>{{ s.text | truncate(300) }}</small>{% endif %}
+                            </li>
+                        {% endfor %}
+                    </ol>
+                {% endif %}
+            </section>
+        {% endfor %}
     {% endif %}
 
     <h3>Планы</h3>

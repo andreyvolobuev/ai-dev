@@ -1,25 +1,17 @@
-"""Clarification subsystem (Phase 3.8).
+"""Goal-driven clarification subsystem (Phase 3.9).
 
-ISSUE → QUESTION (with STAKEHOLDER + REASONING) → ANSWER. Multi-fragment
-DM replies are coalesced after a silence window, classified by an LLM,
-and either close the question or spawn a child (REDIRECT,
-COUNTER_QUESTION, ASKING_FOR_STAKEHOLDER).
+ISSUE → ClarificationGoal (description + why_it_matters) → planner-LLM
+chooses one next step on each tick → step recorded in append-only
+history → repeat until ACHIEVED / ESCALATED / ABANDONED.
 
-The orchestrator owns the state machine; the repo is the only thing
-that touches DB rows; the coalescer / classifier / counter-answerer
-are stateless services driven by orchestrator ticks.
+Replaces the Q-tree (Phase 3.8) which copied parent-question text on
+redirect — that lost the goal. Goal-driven keeps the goal central, the
+planner re-composes the question for each new recipient.
 """
 
-from virtual_dev.application.services.clarification.orchestrator import (
-    ClarificationOrchestrator,
+from virtual_dev.application.services.clarification.goal_orchestrator import (
+    GoalOrchestrator,
 )
-from virtual_dev.application.services.clarification.repo import QuestionRepository
-from virtual_dev.application.services.clarification.stakeholder_resolver import (
-    StakeholderResolver,
-)
+from virtual_dev.application.services.clarification.goal_repo import GoalRepository
 
-__all__ = [
-    "ClarificationOrchestrator",
-    "QuestionRepository",
-    "StakeholderResolver",
-]
+__all__ = ["GoalOrchestrator", "GoalRepository"]

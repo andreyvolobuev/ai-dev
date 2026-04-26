@@ -35,8 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from virtual_dev.adapters.chat.in_memory import InMemoryChat
 from virtual_dev.adapters.code_agent import ClaudeAgentSdkCodeAgent
 from virtual_dev.application.agents import AnalystAgent
-from virtual_dev.application.agents.answer_classifier import AnswerClassifier
-from virtual_dev.application.agents.counter_answerer import CounterQuestionAnswerer
+from virtual_dev.application.agents.clarification_planner import ClarificationPlanner
 from virtual_dev.application.services import (
     CommunicatorService,
     InjectionFilter,
@@ -48,9 +47,8 @@ from virtual_dev.application.services.agent_trace import (
     AgentTraceEvent,
 )
 from virtual_dev.application.services.clarification import (
-    ClarificationOrchestrator,
-    QuestionRepository,
-    StakeholderResolver,
+    GoalOrchestrator,
+    GoalRepository,
 )
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
@@ -86,7 +84,7 @@ class TestAnalystState:
         trace: AgentTrace,
         chat: InMemoryChat,
         analyst: AnalystAgent,
-        clarification: ClarificationOrchestrator,
+        goal_orchestrator: GoalOrchestrator,
     ) -> None:
         self.engine = engine
         self.session_factory = session_factory
@@ -95,12 +93,20 @@ class TestAnalystState:
         self.trace = trace
         self.chat = chat
         self.analyst = analyst
-        self.clarification = clarification
+        self.goal_orchestrator = goal_orchestrator
 
 
-async def _build_state(config_dir: str | Path = "config") -> TestAnalystState:
+async def _build_state(
+    config_dir: str | Path = "config",
+    *,
+    coalesce_window_seconds: int = 30,
+) -> TestAnalystState:
     settings = Settings()
     config = load_config(config_dir)
+    # Tighter idle window for the test UI (default 30s instead of the
+    # production 10 min) — when iterating on the analyst manually we
+    # don't want to wait that long after each reply.
+    config.agents.clarification.coalesce_window_seconds = coalesce_window_seconds
 
     engine = make_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
@@ -139,35 +145,23 @@ async def _build_state(config_dir: str | Path = "config") -> TestAnalystState:
         prompts_loader=prompts_loader,
     )
 
-    classifier = AnswerClassifier(
+    planner = ClarificationPlanner(
         code_agent=code_agent,
         config=config,
         prompts_loader=prompts_loader,
-        injection_filter=injection_filter,
-    )
-    counter_answerer = CounterQuestionAnswerer(
-        code_agent=code_agent,
-        config=config,
-        prompts_loader=prompts_loader,
+        communicator=communicator,
         researcher=researcher,
         injection_filter=injection_filter,
+        trace=trace,
     )
-    stakeholder_resolver = StakeholderResolver(
+    goal_orchestrator = GoalOrchestrator(
+        repo=GoalRepository(session_factory),
         communicator=communicator,
-        code_agent=code_agent,
-        config=config,
-        prompts_loader=prompts_loader,
-        injection_filter=injection_filter,
-    )
-    clarification = ClarificationOrchestrator(
-        repo=QuestionRepository(session_factory),
-        communicator=communicator,
-        classifier=classifier,
-        counter_answerer=counter_answerer,
-        stakeholder_resolver=stakeholder_resolver,
+        planner=planner,
         config=config,
         session_factory=session_factory,
         message_bus=None,
+        trace=trace,
     )
 
     return TestAnalystState(
@@ -178,18 +172,24 @@ async def _build_state(config_dir: str | Path = "config") -> TestAnalystState:
         trace=trace,
         chat=chat,
         analyst=analyst,
-        clarification=clarification,
+        goal_orchestrator=goal_orchestrator,
     )
 
 
-def build_test_analyst_app(config_dir: str | Path = "config") -> FastAPI:
+def build_test_analyst_app(
+    config_dir: str | Path = "config",
+    *,
+    coalesce_window_seconds: int = 30,
+) -> FastAPI:
     """Construct the FastAPI app. State is built inside lifespan."""
 
     templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        state = await _build_state(config_dir)
+        state = await _build_state(
+            config_dir, coalesce_window_seconds=coalesce_window_seconds,
+        )
         app.state.test_state = state
 
         # Coalescer worker — same as in the prod web app, but fast cycles
@@ -198,7 +198,7 @@ def build_test_analyst_app(config_dir: str | Path = "config") -> FastAPI:
         # live app, but the operator can edit clarification.coalesce_window
         # in agents.yaml.
         coalescer = make_answer_coalescer_worker(
-            orchestrator=state.clarification,
+            orchestrator=state.goal_orchestrator,
             interval_seconds=10,
         )
         coalescer_task = asyncio.create_task(coalescer.run_forever(), name="coalescer")
@@ -247,6 +247,7 @@ def build_test_analyst_app(config_dir: str | Path = "config") -> FastAPI:
                     await state.chat.post_user_message(
                         text=str(raw.get("text") or ""),
                         thread_root_id=raw.get("thread_root_id"),
+                        author_username=(raw.get("speaking_as") or None),
                     )
                 elif kind == "reset":
                     await _reset_state(state)
@@ -396,14 +397,14 @@ async def _kick_clarifications(
         ))
         return
 
-    sent = await state.clarification.request_clarifications(
+    sent = await state.goal_orchestrator.request_clarifications(
         task_row=task_row, plan=plan, plan_row_id=plan_row.id,  # type: ignore[arg-type]
     )
     await state.trace.emit(AgentTraceEvent(
         type="orchestrator", agent_key="test-runner",
         payload={
-            "action": "clarifications_dispatched",
-            "detail": f"{sent} DM(s) sent",
+            "action": "goals_created",
+            "detail": f"{sent} goal(s) spawned; planner running for each",
         },
     ))
 
@@ -429,17 +430,17 @@ async def _drive_chat_inbox(state: TestAnalystState) -> None:
 
 
 async def _route_user_event(state: TestAnalystState, event: ChatMessage) -> None:
-    question = None
+    goal = None
     if event.thread_root_id:
-        question = await state.clarification.find_question_by_thread(
+        goal = await state.goal_orchestrator.find_goal_by_thread(
             event.thread_root_id,
         )
-    if question is None:
-        question = await state.clarification.find_question_by_channel(
+    if goal is None:
+        goal = await state.goal_orchestrator.find_goal_by_channel(
             mm_channel_id=event.channel_id,
             mm_user_id=event.author_id,
         )
-    if question is None:
+    if goal is None:
         await state.trace.emit(AgentTraceEvent(
             type="orchestrator", agent_key="test-runner",
             payload={
@@ -449,7 +450,7 @@ async def _route_user_event(state: TestAnalystState, event: ChatMessage) -> None
             },
         ))
         return
-    await state.clarification.append_fragment(question.id, event)
+    await state.goal_orchestrator.append_fragment(goal.id, event)
 
 
 async def _reset_state(state: TestAnalystState) -> None:
@@ -463,26 +464,30 @@ async def _reset_state(state: TestAnalystState) -> None:
 
     from virtual_dev.infrastructure.db import (
         AgentMessageRow,
+        GoalFragmentRow,
+        GoalRow,
+        GoalStepRow,
         PlanRow,
-        QuestionAnswerRow,
-        QuestionFragmentRow,
-        QuestionRow,
         TaskRow,
     )
 
     async with session_scope(state.session_factory) as session:
         for cls in (
-            QuestionFragmentRow,
-            QuestionAnswerRow,
-            QuestionRow,
+            GoalFragmentRow,
+            GoalStepRow,
+            GoalRow,
             PlanRow,
             TaskRow,
             AgentMessageRow,
         ):
             await session.execute(delete(cls))
+    # Wipe trace history so the next page load doesn't replay old
+    # events. The reset event itself stays — it's the new "first
+    # entry" so it's clear what happened.
+    state.trace.clear()
     await state.trace.emit(AgentTraceEvent(
         type="orchestrator", agent_key="test-runner",
-        payload={"action": "reset", "detail": "DB wiped"},
+        payload={"action": "reset", "detail": "DB + trace history wiped"},
     ))
 
 
