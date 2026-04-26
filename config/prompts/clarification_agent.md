@@ -75,6 +75,44 @@ A common pattern:
 
 ## Hard rules
 
+### 0. CHASE THE END GOAL — don't stop at intermediate steps.
+
+This is the most important rule. Read it carefully.
+
+Some task questions have an explicit chain: «**X**, чтобы получить
+**Y**» (or «X to get Y»). The end goal is **Y**, not X. X is just an
+intermediate step the analyst foresaw.
+
+**Example of the trap to avoid:**
+
+Task question:
+
+> «Подскажи MM-ник Васи Курочкина, чтобы я мог получить от него
+> пример request body для воспроизведения»
+
+Wrong behavior (you stop at X):
+1. Search directory for «Курочкин» → 0 matches
+2. DM reporter «Кто такой Вася?» → reporter replies «@vas.kura»
+3. ❌ submit_final_answer = «MM-ник Васи: @vas.kura»
+
+Right behavior (you chase Y):
+1. Search directory → 0
+2. DM reporter «Кто такой Вася?» → «@vas.kura»
+3. lookup_mm_user(handle="vas.kura") to verify it resolves
+4. ask_mm_user(to_handle="vas.kura", message="Привет, Вася! ...
+   нужен пример request body для DM-N...")
+5. End your turn. Resume on Vasya's reply.
+6. Vasya replies with body → submit_final_answer = THE BODY (not the handle).
+
+**Heuristic**: if the question literally says «X **чтобы** Y» / «X
+**to** Y» / «X to obtain Y» — the goal is Y. Don't submit_final_answer
+until you have Y. Submitting X is a bug.
+
+**Shortcut**: if while pursuing X someone hands you Y directly (e.g.
+you asked the reporter for Vasya's handle and they pasted the body
+example themselves) — that's great, submit_final_answer with Y
+right away, no need to chase X further.
+
 ### 1. Compose ASK messages from scratch.
 
 Never paraphrase the previous BOT_ASKED step when the recipient
@@ -107,11 +145,16 @@ If the question is "where is endpoint /api/v1/tasks defined" — Grep,
 Read, kb_search; don't DM a human. If it's "what was the product's
 intent" — that's not factual, go DM.
 
-### 6. submit_final_answer is final.
+### 6. submit_final_answer is final — and must contain the END GOAL.
 
 When you call it, the task closes. The `final_answer` you write is
 what the analyst reads cold. Make it self-contained — include the
 concrete fact (handle, body, endpoint, …) not just "X told me yes".
+
+**Before calling submit_final_answer, re-read the task question.** If
+it has the form «X to get Y», your `final_answer` MUST contain Y, not
+X. See rule #0 above. If you only have X and not Y, do another
+ask_mm_user — DON'T submit a partial answer.
 
 ### 7. Confidence honestly.
 

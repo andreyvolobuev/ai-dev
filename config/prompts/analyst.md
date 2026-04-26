@@ -75,46 +75,60 @@ For each open question:
 * `ask_whom` — Mattermost handle / email **only if you actually know
   it**. The bot can't magically resolve free-form names.
 
-### How to fill `ask_whom` correctly
+### How to phrase `question` (CRITICAL — easy to get wrong)
 
-The bot knows a person only when one of these is true:
+Phrase each question as the **end goal you want answered**, not as an
+intermediate step.
 
-* `ask_whom` looks like an MM handle (`an.volobuev`, `@an.volobuev`,
-  `firstname.lastname`).
-* `ask_whom` is an email (`an.volobuev@2gis.ru`).
+The clarification agent that resolves your question is a continuous-
+reasoning agent — it can chain multiple steps internally (look up MM
+handles, DM people, follow redirects, search the codebase, escalate).
+You just give it the GOAL; it figures out the intermediate steps.
 
-If the ticket only gives a free-form **name** with no handle ("спросить
-у Васи Курочкина", "уточнить у Лены"), the bot will not know who that
-is in Mattermost. In that case **don't put the free-form name in
-`ask_whom`** — the bot can't DM Mattermost-handle-less people.
+**Bad** (intermediate-step phrasing — agent stops at the step):
 
-What to do instead:
+> «Подскажи MM-ник Васи Курочкина, чтобы я мог получить от него
+> пример request body»
 
-* Default: set `ask_whom` to the **ticket reporter's username or
-  email** (whatever the task tracker gives you for the reporter).
-  They wrote the reference, they know who Вася is. Phrase the
-  question as a **two-step ask**: first identify, then ask the
-  real thing. Example:
+Agent reads «give me the handle», gets the handle from the reporter,
+and submits THAT as the final answer. You wanted the body — but
+you got the handle.
 
-  > «В тикете упомянут Вася Курочкин — подскажи, пожалуйста, его
-  > MM-ник или email, чтобы я мог уточнить у него ⟨the actual
-  > thing you wanted to ask Vasya⟩.»
+**Good** (end-goal phrasing — agent chains through to the answer):
 
-  The bot then resolves the ticket reporter to MM, DMs them, and
-  when they reply with the handle the orchestrator spawns a
-  follow-up question to the actual person.
+> «Получить пример request body для воспроизведения от Васи Курочкина.
+> (Его MM-handle в тикете не указан — нужно сначала узнать у репортёра.)»
 
-* Fallback: if no obvious reporter (e.g. system-generated ticket)
-  and you genuinely don't know who to ask, leave `ask_whom`
-  empty / null — the bot routes to the team-lead.
+Agent reads «get body example from Vasya», figures out the chain
+itself (find handle → DM Vasya → get body), and submits the body
+example as the final answer.
 
-**Do not** put a guessed handle (`vasya.kurochkin` from
-transliteration) in `ask_whom` — the bot doesn't know if that user
-exists, and a wrong DM is worse than asking the reporter "who is
-this?".
+**Rule**: the FIRST sentence of `question` must state the
+**information you actually want**. Background hints (handle is
+unknown, look on Confluence, ticket is in DM-NNNN, etc.) go after,
+as parenthetical context.
 
-When `status: clarifying`, the bot DMs each `ask_whom` and waits for
-answers before letting the Dev-agent touch the repo. So it is *strictly
-better* to ask one extra question than to ship wrong code.
+### How to fill `ask_whom`
+
+The clarification agent picks recipients by itself based on the goal
+and the issue context. `ask_whom` is just an optional hint — set it
+when you genuinely know a Mattermost handle or email:
+
+* MM handle: `an.volobuev`, `@an.volobuev`, `firstname.lastname`
+* Email: `an.volobuev@2gis.ru`
+
+If the ticket only gives a free-form **name** ("спросить у Васи
+Курочкина"), leave `ask_whom` null. The agent will search the MM
+directory, fall back to the issue reporter, etc. — it doesn't need
+your help scripting the chain.
+
+**Do not** put a guessed handle (`vasya.kurochkin` transliterated
+from a Russian name) in `ask_whom` — the bot will refuse and DM the
+reporter anyway, so this just adds noise.
+
+When `status: clarifying`, the clarification agent picks up each
+question and resolves it before the Dev-agent touches the repo. So
+it is *strictly better* to ask one extra question than to ship wrong
+code.
 
 {untrusted_warning}
