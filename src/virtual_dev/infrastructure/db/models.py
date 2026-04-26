@@ -200,107 +200,93 @@ class MrHistoryRow(Base):
     indexed_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
 
-class GoalRow(Base):
-    """A clarification goal: the information the bot needs to learn.
+class TaskRowClar(Base):
+    """One ``ClarificationTask`` — phase 4.5 task-driven model.
 
-    Phase 3.9 replaces the Q-tree with a goal-driven model. The
-    planner agent reads the goal description + full step history on
-    each tick and decides one next action. The state machine is a
-    direct projection of the
-    :class:`virtual_dev.domain.models.clarification_goal.GoalState`
-    enum.
+    Replaces ``clarification_goals``. The fields mirror the user's
+    spec (info_source / info_source_class / current_response /
+    is_solved). Internal loop state (awaiting_*, last_planning_started_at)
+    is kept here for crash recovery; nothing in the LLM-facing surface
+    treats this as a state machine.
     """
 
-    __tablename__ = "clarification_goals"
+    __tablename__ = "clarification_tasks"
     __table_args__ = (
-        Index("ix_goals_state_lastfrag", "state", "last_fragment_at"),
-        Index("ix_goals_state_nextrun", "state", "next_planner_run_at"),
-        Index("ix_goals_state_deadline", "state", "deadline_at"),
-        Index("ix_goals_tracker_extid", "tracker", "task_external_id"),
-        Index("ix_goals_parent_state", "parent_goal_id", "state"),
+        Index("ix_clar_tasks_solved_lastfrag", "is_solved", "last_fragment_at"),
+        Index("ix_clar_tasks_solved_nextrun", "is_solved", "next_planner_run_at"),
+        Index("ix_clar_tasks_solved_deadline", "is_solved", "deadline_at"),
+        Index("ix_clar_tasks_tracker_extid", "tracker", "task_external_id"),
+        Index("ix_clar_tasks_parent", "parent_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
     plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    parent_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tracker: Mapped[str] = mapped_column(String(32))
     task_external_id: Mapped[str] = mapped_column(String(64))
 
-    # Sub-goal linkage. NULL on top-level goals; non-NULL when this
-    # goal was spawned by a parent's planner via SPAWN_SUBGOALS.
-    parent_goal_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    depth: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-
-    description: Mapped[str] = mapped_column(Text)
-    why_it_matters: Mapped[str] = mapped_column(Text, default="")
-    initial_contact_hint: Mapped[str] = mapped_column(String(256), default="")
-
-    state: Mapped[str] = mapped_column(String(32), default="pending")
+    question: Mapped[str] = mapped_column(Text)
+    info_source: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    info_source_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_response: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_solved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     final_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
 
-    # Currently-outstanding DM (set when state is in
-    # AWAITING_REPLY|COALESCING|READY_TO_REPLAN|REPLANNING).
-    current_target_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    current_target_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    current_channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    current_asked_post_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    current_asked_text: Mapped[str | None] = mapped_column(Text, nullable=True)
-    current_dedupe_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    depth: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    iteration_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tools_tried_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    closed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Outstanding async wait — filled when an ASYNC tool started a
+    # conversation; cleared when the reply coalesces.
+    awaiting_post_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    awaiting_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    awaiting_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    awaiting_channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    awaiting_dedupe_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_fragment_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
-    coalesce_window_seconds: Mapped[int] = mapped_column(Integer, default=600)
+    coalesce_window_seconds: Mapped[int] = mapped_column(Integer, default=60)
 
-    asked_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    solved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    next_planner_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    planner_calls_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    send_retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_planning_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_planner_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
-class GoalStepRow(Base):
-    """Append-only history entry for a goal.
+class TaskStepRow(Base):
+    """Append-only history entry for one clarification task."""
 
-    ``seq`` is monotonic per-goal; ``UNIQUE(goal_id, seq)`` guarantees
-    we never get two steps with the same ordinal even under racing
-    inserts (we serialise inside the orchestrator, but the constraint
-    is the safety net).
-    """
-
-    __tablename__ = "goal_steps"
-    __table_args__ = (UniqueConstraint("goal_id", "seq", name="uq_goal_step_seq"),)
+    __tablename__ = "clar_task_steps"
+    __table_args__ = (
+        UniqueConstraint("task_id", "seq", name="uq_clar_task_step_seq"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    goal_id: Mapped[int] = mapped_column(Integer, index=True)
+    task_id: Mapped[int] = mapped_column(Integer, index=True)
     seq: Mapped[int] = mapped_column(Integer)
     kind: Mapped[str] = mapped_column(String(32), index=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     text: Mapped[str] = mapped_column(Text, default="")
-    target_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    target_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     metadata_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
 
 
-class GoalFragmentRow(Base):
-    """Raw MM message buffered for the goal's CURRENT outstanding question.
+class TaskFragmentRow(Base):
+    """Raw MM message buffered while the task waits on a human reply."""
 
-    ``UNIQUE(goal_id, mm_post_id)`` (not global) — two goals waiting
-    in the same DM channel can legitimately see the same human reply
-    if the human accidentally hits both threads, and we want each
-    goal's coalescer to see it independently.
-
-    On a new ASK from the planner the buffered fragments either
-    coalesce into the previous question's HUMAN_REPLIED step or are
-    archived as STALE_FRAGMENT (when the new ask invalidates them as
-    contextual evidence).
-    """
-
-    __tablename__ = "goal_fragments"
-    __table_args__ = (UniqueConstraint("goal_id", "mm_post_id", name="uq_goal_fragment_post"),)
+    __tablename__ = "clar_task_fragments"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id", "mm_post_id", name="uq_clar_task_fragment_post",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    goal_id: Mapped[int] = mapped_column(Integer, index=True)
+    task_id: Mapped[int] = mapped_column(Integer, index=True)
     mm_post_id: Mapped[str] = mapped_column(String(64))
     asked_post_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     text: Mapped[str] = mapped_column(Text, default="")

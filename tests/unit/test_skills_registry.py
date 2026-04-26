@@ -94,35 +94,87 @@ def test_filter_by_tag_excludes_other_tags() -> None:
     assert {s.name for s in analyst_skills} == {"analyst_only"}
 
 
-def test_discover_builtin_finds_lookup_and_search_skills() -> None:
-    """The two ship-built-in tools (lookup_mm_user, search_mm_users_by_name)
-    must be discoverable without manual import."""
+def test_discover_builtin_skills_runs_without_error() -> None:
+    """Discovery walks the dir without crashing even when the dir is
+    empty (built-in tools migrated to the Tool registry in Phase 4.5)."""
     registry = get_registry()
     registry.clear()
     populated = discover_builtin_skills()
-    names = {s.name for s in populated.all()}
-    assert "lookup_mm_user" in names
-    assert "search_mm_users_by_name" in names
+    # Built-ins are now in the tools/ subpackage (different registry).
+    # discover_builtin_skills only walks skills/builtin/ — should be OK
+    # to return cleanly even if no .py modules are there.
+    assert populated is not None
 
 
-def test_build_skills_mcp_server_returns_allowed_tool_names() -> None:
-    """``build_skills_mcp_server`` returns the MCP server + the list of
-    allowed tool names the agent must add to CodeAgentRequest.extras."""
+def test_build_skills_mcp_server_with_registered_skill() -> None:
+    """build_skills_mcp_server wraps registered skills into MCP tools."""
     registry = get_registry()
     registry.clear()
-    discover_builtin_skills()
+
+    @skill(
+        name="ping",
+        description="say pong",
+        schema={"type": "object", "properties": {}},
+        tags={"planner"},
+    )
+    async def _ping(args: dict[str, Any], ctx: SkillContext) -> dict[str, Any]:
+        return {"reply": "pong"}
+
     planner_skills = registry.filter(tag="planner")
     server, allowed = build_skills_mcp_server(
         planner_skills, _ctx(), server_name="virtual_dev_skills",
     )
-    assert "mcp__virtual_dev_skills__lookup_mm_user" in allowed
-    assert "mcp__virtual_dev_skills__search_mm_users_by_name" in allowed
+    assert "mcp__virtual_dev_skills__ping" in allowed
     assert server is not None
 
 
 def test_build_skills_mcp_server_returns_empty_list_when_no_skills() -> None:
     server, allowed = build_skills_mcp_server([], _ctx())
     assert allowed == []
+
+
+def test_tool_registry_discovers_builtin_tools() -> None:
+    """The phase-4.5 Tool registry auto-discovers tools shipped under
+    ``virtual_dev/skills/tools/``: find_mm_user_by_name, lookup_mm_user,
+    ask_mm_user, decompose, escalate_to_lead, abandon."""
+    from virtual_dev.application.services.clarification.tools import (
+        discover_builtin_tools,
+        get_tool_registry,
+    )
+
+    registry = get_tool_registry()
+    registry.clear()
+    populated = discover_builtin_tools()
+    names = {t.name for t in populated.all()}
+    expected = {
+        "find_mm_user_by_name", "lookup_mm_user", "ask_mm_user",
+        "decompose", "escalate_to_lead", "abandon",
+    }
+    assert expected <= names, f"missing tools: {expected - names}"
+
+
+def test_tool_registry_modes_are_correct() -> None:
+    """Tools declare SYNC/ASYNC/META modes per the spec."""
+    from virtual_dev.application.services.clarification.tools import (
+        ToolMode,
+        discover_builtin_tools,
+        get_tool_registry,
+    )
+
+    registry = get_tool_registry()
+    registry.clear()
+    discover_builtin_tools()
+
+    sync_tools = {t.name for t in registry.all() if t.mode == ToolMode.SYNC}
+    async_tools = {t.name for t in registry.all() if t.mode == ToolMode.ASYNC}
+    meta_tools = {t.name for t in registry.all() if t.mode == ToolMode.META}
+
+    assert "find_mm_user_by_name" in sync_tools
+    assert "lookup_mm_user" in sync_tools
+    assert "ask_mm_user" in async_tools
+    assert "decompose" in meta_tools
+    assert "escalate_to_lead" in meta_tools
+    assert "abandon" in meta_tools
 
 
 @pytest.mark.asyncio

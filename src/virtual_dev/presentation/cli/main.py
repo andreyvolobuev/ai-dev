@@ -326,7 +326,7 @@ def plan_task(
         task_tracker=container.task_tracker if post_to_tracker else None,
         config=container.config,
         post_to_tracker=post_to_tracker,
-        goal_orchestrator=container.goal_orchestrator,
+        task_orchestrator=container.task_orchestrator,
         session_factory=container.session_factory,
     )
 
@@ -414,46 +414,50 @@ def clarifications_show(
     external_id: str = typer.Argument(..., help="Tracker task id, e.g. DM-1234"),
     tracker: str = typer.Option("jira", help="Tracker name"),
 ) -> None:
-    """Print the goal-step timeline for one task.
+    """Print the task-step timeline for one ticket.
 
-    For each ClarificationGoal on the task, shows the goal description,
-    state, and the append-only history (every bot ask + every coalesced
-    human reply + every planner decision). Read-only; useful when
-    escalation reaches the team-lead and they want to see what the bot
-    actually asked / heard / decided.
+    For each ClarificationTask on the ticket, shows the task question,
+    info_source, is_solved, and the append-only history (planner picks,
+    tool invocations, tool results, human replies, validator verdicts).
     """
     _bootstrap()
     container = build_container()
 
     async def _run() -> None:
-        repo = container.goal_repo
-        goals = await repo.list_for_task(tracker, external_id)
-        if not goals:
+        repo = container.task_repo
+        tasks = await repo.list_for_task(tracker, external_id)
+        if not tasks:
             console.print(
-                f"[yellow]No clarification goals for {tracker}:{external_id}[/yellow]"
+                f"[yellow]No clarification tasks for {tracker}:{external_id}[/yellow]"
             )
             await container.dispose()
             return
 
         from rich.tree import Tree
 
-        for goal in goals:
-            steps = await repo.list_steps(goal.id)
-            header = (
-                f"[bold]Goal #{goal.id} — {goal.state.value}[/bold]\n"
-                f"  description: {goal.description[:240]}\n"
-                f"  why_it_matters: {(goal.why_it_matters or '')[:200]}\n"
-                f"  initial_contact_hint: {goal.initial_contact_hint or '(none)'}\n"
-                f"  planner_calls: {goal.planner_calls_count}"
+        for task in tasks:
+            steps = await repo.list_steps(task.id)
+            status = "✓ solved" if task.is_solved else (
+                "× closed" if task.closed else "… active"
             )
-            if goal.final_answer:
-                header += f"\n  [green]final_answer:[/green] {goal.final_answer[:300]}"
+            header = (
+                f"[bold]Task #{task.id} (depth {task.depth}) — {status}[/bold]\n"
+                f"  question: {task.question[:240]}\n"
+                f"  info_source: {task.info_source or '(?)'} "
+                f"({task.info_source_class or '?'})\n"
+                f"  iterations: {task.iteration_count}"
+            )
+            if task.final_answer:
+                header += (
+                    f"\n  [green]final_answer:[/green] "
+                    f"{task.final_answer[:300]} "
+                    f"(confidence={task.confidence:.2f})"
+                )
             tree = Tree(header)
             for s in steps:
-                who = s.target_username or s.target_user_id or "(internal)"
                 label = (
                     f"[dim]\\[{s.seq}][/dim] "
-                    f"[bold]{s.kind.value}[/bold] → @{who}"
+                    f"[bold]{s.kind.value}[/bold]"
                 )
                 if s.text:
                     label += f"\n   {s.text[:300]}"

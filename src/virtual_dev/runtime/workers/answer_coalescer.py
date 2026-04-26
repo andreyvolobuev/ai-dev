@@ -1,27 +1,26 @@
-"""Background worker: idle-flush + deadline-sweep for clarification questions.
+"""Background worker: idle-flush + deadline-sweep for clarification tasks.
 
-Both jobs are owned by :class:`ClarificationOrchestrator`. This module
-is just the wiring that turns them into a periodic background task in
-the FastAPI lifespan.
+Both jobs are owned by :class:`TaskOrchestrator`. This module is just
+the wiring that turns them into a periodic background task.
 """
 
 from __future__ import annotations
 
-from virtual_dev.application.services.clarification import GoalOrchestrator
+from virtual_dev.application.services.clarification import TaskOrchestrator
 from virtual_dev.runtime.workers.poller import PollerWorker
 
 
 def make_answer_coalescer_worker(
     *,
-    orchestrator: GoalOrchestrator,
+    orchestrator: TaskOrchestrator,
     interval_seconds: int,
 ) -> PollerWorker:
     """Build a :class:`PollerWorker` that ticks the orchestrator's
     ``flush_idle`` and ``sweep_deadlines`` every ``interval_seconds``.
 
     The two ticks share one worker because they're both cheap, both
-    operate on the same ``questions`` table, and we want a single
-    cadence-knob in settings (``answer_coalesce_poll_interval_seconds``).
+    operate on the same ``clarification_tasks`` table, and we want a
+    single cadence-knob in settings.
     """
     return PollerWorker(
         name="answer-coalescer",

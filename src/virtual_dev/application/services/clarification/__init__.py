@@ -1,17 +1,42 @@
-"""Goal-driven clarification subsystem (Phase 3.9).
+"""Task-driven clarification subsystem (Phase 4.5).
 
-ISSUE → ClarificationGoal (description + why_it_matters) → planner-LLM
-chooses one next step on each tick → step recorded in append-only
-history → repeat until ACHIEVED / ESCALATED / ABANDONED.
+ISSUE → ClarificationTask (question + info_source/info_source_class)
+→ Tool Picker LLM picks ONE tool per tick → tool runs (SYNC | ASYNC |
+META) → Validator LLM checks chain → tasks marked solved / not →
+loop until every top-level task is closed.
 
-Replaces the Q-tree (Phase 3.8) which copied parent-question text on
-redirect — that lost the goal. Goal-driven keeps the goal central, the
-planner re-composes the question for each new recipient.
+Replaces the goal-driven model (Phase 3.9) which had a hardcoded
+state machine and 6 fixed planner actions. Now actions ARE tools, and
+adding a new tool is a matter of dropping a file under
+:mod:`virtual_dev.skills.tools` with a ``@tool_`` decorator.
 """
 
-from virtual_dev.application.services.clarification.goal_orchestrator import (
-    GoalOrchestrator,
+from virtual_dev.application.services.clarification.task_orchestrator import (
+    TaskOrchestrator,
+    TaskOrchestratorStats,
 )
-from virtual_dev.application.services.clarification.goal_repo import GoalRepository
+from virtual_dev.application.services.clarification.task_repo import (
+    ClarificationTaskRepository,
+)
+from virtual_dev.application.services.clarification.tools import (
+    PendingReply,
+    Tool,
+    ToolContext,
+    ToolOutcome,
+    ToolRegistry,
+    discover_builtin_tools,
+    get_tool_registry,
+)
 
-__all__ = ["GoalOrchestrator", "GoalRepository"]
+__all__ = [
+    "ClarificationTaskRepository",
+    "PendingReply",
+    "TaskOrchestrator",
+    "TaskOrchestratorStats",
+    "Tool",
+    "ToolContext",
+    "ToolOutcome",
+    "ToolRegistry",
+    "discover_builtin_tools",
+    "get_tool_registry",
+]

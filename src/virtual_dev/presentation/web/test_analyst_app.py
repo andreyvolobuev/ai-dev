@@ -35,7 +35,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from virtual_dev.adapters.chat.in_memory import InMemoryChat
 from virtual_dev.adapters.code_agent import ClaudeAgentSdkCodeAgent
 from virtual_dev.application.agents import AnalystAgent
-from virtual_dev.application.agents.clarification_planner import ClarificationPlanner
+from virtual_dev.application.agents.clarification_tool_picker import (
+    ClarificationToolPicker,
+)
+from virtual_dev.application.agents.clarification_validator import (
+    ClarificationValidator,
+)
 from virtual_dev.application.services import (
     CommunicatorService,
     InjectionFilter,
@@ -47,8 +52,8 @@ from virtual_dev.application.services.agent_trace import (
     AgentTraceEvent,
 )
 from virtual_dev.application.services.clarification import (
-    GoalOrchestrator,
-    GoalRepository,
+    ClarificationTaskRepository,
+    TaskOrchestrator,
 )
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
@@ -84,7 +89,7 @@ class TestAnalystState:
         trace: AgentTrace,
         chat: InMemoryChat,
         analyst: AnalystAgent,
-        goal_orchestrator: GoalOrchestrator,
+        task_orchestrator: TaskOrchestrator,
     ) -> None:
         self.engine = engine
         self.session_factory = session_factory
@@ -93,7 +98,7 @@ class TestAnalystState:
         self.trace = trace
         self.chat = chat
         self.analyst = analyst
-        self.goal_orchestrator = goal_orchestrator
+        self.task_orchestrator = task_orchestrator
 
 
 async def _build_state(
@@ -160,19 +165,26 @@ async def _build_state(
         prompts_loader=prompts_loader,
     )
 
-    planner = ClarificationPlanner(
+    picker = ClarificationToolPicker(
         code_agent=code_agent,
         config=config,
         prompts_loader=prompts_loader,
-        communicator=communicator,
         researcher=researcher,
         injection_filter=injection_filter,
         trace=trace,
     )
-    goal_orchestrator = GoalOrchestrator(
-        repo=GoalRepository(session_factory),
+    validator = ClarificationValidator(
+        code_agent=code_agent,
+        config=config,
+        prompts_loader=prompts_loader,
+        injection_filter=injection_filter,
+        trace=trace,
+    )
+    task_orchestrator = TaskOrchestrator(
+        repo=ClarificationTaskRepository(session_factory),
         communicator=communicator,
-        planner=planner,
+        picker=picker,
+        validator=validator,
         config=config,
         session_factory=session_factory,
         message_bus=None,
@@ -187,7 +199,7 @@ async def _build_state(
         trace=trace,
         chat=chat,
         analyst=analyst,
-        goal_orchestrator=goal_orchestrator,
+        task_orchestrator=task_orchestrator,
     )
 
 
@@ -213,7 +225,7 @@ def build_test_analyst_app(
         # live app, but the operator can edit clarification.coalesce_window
         # in agents.yaml.
         coalescer = make_answer_coalescer_worker(
-            orchestrator=state.goal_orchestrator,
+            orchestrator=state.task_orchestrator,
             interval_seconds=10,
         )
         coalescer_task = asyncio.create_task(coalescer.run_forever(), name="coalescer")
@@ -422,7 +434,7 @@ async def _kick_clarifications(
         ))
         return
 
-    sent = await state.goal_orchestrator.request_clarifications(
+    sent = await state.task_orchestrator.request_clarifications(
         task_row=task_row, plan=plan, plan_row_id=plan_row.id,  # type: ignore[arg-type]
     )
     await state.trace.emit(AgentTraceEvent(
@@ -455,17 +467,17 @@ async def _drive_chat_inbox(state: TestAnalystState) -> None:
 
 
 async def _route_user_event(state: TestAnalystState, event: ChatMessage) -> None:
-    goal = None
+    task = None
     if event.thread_root_id:
-        goal = await state.goal_orchestrator.find_goal_by_thread(
+        task = await state.task_orchestrator.find_task_by_thread(
             event.thread_root_id,
         )
-    if goal is None:
-        goal = await state.goal_orchestrator.find_goal_by_channel(
+    if task is None:
+        task = await state.task_orchestrator.find_task_by_channel(
             mm_channel_id=event.channel_id,
             mm_user_id=event.author_id,
         )
-    if goal is None:
+    if task is None:
         await state.trace.emit(AgentTraceEvent(
             type="orchestrator", agent_key="test-runner",
             payload={
@@ -475,32 +487,27 @@ async def _route_user_event(state: TestAnalystState, event: ChatMessage) -> None
             },
         ))
         return
-    await state.goal_orchestrator.append_fragment(goal.id, event)
+    await state.task_orchestrator.append_fragment(task.id, event)
 
 
 async def _reset_state(state: TestAnalystState) -> None:
-    """Wipe questions/fragments/answers/tasks/plans for a fresh run.
-
-    We keep the same ``InMemoryChat`` instance — CommunicatorService and
-    the orchestrator have a reference to it baked in at startup. Clearing
-    the DB is enough to make the next ``run_task`` start from scratch.
-    """
+    """Wipe clarification tasks + plans + tracker tasks for a fresh run."""
     from sqlalchemy import delete
 
     from virtual_dev.infrastructure.db import (
         AgentMessageRow,
-        GoalFragmentRow,
-        GoalRow,
-        GoalStepRow,
         PlanRow,
+        TaskFragmentRow,
         TaskRow,
+        TaskRowClar,
+        TaskStepRow,
     )
 
     async with session_scope(state.session_factory) as session:
         for cls in (
-            GoalFragmentRow,
-            GoalStepRow,
-            GoalRow,
+            TaskFragmentRow,
+            TaskStepRow,
+            TaskRowClar,
             PlanRow,
             TaskRow,
             AgentMessageRow,

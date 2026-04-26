@@ -27,11 +27,11 @@ from virtual_dev.application.agents.orchestrator import (
 )
 from virtual_dev.infrastructure.container import Container
 from virtual_dev.infrastructure.db import (
-    GoalRow,
-    GoalStepRow,
     MergeRequestRow,
     PlanRow,
     TaskRow,
+    TaskRowClar,
+    TaskStepRow,
 )
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
@@ -74,7 +74,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         task_tracker=container.task_tracker,
         config=container.config,
         message_bus=container.message_bus,
-        goal_orchestrator=container.goal_orchestrator,
+        task_orchestrator=container.task_orchestrator,
         session_factory=container.session_factory,
     )
     analyst_runner = AgentRunner(
@@ -112,7 +112,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
     )
 
     coalescer_poller = make_answer_coalescer_worker(
-        orchestrator=container.goal_orchestrator,
+        orchestrator=container.task_orchestrator,
         interval_seconds=container.settings.answer_coalesce_poll_interval_seconds,
     )
 
@@ -128,7 +128,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             config=container.config,
             settings=container.settings,
             vcs=container.vcs,
-            goal_orchestrator=container.goal_orchestrator,
+            task_orchestrator=container.task_orchestrator,
         )
         # Catch-up tick — runs independently of the WS health, so
         # missed posts get replayed even if the listener's
@@ -254,34 +254,34 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                         .order_by(MergeRequestRow.created_at.desc())
                     )
                 ).scalars().all())
-                # Phase 3.9: goal-driven clarifications. We fetch
-                # goals + their step history for this task so the
-                # template can render a per-goal timeline.
-                goal_rows = list((
+                # Phase 4.5: task-driven clarifications. Fetch
+                # clarification tasks + their step history for this
+                # ticket so the template can render a per-task timeline.
+                clar_rows = list((
                     await session.execute(
-                        select(GoalRow)
+                        select(TaskRowClar)
                         .where(
-                            GoalRow.tracker == row.tracker,
-                            GoalRow.task_external_id == row.external_id,
+                            TaskRowClar.tracker == row.tracker,
+                            TaskRowClar.task_external_id == row.external_id,
                         )
-                        .order_by(GoalRow.id.asc())
+                        .order_by(TaskRowClar.id.asc())
                     )
                 ).scalars().all())
                 step_rows = list((
                     await session.execute(
-                        select(GoalStepRow)
+                        select(TaskStepRow)
                         .where(
-                            GoalStepRow.goal_id.in_([g.id for g in goal_rows])
+                            TaskStepRow.task_id.in_([c.id for c in clar_rows])
                         )
-                        .order_by(GoalStepRow.goal_id.asc(), GoalStepRow.seq.asc())
+                        .order_by(TaskStepRow.task_id.asc(), TaskStepRow.seq.asc())
                     )
-                ).scalars().all()) if goal_rows else []
-                steps_by_goal: dict[int, list[GoalStepRow]] = {}
+                ).scalars().all()) if clar_rows else []
+                steps_by_task: dict[int, list[TaskStepRow]] = {}
                 for s in step_rows:
-                    steps_by_goal.setdefault(s.goal_id, []).append(s)
+                    steps_by_task.setdefault(s.task_id, []).append(s)
                 questions = [
-                    {"row": g, "steps": steps_by_goal.get(g.id, [])}
-                    for g in goal_rows
+                    {"row": c, "steps": steps_by_task.get(c.id, [])}
+                    for c in clar_rows
                 ]
             else:
                 questions = []
