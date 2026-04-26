@@ -61,6 +61,12 @@ class InMemoryChat(ChatPort):
         self._posts: dict[str, ChatMessage] = {}
         # post_id → list[bot_emoji]
         self._reactions: dict[str, list[str]] = {}
+        # username → user_id for handles the operator has actually
+        # spoken as (or is, by default). Distinguishes "real" people
+        # from fictional names the planner might guess — without this,
+        # ``lookup_mm_user`` would say everyone exists and Vasya
+        # Kurochkin (who isn't on the team) gets DM'd.
+        self._known_users: dict[str, str] = {user_name: user_id}
         self._counter = 0
 
     # --- ChatPort implementation -----------------------------------
@@ -90,16 +96,17 @@ class InMemoryChat(ChatPort):
         return msg
 
     async def find_user_by_email(self, email: str) -> ChatUser | None:
-        # Each email maps to its own synthetic user. Critical for the
-        # orchestrator's cycle detection: if everyone resolves to the
-        # same id, every redirect looks like a cycle. The UI side
-        # picks "speaking as <handle>" so the operator can play
-        # multiple roles in one session.
         local = email.split("@", 1)[0] or "user"
-        return ChatUser(id=f"uid-{local}", username=local, email=email)
+        if local not in self._known_users:
+            return None
+        return ChatUser(
+            id=self._known_users[local], username=local, email=email,
+        )
 
     async def find_user_by_username(self, username: str) -> ChatUser | None:
-        return ChatUser(id=f"uid-{username}", username=username)
+        if username not in self._known_users:
+            return None
+        return ChatUser(id=self._known_users[username], username=username)
 
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
         self._reactions.setdefault(post_id, []).append(emoji_name)
@@ -163,6 +170,8 @@ class InMemoryChat(ChatPort):
         if author_username:
             author_id = f"uid-{author_username}"
             default_channel = f"dm-{author_id}"
+            # Register: from now on lookup_mm_user finds this handle.
+            self._known_users.setdefault(author_username, author_id)
         else:
             author_id = self._user_id
             default_channel = f"dm-{self._user_id}"
