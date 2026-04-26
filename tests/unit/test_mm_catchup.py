@@ -179,8 +179,7 @@ def _orchestrator(
     return TaskOrchestrator(
         repo=ClarificationTaskRepository(session_factory),
         communicator=communicator,
-        picker=_StubPicker(),                          # type: ignore[arg-type]
-        validator=_StubValidator(),                    # type: ignore[arg-type]
+        agent=_StubAgent(),                            # type: ignore[arg-type]
         config=_config(),
         session_factory=session_factory,
         message_bus=None,
@@ -206,14 +205,9 @@ def _listener(
     )
 
 
-class _StubPicker:
-    async def pick(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
-        raise AssertionError("picker should not run during catch-up tests")
-
-
-class _StubValidator:
-    async def validate(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
-        raise AssertionError("validator should not run during catch-up tests")
+class _StubAgent:
+    async def run(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+        raise AssertionError("agent should not run during catch-up tests")
 
 
 # ============================================================

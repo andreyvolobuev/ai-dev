@@ -133,50 +133,6 @@ def test_build_skills_mcp_server_returns_empty_list_when_no_skills() -> None:
     assert allowed == []
 
 
-def test_tool_registry_discovers_builtin_tools() -> None:
-    """The phase-4.5 Tool registry auto-discovers tools shipped under
-    ``virtual_dev/skills/tools/``: find_mm_user_by_name, lookup_mm_user,
-    ask_mm_user, decompose, escalate_to_lead, abandon."""
-    from virtual_dev.application.services.clarification.tools import (
-        discover_builtin_tools,
-        get_tool_registry,
-    )
-
-    registry = get_tool_registry()
-    registry.clear()
-    populated = discover_builtin_tools()
-    names = {t.name for t in populated.all()}
-    expected = {
-        "find_mm_user_by_name", "lookup_mm_user", "ask_mm_user",
-        "decompose", "escalate_to_lead", "abandon",
-    }
-    assert expected <= names, f"missing tools: {expected - names}"
-
-
-def test_tool_registry_modes_are_correct() -> None:
-    """Tools declare SYNC/ASYNC/META modes per the spec."""
-    from virtual_dev.application.services.clarification.tools import (
-        ToolMode,
-        discover_builtin_tools,
-        get_tool_registry,
-    )
-
-    registry = get_tool_registry()
-    registry.clear()
-    discover_builtin_tools()
-
-    sync_tools = {t.name for t in registry.all() if t.mode == ToolMode.SYNC}
-    async_tools = {t.name for t in registry.all() if t.mode == ToolMode.ASYNC}
-    meta_tools = {t.name for t in registry.all() if t.mode == ToolMode.META}
-
-    assert "find_mm_user_by_name" in sync_tools
-    assert "lookup_mm_user" in sync_tools
-    assert "ask_mm_user" in async_tools
-    assert "decompose" in meta_tools
-    assert "escalate_to_lead" in meta_tools
-    assert "abandon" in meta_tools
-
-
 @pytest.mark.asyncio
 async def test_skill_handler_receives_context_with_communicator() -> None:
     """A skill handler can reach CommunicatorService via SkillContext —

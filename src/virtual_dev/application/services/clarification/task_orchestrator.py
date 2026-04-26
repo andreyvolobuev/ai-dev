@@ -1,26 +1,23 @@
-"""Task-driven clarification orchestrator (Phase 4.5).
+"""Task-driven clarification orchestrator (Phase 4.6).
 
-Runs the loop:
+Thin shell around :class:`ClarificationAgent`. Responsibilities:
 
-    pick task → list applicable tools → planner picks ONE tool →
-    execute tool (SYNC | ASYNC | META) → if SYNC: validate result →
-    if ASYNC: install awaiting_*, return (resume on coalesced reply) →
-    if META: handle directly (decompose / escalate / abandon)
+* Spawn one task per analyst open-question.
+* Drive the agent on creation and after every coalesced human reply.
+* Persist what the agent did (steps + state).
+* Translate agent effects (ask_dispatched / final_answer / escalate /
+  abandon) into DB writes + DM lead / re-publish task.discovered.
+* Coalesce fragments (idle window) and sweep deadlines.
 
-The validator is *chain-aware*: every validated response is checked
-against the full ancestor chain. A response that solves the root
-shortcuts the entire branch.
-
-This module replaces ``GoalOrchestrator``. Goal-state-machine fields
-(REPLANNING, COALESCING, …) are gone — task lifecycle is just
-``is_solved``/``closed``. Internal bookkeeping (last_fragment_at,
-last_planning_started_at, awaiting_*) lives on the row but is not
-exposed to the LLM as state.
+The agent itself does all the LLM-level reasoning: which tool, when
+to ask, when to declare done, how to phrase questions. There's no
+separate picker / validator any more — Claude-Code-like: one brain,
+one chain of thought, persistent across human-reply latency by
+re-rendering history into each prompt.
 """
 
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -29,13 +26,11 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from virtual_dev.application.agents.clarification_tool_picker import (
-    ClarificationToolPicker,
-    PickerInput,
-)
-from virtual_dev.application.agents.clarification_validator import (
-    ClarificationValidator,
-    ValidatorInput,
+from virtual_dev.application.agents.clarification_agent import (
+    AgentEffect,
+    AgentRunInput,
+    AgentRunResult,
+    ClarificationAgent,
 )
 from virtual_dev.application.services.agent_trace import (
     AgentTrace,
@@ -45,17 +40,11 @@ from virtual_dev.application.services.agent_trace import (
 from virtual_dev.application.services.clarification.task_repo import (
     ClarificationTaskRepository,
 )
-from virtual_dev.application.services.clarification.tools import (
-    ToolContext,
-    ToolRegistry,
-    discover_builtin_tools,
-)
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.clarification_task import (
     ClarificationTask,
     TaskStepKind,
-    ToolMode,
 )
 from virtual_dev.domain.models.plan import Plan, PlanStatus
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
@@ -64,49 +53,39 @@ from virtual_dev.infrastructure.db import PlanRow, TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
 
 
-_USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
-
-
 @dataclass
 class TaskOrchestratorStats:
     tasks_created: int = 0
     fragments_appended: int = 0
-    tool_picks: int = 0
-    tool_invocations: int = 0
-    validations: int = 0
-    sync_resolutions: int = 0
-    async_dispatches: int = 0
-    decompositions: int = 0
+    agent_runs: int = 0
+    asks_dispatched: int = 0
+    final_answers: int = 0
     escalations: int = 0
     abandonments: int = 0
     re_dispatches: int = 0
 
 
 class TaskOrchestrator:
-    """Drives every ``ClarificationTask`` through the pick→apply→validate loop."""
+    """Drives every ``ClarificationTask`` via the ClarificationAgent."""
 
     def __init__(
         self,
         *,
         repo: ClarificationTaskRepository,
         communicator: CommunicatorService,
-        picker: ClarificationToolPicker,
-        validator: ClarificationValidator,
+        agent: ClarificationAgent,
         config: AppConfig,
         session_factory: async_sessionmaker[AsyncSession],
         message_bus: MessageBusPort | None,
         trace: AgentTrace | None = None,
-        tool_registry: ToolRegistry | None = None,
     ) -> None:
         self._repo = repo
         self._communicator = communicator
-        self._picker = picker
-        self._validator = validator
+        self._agent = agent
         self._config = config
         self._session_factory = session_factory
         self._message_bus = message_bus
         self._trace = trace
-        self._tools = tool_registry or discover_builtin_tools()
         self.stats = TaskOrchestratorStats()
 
     # ---------------------------------------------------------------- entry
@@ -143,7 +122,7 @@ class TaskOrchestrator:
             self.stats.tasks_created += 1
             created += 1
             await self._emit("task_created", task)
-            await self._run_one_step(task)
+            await self._drive(task)
         return created
 
     async def find_task_by_thread(
@@ -186,11 +165,11 @@ class TaskOrchestrator:
         flushed = 0
         for task in idle:
             try:
-                await self._coalesce_and_validate(task)
+                await self._coalesce_and_drive(task)
                 flushed += 1
             except Exception:
                 logger.exception(
-                    "Task {}: coalesce+validate failed", task.id,
+                    "Task {}: coalesce+drive failed", task.id,
                 )
         return flushed
 
@@ -206,24 +185,25 @@ class TaskOrchestrator:
             )
             refreshed = await self._repo.get(task.id)
             if refreshed is not None:
-                await self._run_one_step(refreshed)
+                await self._drive(refreshed)
 
     async def _abandon_overdue(self, *, now: datetime) -> int:
         overdue = await self._repo.find_overdue(now=now)
         swept = 0
         for task in overdue:
-            await self._abandon_task(
-                task, reason="deadline_exceeded", escalate=True,
+            await self._mark_terminal(
+                task,
+                kind="escalate",
+                reason="deadline_exceeded",
+                escalate=True,
             )
             swept += 1
         return swept
 
     # ---------------------------------------------------------------- coalesce
-    async def _coalesce_and_validate(
-        self, task: ClarificationTask,
-    ) -> None:
-        """Idle window passed → merge fragments, append HUMAN_REPLIED step,
-        run validator."""
+    async def _coalesce_and_drive(self, task: ClarificationTask) -> None:
+        """Idle window passed → merge fragments, append HUMAN_REPLIED
+        step, drive the agent."""
         fragments = await self._repo.list_unflushed_fragments(task.id)
         if not fragments:
             return
@@ -255,18 +235,11 @@ class TaskOrchestrator:
         refreshed = await self._repo.get(task.id)
         if refreshed is None:
             return
-
-        await self._validate_and_route(
-            refreshed, response_text=merged,
-            response_source_label=task.awaiting_username or "",
-            response_source_class="mattermost",
-        )
+        await self._drive(refreshed)
 
     # ---------------------------------------------------------------- main loop
-    async def _run_one_step(self, task: ClarificationTask) -> None:
-        """Pick a tool, run it, route the result. Called when a task
-        is fresh, when a SYNC tool didn't solve it, or when waking
-        from a deferral."""
+    async def _drive(self, task: ClarificationTask) -> None:
+        """Run the agent once on this task, then react to the effects."""
         if task.closed:
             return
         max_iter = self._config.agents.clarification.max_planner_calls_per_goal
@@ -275,7 +248,11 @@ class TaskOrchestrator:
                 "Task {}: max_iterations ({}) reached; escalating",
                 task.id, max_iter,
             )
-            await self._escalate_task(task, reason="max_iterations_reached")
+            await self._mark_terminal(
+                task, kind="escalate",
+                reason="max_iterations_reached",
+                escalate=True,
+            )
             return
 
         await self._repo.update(
@@ -284,409 +261,173 @@ class TaskOrchestrator:
             last_planning_started_at=datetime.now(timezone.utc),
         )
 
-        chain = await self._repo.chain(task.id)
-        history = await self._repo.list_steps(task.id)
-        issue_summary = await self._load_issue_summary(task)
-        repo_workspace = await self._resolve_repo_workspace(task)
-        tools = self._tools.filter(tag="clarification")
+        # Re-fetch so iteration_count is fresh in the prompt.
+        latest = await self._repo.get(task.id)
+        if latest is None:
+            return
+        history = await self._repo.list_steps(latest.id)
+        issue_summary = await self._load_issue_summary(latest)
+        repo_workspace = await self._resolve_repo_workspace(latest)
 
         try:
-            invocation = await self._picker.pick(PickerInput(
-                task=task, chain=chain, history=history,
+            run = await self._agent.run(AgentRunInput(
+                task=latest, history=history,
                 issue_summary=issue_summary,
                 repo_workspace=repo_workspace,
-                available_tools=tools,
             ))
         except Exception:
-            logger.exception("Task {}: picker crashed", task.id)
+            logger.exception("Task {}: agent crashed", latest.id)
             await self._repo.update(
-                task.id, clear_last_planning_started_at=True,
+                latest.id, clear_last_planning_started_at=True,
             )
             return
-        self.stats.tool_picks += 1
+        self.stats.agent_runs += 1
+        await self._record_run(latest, run)
+        await self._apply_effects(latest, run)
+
+    async def _record_run(
+        self, task: ClarificationTask, run: AgentRunResult,
+    ) -> None:
+        """Append a step capturing the agent's run summary (so the next
+        invocation's prompt-history shows what the agent did)."""
+        # No effects → agent ran out of turns / didn't act.
+        summary = (
+            f"agent ran {run.turns} turn(s), stop={run.stopped_reason}, "
+            f"effects={[e.kind for e in run.effects]}"
+        )
         await self._repo.append_step(
             task_id=task.id,
             kind=TaskStepKind.PLANNER_DECIDED,
-            text=invocation.reasoning,
+            text=summary,
             metadata={
-                "tool": invocation.tool, "params": invocation.params,
+                "stopped_reason": run.stopped_reason,
+                "turns": run.turns,
+                "cost_usd": run.cost_usd,
+                "effects": [
+                    {"kind": e.kind, "payload": e.payload}
+                    for e in run.effects
+                ],
             },
         )
-        await self._emit("tool_picked", task, payload={
-            "tool": invocation.tool,
-            "reasoning": invocation.reasoning,
-        })
 
-        tool = self._tools.get(invocation.tool)
-        if tool is None:
-            logger.warning(
-                "Task {}: picker chose unknown tool {!r}; escalating",
-                task.id, invocation.tool,
-            )
-            await self._escalate_task(
-                task, reason=f"unknown_tool:{invocation.tool}",
-            )
-            return
-
-        ctx = ToolContext(
-            task=task, chain=chain,
-            communicator=self._communicator, config=self._config,
-            session_factory=self._session_factory,
-        )
-
-        try:
-            outcome = await tool.handler(invocation.params or {}, ctx)
-        except Exception as exc:
-            logger.exception(
-                "Task {}: tool {!r} raised", task.id, invocation.tool,
-            )
-            await self._repo.append_step(
-                task_id=task.id,
-                kind=TaskStepKind.TOOL_RESULT,
-                text=f"Tool crashed: {type(exc).__name__}: {exc}",
-                metadata={"tool": invocation.tool, "error": True},
-            )
-            await self._repo.update(
-                task.id,
-                append_tool_tried=invocation.tool,
-                clear_last_planning_started_at=True,
-            )
-            refreshed = await self._repo.get(task.id)
-            if refreshed is not None:
-                await self._run_one_step(refreshed)
-            return
-
-        await self._repo.append_step(
-            task_id=task.id,
-            kind=TaskStepKind.TOOL_INVOKED,
-            text=invocation.reasoning,
-            metadata={
-                "tool": invocation.tool,
-                "params": invocation.params,
-                "mode": tool.mode.value,
-            },
-        )
-        self.stats.tool_invocations += 1
-
-        if outcome.error:
-            await self._repo.append_step(
-                task_id=task.id,
-                kind=TaskStepKind.TOOL_RESULT,
-                text=f"Tool error: {outcome.error}",
-                metadata={"tool": invocation.tool, "error": outcome.error},
-            )
-            await self._repo.update(
-                task.id,
-                append_tool_tried=invocation.tool,
-                clear_last_planning_started_at=True,
-            )
-            refreshed = await self._repo.get(task.id)
-            if refreshed is not None:
-                await self._run_one_step(refreshed)
-            return
-
-        if tool.mode == ToolMode.SYNC and outcome.result is not None:
-            await self._on_sync_result(task, invocation.tool, outcome.result)
-        elif tool.mode == ToolMode.ASYNC and outcome.pending is not None:
-            await self._on_async_dispatch(task, invocation.tool, outcome)
-        elif tool.mode == ToolMode.META:
-            await self._on_meta(task, invocation.tool, outcome)
-        else:
-            logger.warning(
-                "Task {}: tool {!r} returned mode={} but no payload",
-                task.id, invocation.tool, tool.mode,
-            )
-            await self._repo.update(
-                task.id,
-                append_tool_tried=invocation.tool,
-                clear_last_planning_started_at=True,
-            )
-            refreshed = await self._repo.get(task.id)
-            if refreshed is not None:
-                await self._run_one_step(refreshed)
-
-    async def _on_sync_result(
-        self, task: ClarificationTask, tool_name: str, result,
+    async def _apply_effects(
+        self, task: ClarificationTask, run: AgentRunResult,
     ) -> None:
-        await self._repo.append_step(
-            task_id=task.id,
-            kind=TaskStepKind.TOOL_RESULT,
-            text=result.text or "",
-            metadata={
-                "tool": tool_name,
-                "structured": result.structured,
-                "source_label": result.source_label,
-                "source_class": result.source_class,
-            },
+        # Find the (single) terminal-class effect, if any.
+        for e in run.effects:
+            if e.kind == "ask_dispatched":
+                await self._on_ask(task, e)
+                return
+            if e.kind == "final_answer":
+                await self._on_final_answer(task, e)
+                return
+            if e.kind == "escalate":
+                await self._mark_terminal(
+                    task, kind="escalate",
+                    reason=e.payload.get("reason", "agent_escalate"),
+                    escalate=True,
+                )
+                return
+            if e.kind == "abandon":
+                await self._mark_terminal(
+                    task, kind="abandon",
+                    reason=e.payload.get("reason", "agent_abandon"),
+                    escalate=False,
+                )
+                return
+        # No terminal effect — agent finished without acting. Either the
+        # LLM hit max_turns or returned end_turn without using a tool.
+        # Treat as escalation so the operator sees it instead of a
+        # silent no-op.
+        logger.warning(
+            "Task {}: agent run ended without effect (stop={}, turns={})",
+            task.id, run.stopped_reason, run.turns,
         )
-        await self._repo.update(
-            task.id,
-            current_response=result.text or "",
-        )
-        refreshed = await self._repo.get(task.id)
-        if refreshed is None:
-            return
-        await self._validate_and_route(
-            refreshed, response_text=result.text or "",
-            response_source_label=result.source_label or f"tool:{tool_name}",
-            response_source_class=result.source_class or f"tool:{tool_name}",
-            tool_name=tool_name,
+        await self._mark_terminal(
+            task, kind="escalate",
+            reason=f"agent_no_action:{run.stopped_reason}",
+            escalate=True,
         )
 
-    async def _on_async_dispatch(
-        self, task: ClarificationTask, tool_name: str, outcome,
+    async def _on_ask(
+        self, task: ClarificationTask, effect: AgentEffect,
     ) -> None:
-        pending = outcome.pending
+        p = effect.payload
+        # The agent's MCP tool already performed the DM via
+        # CommunicatorService; the orchestrator just records it as a
+        # BOT_ASKED step and installs awaiting_*.
         await self._repo.append_step(
             task_id=task.id,
             kind=TaskStepKind.BOT_ASKED,
-            text=pending.asked_text,
+            text=p.get("asked_text") or "",
             metadata={
-                "tool": tool_name,
-                "asked_post_id": pending.asked_post_id,
-                "channel_id": pending.channel_id,
-                "target_user_id": pending.target_user_id,
-                "target_username": pending.target_username,
-                "dedupe_key": pending.dedupe_key,
+                "asked_post_id": p.get("asked_post_id"),
+                "channel_id": p.get("channel_id"),
+                "target_user_id": p.get("target_user_id"),
+                "target_username": p.get("target_username"),
+                "dedupe_key": p.get("dedupe_key"),
             },
         )
         await self._repo.update(
             task.id,
-            info_source=pending.info_source or task.info_source,
-            info_source_class=pending.info_source_class or task.info_source_class,
-            awaiting_post_id=pending.asked_post_id,
-            awaiting_user_id=pending.target_user_id,
-            awaiting_username=pending.target_username or "",
-            awaiting_channel_id=pending.channel_id,
-            awaiting_dedupe_key=pending.dedupe_key or "",
-            append_tool_tried=tool_name,
+            info_source=(p.get("target_username") or p.get("target_email") or task.info_source),
+            info_source_class="mattermost",
+            awaiting_post_id=p.get("asked_post_id") or "",
+            awaiting_user_id=p.get("target_user_id") or "",
+            awaiting_username=p.get("target_username") or "",
+            awaiting_channel_id=p.get("channel_id") or "",
+            awaiting_dedupe_key=p.get("dedupe_key") or "",
             clear_last_planning_started_at=True,
         )
-        self.stats.async_dispatches += 1
-
-    async def _on_meta(
-        self, task: ClarificationTask, tool_name: str, outcome,
-    ) -> None:
-        action = outcome.meta_action or ""
-        if action == "decompose":
-            await self._do_decompose(task, outcome.meta_payload or {})
-        elif action == "escalate_to_lead":
-            reason = (outcome.meta_payload or {}).get("reason", "planner_escalation")
-            await self._escalate_task(task, reason=str(reason))
-        elif action == "abandon":
-            reason = (outcome.meta_payload or {}).get("reason", "planner_abandon")
-            await self._abandon_task(task, reason=str(reason), escalate=False)
-        else:
-            logger.warning(
-                "Task {}: meta-tool {!r} returned unknown action {!r}",
-                task.id, tool_name, action,
-            )
-            await self._repo.update(
-                task.id,
-                append_tool_tried=tool_name,
-                clear_last_planning_started_at=True,
-            )
-
-    async def _do_decompose(
-        self, task: ClarificationTask, payload: dict,
-    ) -> None:
-        max_depth = self._config.agents.clarification.max_subgoal_depth
-        if task.depth >= max_depth:
-            await self._escalate_task(task, reason="max_subgoal_depth")
-            return
-        specs = payload.get("subtasks") or []
-        if not specs:
-            await self._escalate_task(task, reason="decompose_empty")
-            return
-        clar_cfg = self._config.agents.clarification
-        deadline = task.deadline_at or (
-            datetime.now(timezone.utc) + timedelta(hours=clar_cfg.max_goal_age_hours)
-        )
-        children: list[ClarificationTask] = []
-        for spec in specs:
-            child = await self._repo.create_task(
-                plan_id=task.plan_id,
-                parent_id=task.id,
-                tracker=task.tracker,
-                task_external_id=task.task_external_id,
-                question=spec["question"],
-                info_source=spec.get("info_source"),
-                info_source_class=spec.get("info_source_class"),
-                coalesce_window_seconds=clar_cfg.coalesce_window_seconds,
-                deadline_at=deadline,
-                depth=task.depth + 1,
-            )
-            await self._repo.append_step(
-                task_id=task.id,
-                kind=TaskStepKind.SUBTASK_SPAWNED,
-                text=spec["question"],
-                metadata={"subtask_id": child.id},
-            )
-            children.append(child)
-            await self._emit("subtask_spawned", task, payload={
-                "subtask_id": child.id,
-                "question": spec["question"],
-            })
-        self.stats.decompositions += 1
-        await self._repo.update(
-            task.id, clear_last_planning_started_at=True,
-        )
-        # Drive each child immediately.
-        for child in children:
-            await self._run_one_step(child)
-
-    # ---------------------------------------------------------------- validate
-    async def _validate_and_route(
-        self,
-        task: ClarificationTask,
-        *,
-        response_text: str,
-        response_source_label: str,
-        response_source_class: str,
-        tool_name: str | None = None,
-    ) -> None:
-        chain = await self._repo.chain(task.id)
-        try:
-            verdict = await self._validator.validate(ValidatorInput(
-                task=task, chain=chain,
-                response_text=response_text,
-                response_source_label=response_source_label,
-                response_source_class=response_source_class,
-                issue_summary=await self._load_issue_summary(task),
-            ))
-        except Exception:
-            logger.exception("Task {}: validator crashed", task.id)
-            await self._repo.update(
-                task.id,
-                append_tool_tried=tool_name or "unknown",
-                clear_last_planning_started_at=True,
-            )
-            refreshed = await self._repo.get(task.id)
-            if refreshed is not None:
-                await self._run_one_step(refreshed)
-            return
-        self.stats.validations += 1
-
-        await self._repo.append_step(
-            task_id=task.id,
-            kind=TaskStepKind.VALIDATED,
-            text=verdict.reasoning or "",
-            metadata={
-                "resolves": [
-                    {
-                        "task_id": v.task_id,
-                        "final_answer": v.final_answer,
-                        "confidence": v.confidence,
-                    }
-                    for v in verdict.resolves
-                ],
-                "tool": tool_name,
-            },
-        )
-        await self._emit("validated", task, payload={
-            "tool": tool_name,
-            "resolves_count": len(verdict.resolves),
-            "reasoning": verdict.reasoning,
+        self.stats.asks_dispatched += 1
+        await self._emit("ask_dispatched", task, payload={
+            "target_user_id": p.get("target_user_id"),
+            "target_username": p.get("target_username"),
         })
 
-        chain_ids = {c.id for c in chain}
-        any_resolved = False
-        # Sort resolves by depth so deepest closes first; helpful for
-        # the resettle-plan logic to see consistent state.
-        depth_by_id = {c.id: c.depth for c in chain}
-        ordered = sorted(
-            verdict.resolves,
-            key=lambda v: depth_by_id.get(v.task_id, 0),
-            reverse=True,
-        )
-        for v in ordered:
-            if v.task_id not in chain_ids:
-                logger.warning(
-                    "Task {}: validator returned task_id {} not in chain; ignoring",
-                    task.id, v.task_id,
-                )
-                continue
-            await self._mark_solved(
-                v.task_id, final_answer=v.final_answer, confidence=v.confidence,
-            )
-            any_resolved = True
-            self.stats.sync_resolutions += 1
-
-        if not any_resolved:
-            # No task solved → record tool as tried, run loop again.
-            await self._repo.update(
-                task.id,
-                append_tool_tried=tool_name or "unknown",
-                clear_last_planning_started_at=True,
-            )
-            refreshed = await self._repo.get(task.id)
-            if refreshed is not None:
-                await self._run_one_step(refreshed)
-            return
-
-        # Some tasks solved. Cascade ancestors that are now obsolete:
-        # if a deeper-task resolution incidentally answers the parent,
-        # the parent will already have been in `resolves` (validator's
-        # job). We only need to settle the plan and trigger any
-        # parent's NEXT step if it became unblocked.
-        await self._cascade_after_resolution(task)
-
-    async def _mark_solved(
-        self, task_id: int, *, final_answer: str, confidence: float,
+    async def _on_final_answer(
+        self, task: ClarificationTask, effect: AgentEffect,
     ) -> None:
+        p = effect.payload
+        final = str(p.get("final_answer") or "").strip()
+        confidence = float(p.get("confidence") or 0.0)
+        reasoning = str(p.get("reasoning") or "")
         await self._repo.update(
-            task_id,
+            task.id,
             is_solved=True,
-            final_answer=final_answer,
+            final_answer=final,
             confidence=confidence,
             clear_awaiting=True,
             closed=True,
             clear_last_planning_started_at=True,
         )
         await self._repo.append_step(
-            task_id=task_id,
+            task_id=task.id,
             kind=TaskStepKind.NOTE,
-            text=f"Task solved (confidence={confidence:.2f}): {final_answer[:200]}",
-            metadata={"final_answer": final_answer, "confidence": confidence},
+            text=(
+                f"final_answer (confidence={confidence:.2f}): {final[:300]}"
+                + (f"\nreasoning: {reasoning[:300]}" if reasoning else "")
+            ),
+            metadata={
+                "final_answer": final,
+                "confidence": confidence,
+                "reasoning": reasoning,
+            },
         )
+        self.stats.final_answers += 1
+        await self._emit("final_answer", task, payload={
+            "final_answer": final,
+            "confidence": confidence,
+        })
+        await self._maybe_resettle_plan(task)
 
-    async def _cascade_after_resolution(
-        self, anchor: ClarificationTask,
-    ) -> None:
-        """After at least one task in the chain is solved, drive
-        further work:
-
-        * Any UNCLOSED ancestors continue: their next planner pick may
-          succeed now that a child finished.
-        * If every ancestor in the chain is closed, the plan-resettle
-          check runs.
-        """
-        chain = await self._repo.chain(anchor.id)
-        # Walk root → ... → anchor; the deepest unclosed task gets a
-        # ``_run_one_step`` so its planner can react to the new
-        # subtask outcome.
-        for t in chain:
-            refreshed = await self._repo.get(t.id)
-            if refreshed is None:
-                continue
-            if not refreshed.closed:
-                # Notify on parents: append a SUBTASK_RESOLVED step so
-                # the picker sees what just happened on the next pick.
-                if refreshed.id != anchor.id:
-                    await self._repo.append_step(
-                        task_id=refreshed.id,
-                        kind=TaskStepKind.SUBTASK_RESOLVED,
-                        text=anchor.final_answer or "",
-                        metadata={"subtask_id": anchor.id},
-                    )
-                await self._run_one_step(refreshed)
-                return
-        # All closed → maybe re-dispatch.
-        await self._maybe_resettle_plan(anchor)
-
-    # ---------------------------------------------------------------- terminals
-    async def _abandon_task(
-        self, task: ClarificationTask, *, reason: str, escalate: bool,
+    async def _mark_terminal(
+        self,
+        task: ClarificationTask,
+        *,
+        kind: str,                    # "escalate" | "abandon"
+        reason: str,
+        escalate: bool,
     ) -> None:
         await self._repo.update(
             task.id,
@@ -698,58 +439,17 @@ class TaskOrchestrator:
         await self._repo.append_step(
             task_id=task.id,
             kind=TaskStepKind.NOTE,
-            text=f"Task abandoned: {reason}",
-            metadata={"reason": reason, "kind": "abandon"},
+            text=f"Task {kind}d: {reason}",
+            metadata={"reason": reason, "kind": kind},
         )
-        self.stats.abandonments += 1
+        if kind == "escalate":
+            self.stats.escalations += 1
+        else:
+            self.stats.abandonments += 1
         if escalate:
             await self._send_lead_escalation(task, reason=reason)
-        await self._cascade_after_terminal(task)
-
-    async def _escalate_task(
-        self, task: ClarificationTask, *, reason: str,
-    ) -> None:
-        await self._repo.update(
-            task.id,
-            is_solved=False,
-            closed=True,
-            clear_awaiting=True,
-            clear_last_planning_started_at=True,
-        )
-        await self._repo.append_step(
-            task_id=task.id,
-            kind=TaskStepKind.NOTE,
-            text=f"Task escalated: {reason}",
-            metadata={"reason": reason, "kind": "escalate"},
-        )
-        self.stats.escalations += 1
-        await self._send_lead_escalation(task, reason=reason)
-        await self._cascade_after_terminal(task)
-
-    async def _cascade_after_terminal(
-        self, anchor: ClarificationTask,
-    ) -> None:
-        # Same logic as _cascade_after_resolution but the parent
-        # gets a SUBTASK_RESOLVED step with the abandon/escalate note.
-        chain = await self._repo.chain(anchor.id)
-        for t in chain:
-            refreshed = await self._repo.get(t.id)
-            if refreshed is None:
-                continue
-            if not refreshed.closed:
-                if refreshed.id != anchor.id:
-                    await self._repo.append_step(
-                        task_id=refreshed.id,
-                        kind=TaskStepKind.SUBTASK_RESOLVED,
-                        text=f"Subtask {anchor.id} ended without an answer",
-                        metadata={
-                            "subtask_id": anchor.id,
-                            "subtask_outcome": "terminal_no_answer",
-                        },
-                    )
-                await self._run_one_step(refreshed)
-                return
-        await self._maybe_resettle_plan(anchor)
+        await self._emit(f"{kind}_terminal", task, payload={"reason": reason})
+        await self._maybe_resettle_plan(task)
 
     async def _send_lead_escalation(
         self, task: ClarificationTask, *, reason: str,
@@ -861,7 +561,9 @@ class TaskOrchestrator:
             self.stats.re_dispatches += 1
 
     async def _reseed_task_description(
-        self, anchor: ClarificationTask, siblings: list[ClarificationTask],
+        self,
+        anchor: ClarificationTask,
+        siblings: list[ClarificationTask],
     ) -> None:
         async with session_scope(self._session_factory) as session:
             row = (await session.execute(

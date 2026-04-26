@@ -1,14 +1,16 @@
-"""Task-driven clarification subsystem (Phase 4.5).
+"""Task-driven clarification subsystem (Phase 4.6).
 
-ISSUE → ClarificationTask (question + info_source/info_source_class)
-→ Tool Picker LLM picks ONE tool per tick → tool runs (SYNC | ASYNC |
-META) → Validator LLM checks chain → tasks marked solved / not →
-loop until every top-level task is closed.
+ISSUE → ClarificationTask (question + info_source) → one
+ClarificationAgent reasons continuously, chains tools, sends DMs to
+humans, eventually calls submit_final_answer / escalate_to_lead /
+abandon. The orchestrator is a thin shell that persists state,
+coalesces fragments, and re-invokes the agent on human replies.
 
-Replaces the goal-driven model (Phase 3.9) which had a hardcoded
-state machine and 6 fixed planner actions. Now actions ARE tools, and
-adding a new tool is a matter of dropping a file under
-:mod:`virtual_dev.skills.tools` with a ``@tool_`` decorator.
+Replaces the multi-agent picker+validator pipeline of Phase 4.5 with
+a Claude-Code-style single-agent loop. The agent's MCP tools are
+defined inside the agent itself (because they need closures over the
+running task + effects buffer), so there's no separate Tool registry
+in this phase.
 """
 
 from virtual_dev.application.services.clarification.task_orchestrator import (
@@ -18,25 +20,9 @@ from virtual_dev.application.services.clarification.task_orchestrator import (
 from virtual_dev.application.services.clarification.task_repo import (
     ClarificationTaskRepository,
 )
-from virtual_dev.application.services.clarification.tools import (
-    PendingReply,
-    Tool,
-    ToolContext,
-    ToolOutcome,
-    ToolRegistry,
-    discover_builtin_tools,
-    get_tool_registry,
-)
 
 __all__ = [
     "ClarificationTaskRepository",
-    "PendingReply",
     "TaskOrchestrator",
     "TaskOrchestratorStats",
-    "Tool",
-    "ToolContext",
-    "ToolOutcome",
-    "ToolRegistry",
-    "discover_builtin_tools",
-    "get_tool_registry",
 ]

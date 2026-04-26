@@ -35,11 +35,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from virtual_dev.adapters.chat.in_memory import InMemoryChat
 from virtual_dev.adapters.code_agent import ClaudeAgentSdkCodeAgent
 from virtual_dev.application.agents import AnalystAgent
-from virtual_dev.application.agents.clarification_tool_picker import (
-    ClarificationToolPicker,
-)
-from virtual_dev.application.agents.clarification_validator import (
-    ClarificationValidator,
+from virtual_dev.application.agents.clarification_agent import (
+    ClarificationAgent,
 )
 from virtual_dev.application.services import (
     CommunicatorService,
@@ -165,26 +162,19 @@ async def _build_state(
         prompts_loader=prompts_loader,
     )
 
-    picker = ClarificationToolPicker(
+    clarification_agent = ClarificationAgent(
         code_agent=code_agent,
         config=config,
         prompts_loader=prompts_loader,
+        communicator=communicator,
         researcher=researcher,
-        injection_filter=injection_filter,
-        trace=trace,
-    )
-    validator = ClarificationValidator(
-        code_agent=code_agent,
-        config=config,
-        prompts_loader=prompts_loader,
         injection_filter=injection_filter,
         trace=trace,
     )
     task_orchestrator = TaskOrchestrator(
         repo=ClarificationTaskRepository(session_factory),
         communicator=communicator,
-        picker=picker,
-        validator=validator,
+        agent=clarification_agent,
         config=config,
         session_factory=session_factory,
         message_bus=None,

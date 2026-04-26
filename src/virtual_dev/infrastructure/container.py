@@ -27,11 +27,8 @@ from virtual_dev.application.agents.dev import DevAgent
 from virtual_dev.application.agents.devops import DevOpsAgent
 from virtual_dev.application.agents.orchestrator import dev_agent_key
 from virtual_dev.application.agents.reviewer import ReviewerAgent
-from virtual_dev.application.agents.clarification_tool_picker import (
-    ClarificationToolPicker,
-)
-from virtual_dev.application.agents.clarification_validator import (
-    ClarificationValidator,
+from virtual_dev.application.agents.clarification_agent import (
+    ClarificationAgent,
 )
 from virtual_dev.application.agents.thread_responder import ThreadResponderAgent
 from virtual_dev.application.services import (
@@ -92,10 +89,9 @@ class Container:
     reviewer: ReviewerAgent
     devops: DevOpsAgent
     thread_responder: ThreadResponderAgent
-    # Phase 4.5: task-driven clarification subsystem.
+    # Phase 4.6: single-agent clarification subsystem.
     task_repo: ClarificationTaskRepository
-    tool_picker: ClarificationToolPicker
-    validator: ClarificationValidator
+    clarification_agent: ClarificationAgent
     task_orchestrator: TaskOrchestrator
 
     async def init_db(self) -> None:
@@ -270,26 +266,20 @@ def build_container(config_dir: Path | str = "config") -> Container:
         prompts_loader=prompts_loader,
     )
 
-    # Phase 4.5: task-driven clarification subsystem.
+    # Phase 4.6: single-agent clarification subsystem.
     task_repo = ClarificationTaskRepository(session_factory=session_factory)
-    tool_picker = ClarificationToolPicker(
+    clarification_agent = ClarificationAgent(
         code_agent=code_agent,
         config=config,
         prompts_loader=prompts_loader,
+        communicator=communicator,
         researcher=researcher,
-        injection_filter=injection_filter,
-    )
-    validator = ClarificationValidator(
-        code_agent=code_agent,
-        config=config,
-        prompts_loader=prompts_loader,
         injection_filter=injection_filter,
     )
     task_orchestrator = TaskOrchestrator(
         repo=task_repo,
         communicator=communicator,
-        picker=tool_picker,
-        validator=validator,
+        agent=clarification_agent,
         config=config,
         session_factory=session_factory,
         message_bus=message_bus,
@@ -347,8 +337,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         devops=devops,
         thread_responder=thread_responder,
         task_repo=task_repo,
-        tool_picker=tool_picker,
-        validator=validator,
+        clarification_agent=clarification_agent,
         task_orchestrator=task_orchestrator,
     )
 
