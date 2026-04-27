@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from virtual_dev.tools._helpers import (
+    parse_jira_attachment_id,
     parse_mm_post_id,
     url_is_on_host,
 )
@@ -46,6 +47,34 @@ def test_parse_mm_post_id_extracts_from_permalink_or_bare(
 )
 def test_parse_mm_post_id_returns_none_for_unparseable(inp: str) -> None:
     assert parse_mm_post_id(inp) is None
+
+
+@pytest.mark.parametrize(
+    ("inp", "expected"),
+    [
+        ("https://jira.2gis.ru/secure/attachment/788824/V2%20(2).pdf", "788824"),
+        ("https://jira.example.com/secure/attachment/123/file.docx", "123"),
+        # Trailing-slash variant
+        ("https://jira.example.com/secure/attachment/999/", "999"),
+        # Bare id pass-through
+        ("788824", "788824"),
+    ],
+)
+def test_parse_jira_attachment_id_extracts_id(inp: str, expected: str) -> None:
+    assert parse_jira_attachment_id(inp) == expected
+
+
+@pytest.mark.parametrize(
+    "inp",
+    [
+        "",
+        "https://jira.example.com/browse/DM-123",  # not an attachment URL
+        "not a url",
+        "abc",  # non-numeric bare
+    ],
+)
+def test_parse_jira_attachment_id_none_for_unparseable(inp: str) -> None:
+    assert parse_jira_attachment_id(inp) is None
 
 
 @pytest.mark.parametrize(

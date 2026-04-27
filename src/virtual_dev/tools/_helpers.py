@@ -86,6 +86,49 @@ def fetch_url_with_bearer(url: str, token: str, *, timeout: float = 30.0) -> byt
 
 
 _MM_PERMALINK_RE = re.compile(r"/pl/([a-z0-9]+)/?", re.IGNORECASE)
+_JIRA_ATTACHMENT_RE = re.compile(
+    r"/secure/attachment/(\d+)(?:/|$)", re.IGNORECASE,
+)
+
+
+def parse_jira_attachment_id(url: str) -> str | None:
+    """Extract the numeric attachment id from a Jira download URL.
+
+    Self-hosted Jira links to attachments as
+    ``<base>/secure/attachment/<id>/<filename>`` in the ticket
+    description. Hitting that path directly with PAT auth returns
+    HTML (login redirect / wrapper) — we use the REST API
+    ``/rest/api/2/attachment/content/<id>`` instead, which needs the
+    bare id.
+
+    Returns ``None`` for inputs we can't parse.
+    """
+    if not url:
+        return None
+    m = _JIRA_ATTACHMENT_RE.search(url)
+    if m:
+        return m.group(1)
+    # Bare numeric id pass-through.
+    if re.fullmatch(r"\d+", url.strip()):
+        return url.strip()
+    return None
+
+
+def fetch_jira_attachment_content(
+    *, jira_url: str, jira_token: str, attachment_id: str,
+) -> bytes:
+    """Download attachment bytes via Jira REST API. Sync — wrap with
+    ``asyncio.to_thread``. Uses ``atlassian-python-api`` so it picks
+    up the same auth shape as the rest of the Jira-tracker code.
+    """
+    from atlassian import Jira
+    client = Jira(url=jira_url, token=jira_token, cloud=False)
+    body = client.get_attachment_content(attachment_id)
+    if not isinstance(body, (bytes, bytearray)):
+        raise RuntimeError(
+            f"Unexpected attachment response type: {type(body).__name__}"
+        )
+    return bytes(body)
 
 
 def parse_mm_post_id(url_or_id: str) -> str | None:
@@ -126,8 +169,10 @@ def url_is_on_host(url: str, expected_host: str) -> bool:
 
 __all__ = [
     "error_text",
+    "fetch_jira_attachment_content",
     "fetch_url_with_bearer",
     "git_grep",
+    "parse_jira_attachment_id",
     "parse_mm_post_id",
     "text_result",
     "url_is_on_host",
