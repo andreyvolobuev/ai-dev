@@ -115,45 +115,67 @@ def parse_jira_attachment_id(url: str) -> str | None:
 
 
 def fetch_jira_attachment_content(
-    *, jira_url: str, jira_token: str, attachment_id: str,
+    *, jira_url: str, jira_token: str, url_or_id: str,
 ) -> bytes:
     """Download attachment bytes from Jira. Sync — wrap with
-    ``asyncio.to_thread``. Uses ``atlassian-python-api`` so it picks
-    up the same auth shape (PAT Bearer) as the rest of the Jira code.
+    ``asyncio.to_thread``.
 
-    Two-step on Server/DC:
+    ``url_or_id`` is either a full ``/secure/attachment/<id>/<filename>``
+    URL (the form Jira surfaces in ``fields.attachment[].content``) or
+    a bare numeric id. For a bare id we hit metadata once to get the
+    canonical content URL, then download.
 
-    1. ``GET /rest/api/2/attachment/<id>`` returns metadata with a
-       ``content`` field — the actual download URL on
-       ``/secure/attachment/<id>/<filename>``.
-    2. Fetch that URL via the same authenticated session.
+    Verified empirically against Jira Server/DC: a plain GET to
+    ``/secure/attachment/<id>/<filename>`` with ``Authorization:
+    Bearer <PAT>`` returns 200 + the file bytes. No need for the
+    atlassian-python-api ``_session`` wrapper.
 
-    The shortcut ``client.get_attachment_content(id)`` exists in the
-    library but only works on Jira Cloud — Server/DC returns 404.
+    Why a non-200-but-200 used to look like a parsing error: hitting
+    ``/secure/attachment/<id>/...`` with a *non-existent* id returns
+    ``200 OK`` with a near-empty body (Jira's quirk), not 404 — that's
+    why the previous failure surfaced as ``invalid pdf header``
+    instead of an HTTP error. We surface non-PDF/non-zip bodies as
+    explicit errors below.
     """
-    from atlassian import Jira
-    client = Jira(url=jira_url, token=jira_token, cloud=False)
+    s = (url_or_id or "").strip()
+    if not s:
+        raise RuntimeError("empty url_or_id")
+    if s.startswith(("http://", "https://")):
+        download_url = s
+    else:
+        # Bare id → fetch metadata for the canonical content URL.
+        from atlassian import Jira
+        client = Jira(url=jira_url, token=jira_token, cloud=False)
+        meta = client.get_attachment(s)
+        if not isinstance(meta, dict) or not meta.get("content"):
+            raise RuntimeError(
+                f"Jira attachment {s}: no metadata or missing `content` URL"
+            )
+        download_url = str(meta["content"])
 
-    meta = client.get_attachment(attachment_id)
-    if not isinstance(meta, dict):
+    if not url_is_on_host(download_url, jira_url):
         raise RuntimeError(
-            f"Unexpected attachment metadata: {type(meta).__name__}"
-        )
-    content_url = meta.get("content")
-    if not content_url:
-        raise RuntimeError(
-            f"Jira attachment {attachment_id} metadata has no `content` URL "
-            f"(keys: {sorted(meta.keys())})"
+            f"refusing to send Jira PAT to non-Jira host: {download_url}"
         )
 
-    response = client._session.get(content_url, allow_redirects=True)
-    if response.status_code != 200:
-        body_preview = (response.text or "")[:200]
+    import httpx
+    with httpx.Client(timeout=60, follow_redirects=True) as c:
+        resp = c.get(download_url, headers={"Authorization": f"Bearer {jira_token}"})
+    if resp.status_code != 200:
+        body_preview = (resp.text or "")[:200]
         raise RuntimeError(
-            f"Jira attachment download failed: HTTP {response.status_code} "
-            f"from {content_url} (body: {body_preview!r})"
+            f"Jira attachment download failed: HTTP {resp.status_code} "
+            f"from {download_url} (body: {body_preview!r})"
         )
-    return response.content
+    body = resp.content
+    # Jira returns 200 + tiny body for non-existent ids. Catch that
+    # case explicitly so the parser doesn't barf on a 5-byte "PDF".
+    if len(body) < 64:
+        raise RuntimeError(
+            f"Jira attachment download returned only {len(body)} bytes — "
+            f"likely a non-existent id. URL was {download_url}"
+        )
+    return body
 
 
 def parse_mm_post_id(url_or_id: str) -> str | None:

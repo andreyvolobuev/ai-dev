@@ -59,8 +59,7 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
         return error_text("Empty URL")
     if not settings.jira_url or not settings.jira_token:
         return error_text("Jira credentials are not configured (JIRA_URL / JIRA_TOKEN)")
-    attachment_id = parse_jira_attachment_id(url)
-    if attachment_id is None:
+    if parse_jira_attachment_id(url) is None:
         return error_text(
             f"Couldn't extract an attachment id from {url!r}. Expected "
             f"either a /secure/attachment/<id>/<filename> URL or a bare "
@@ -71,11 +70,11 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
             fetch_jira_attachment_content,
             jira_url=settings.jira_url,
             jira_token=settings.jira_token,
-            attachment_id=attachment_id,
+            url_or_id=url,
         )
     except Exception as exc:
         logger.exception("read_jira_attachment_docx: download failed")
-        return error_text(f"Download failed (attachment {attachment_id}): {exc}")
+        return error_text(f"Download failed: {exc}")
 
     try:
         doc = await asyncio.to_thread(Document, io.BytesIO(body))
