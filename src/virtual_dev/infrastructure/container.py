@@ -125,6 +125,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
     """
     settings = Settings()
     config = load_config(config_dir)
+    _apply_settings_overrides(config, settings)
 
     engine = make_engine(settings.db_url)
     session_factory = make_session_factory(engine)
@@ -144,17 +145,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
             "Jira credentials are incomplete (JIRA_URL or JIRA_TOKEN missing) — task tracker disabled"
         )
 
-    chat: ChatPort | None = None
-    if settings.mattermost_url and settings.mattermost_token:
-        chat = MattermostChat(
-            url=settings.mattermost_url,
-            token=settings.mattermost_token,
-            bot_username=settings.mattermost_bot_username or None,
-            ssl_verify=settings.mattermost_ssl_verify,
-            ssl_ca_file=settings.mattermost_ssl_ca_file or None,
-        )
-    else:
-        logger.warning("Mattermost credentials missing — chat disabled")
+    chat: ChatPort | None = _build_chat_adapter(settings)
 
     knowledge_base: KnowledgeBasePort | None = None
     if settings.confluence_url and settings.confluence_user and settings.confluence_token:
@@ -332,3 +323,50 @@ def _host(url: str) -> str | None:
     if not url:
         return None
     return urlparse(url).hostname
+
+
+def _apply_settings_overrides(config: AppConfig, settings: Settings) -> None:
+    """Layer deploy-specific values from ``.env`` on top of the YAML
+    config. Replaces the old ``config/local.yaml`` overlay so all
+    deploy-specific values live in one place (the environment).
+
+    Empty env values fall through to whatever's in YAML.
+    """
+    if settings.escalation_user:
+        config.agents.escalation.mattermost_user = settings.escalation_user
+    if settings.default_team_channel:
+        config.mappings.team_channels["default"] = settings.default_team_channel
+    if settings.repo_local_paths:
+        for repo in config.repositories:
+            override = settings.repo_local_paths.get(repo.key)
+            if override:
+                repo.local_path = override
+
+
+def _build_chat_adapter(settings: Settings) -> "ChatPort | None":
+    """Pick the chat adapter from ``CHAT_PROVIDER`` env. Defaults to
+    Mattermost. Slack/Telegram raise NotImplementedError until adapters
+    land — keep the env knob so swapping is config-only when they do.
+    """
+    provider = (settings.chat_provider or "mattermost").lower()
+    if provider == "mattermost":
+        if not (settings.mattermost_url and settings.mattermost_token):
+            logger.warning("Mattermost credentials missing — chat disabled")
+            return None
+        return MattermostChat(
+            url=settings.mattermost_url,
+            token=settings.mattermost_token,
+            bot_username=settings.mattermost_bot_username or None,
+            ssl_verify=settings.mattermost_ssl_verify,
+            ssl_ca_file=settings.mattermost_ssl_ca_file or None,
+        )
+    if provider in ("slack", "telegram"):
+        raise NotImplementedError(
+            f"chat_provider={provider!r} is configurable but no adapter "
+            f"is wired yet. Set CHAT_PROVIDER=mattermost or implement "
+            f"the adapter under src/virtual_dev/adapters/chat/."
+        )
+    raise ValueError(
+        f"Unknown CHAT_PROVIDER={provider!r}. "
+        f"Expected one of: mattermost, slack, telegram."
+    )

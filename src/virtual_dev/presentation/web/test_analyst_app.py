@@ -111,10 +111,9 @@ async def _build_state(
     # the test-analyst session). Without this an `escalate_to_lead`
     # decision silently drops the DM and the activity feed shows
     # nothing — the operator can't tell the bot gave up. We always
-    # override here, even if config/local.yaml has a real lead handle
-    # configured — that handle won't exist in the in-memory chat
-    # directory, so the DM would drop. The operator IS the lead in
-    # this session.
+    # override here, even if ESCALATION_USER points at a real lead —
+    # that handle won't exist in the in-memory chat directory, so
+    # the DM would drop. The operator IS the lead in this session.
     config.agents.escalation.mattermost_user = "you"
 
     engine = make_engine("sqlite+aiosqlite:///:memory:")

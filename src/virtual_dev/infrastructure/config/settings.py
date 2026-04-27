@@ -6,6 +6,12 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+class _ChatProvider:
+    MATTERMOST = "mattermost"
+    SLACK = "slack"          # placeholder — adapter not yet implemented
+    TELEGRAM = "telegram"    # placeholder — adapter not yet implemented
+
+
 class Settings(BaseSettings):
     """Secrets and per-machine runtime config.
 
@@ -28,6 +34,11 @@ class Settings(BaseSettings):
     # --- GitLab ---
     gitlab_url: str = ""
     gitlab_token: str = ""
+
+    # --- Chat provider ---
+    # Which chat adapter to wire. Default mattermost; "slack" /
+    # "telegram" are placeholders pending adapter implementations.
+    chat_provider: str = _ChatProvider.MATTERMOST
 
     # --- Mattermost ---
     mattermost_url: str = ""
@@ -61,6 +72,23 @@ class Settings(BaseSettings):
     web_port: int = 8080
 
     log_level: str = Field(default="INFO")
+
+    # --- Deploy-specific overrides (replaces config/local.yaml) ---
+    # All deploy-specific values now live in the environment alongside
+    # the secrets — there's no second uncommitted file to track.
+    #
+    # Chat handle of the team-lead the bot escalates to. Falls back
+    # to whatever's in agents.yaml; in practice that's empty so set
+    # this in your .env.
+    escalation_user: str = ""
+    # Default team channel for broadcasts (e.g. "Plan ready" pings).
+    # Same fallback contract as escalation_user.
+    default_team_channel: str = ""
+    # Per-developer-machine paths to repo checkouts. JSON-encoded:
+    # ``REPO_LOCAL_PATHS={"bellingshausen": "/Users/x/bellingshausen"}``
+    # Empty value → fall back to ``workspaces_dir/<key>`` (for cloned
+    # repos) or whatever's in repositories.yaml.
+    repo_local_paths: dict[str, str] = Field(default_factory=dict)
 
     # --- Phase 3 ---
     # How often Reviewer / DevOps scan open MRs. Tight enough for feedback,
