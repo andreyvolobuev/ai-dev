@@ -35,6 +35,7 @@ from virtual_dev.application.services import (
     ResearcherToolkit,
     RulesLoader,
 )
+from virtual_dev.application.services.agent_trace import AgentTrace
 from virtual_dev.application.services.analyst_session_repo import (
     AnalystSessionRepository,
 )
@@ -88,6 +89,9 @@ class Container:
     # Phase 5.0: analyst is the only agent. Session state per ticket
     # lives on TaskRow + analyst_conversation_steps.
     analyst_session_repo: AnalystSessionRepository
+    # Always-on event broadcaster. Subscribed by the log sink in the
+    # web app's lifespan so DEBUG logs mirror the test-analyst UI feed.
+    trace: AgentTrace
 
     async def init_db(self) -> None:
         """Create all tables. Used by ``virtual-dev db init``."""
@@ -204,8 +208,10 @@ def build_container(config_dir: Path | str = "config") -> Container:
     else:
         logger.info("MR-history index disabled (VCS not configured)")
 
+    trace = AgentTrace()
     code_agent: CodeAgentPort = ClaudeAgentSdkCodeAgent(
         default_model=config.agents.models.default,
+        trace=trace,
     )
     llm: LlmPort = ClaudeAgentSdkLlm()
 
@@ -318,6 +324,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         devops=devops,
         thread_responder=thread_responder,
         analyst_session_repo=analyst_session_repo,
+        trace=trace,
     )
 
 

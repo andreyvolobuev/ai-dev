@@ -44,6 +44,7 @@ from virtual_dev.application.services import (
 from virtual_dev.application.services.agent_trace import (
     AgentTrace,
     AgentTraceEvent,
+    consume_trace_to_logs,
 )
 from virtual_dev.application.services.analyst_session_repo import (
     AnalystSessionRepository,
@@ -214,6 +215,14 @@ def build_test_analyst_app(
         )
         coalescer_task = asyncio.create_task(coalescer.run_forever(), name="coalescer")
 
+        # Log sink: also drain trace events to loguru DEBUG locally so
+        # the test-analyst console mirrors the UI feed (useful when
+        # iterating on prompts without the browser open).
+        log_sink_task = asyncio.create_task(
+            consume_trace_to_logs(state.trace),
+            name="agent-trace-log-sink",
+        )
+
         # Listener-style consumer: every user message lands on chat.subscribe()
         # and we route it through the orchestrator's append_fragment using the
         # same lookup logic as MmThreadListener.
@@ -224,7 +233,7 @@ def build_test_analyst_app(
             yield
         finally:
             await coalescer.stop()
-            for task in (coalescer_task, listener_task):
+            for task in (coalescer_task, listener_task, log_sink_task):
                 task.cancel()
                 try:
                     await task

@@ -25,6 +25,7 @@ from virtual_dev.application.agents.orchestrator import (
     TOPIC_PLAN_READY,
     TOPIC_TASK_DISCOVERED,
 )
+from virtual_dev.application.services.agent_trace import consume_trace_to_logs
 from virtual_dev.infrastructure.container import Container
 from virtual_dev.infrastructure.db import (
     AnalystConversationStepRow,
@@ -76,6 +77,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         config=container.config,
         message_bus=container.message_bus,
         session_factory=container.session_factory,
+        trace=container.trace,
     )
     analyst_runner = AgentRunner(
         agent_key=AnalystAgent.agent_key,
@@ -142,6 +144,14 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         background: list[asyncio.Task[None]] = []
+        # Log sink: drains AgentTrace into loguru DEBUG so a prod log
+        # at level=DEBUG mirrors the test-analyst UI feed (one line per
+        # tool_use / llm_text / agent_started / orchestrator event,
+        # tagged with the analyst-run correlation id).
+        background.append(asyncio.create_task(
+            consume_trace_to_logs(container.trace),
+            name="agent-trace-log-sink",
+        ))
         if start_scheduler:
             background.append(asyncio.create_task(orchestrator.run_forever(), name="orchestrator"))
             background.append(asyncio.create_task(analyst_runner.run_forever(), name="analyst-runner"))

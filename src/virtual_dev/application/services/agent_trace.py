@@ -15,13 +15,36 @@ emitting, so the cost is zero when unused.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from loguru import logger
+
+# Holds the current agent-run correlation id. Set via ``bind_run_id``
+# at the start of an agent invocation (e.g. ``AnalystAgent.run``); all
+# AgentTraceEvents emitted within that async context auto-stamp it.
+# Lets the operator grep a single run end-to-end across log lines.
+_RUN_ID_CTX: ContextVar[str | None] = ContextVar("agent_run_id", default=None)
+
+
+@contextmanager
+def bind_run_id(run_id: str) -> Iterator[None]:
+    """Bind a correlation id to the current async context. Exiting the
+    block resets back to the prior value so nested binds work."""
+    token = _RUN_ID_CTX.set(run_id)
+    # Loguru's contextualize threads run_id into every logger.* call
+    # made inside the block, so format strings can include it.
+    with logger.contextualize(run_id=run_id):
+        try:
+            yield
+        finally:
+            _RUN_ID_CTX.reset(token)
 
 
 @dataclass
@@ -32,6 +55,11 @@ class AgentTraceEvent:
     agent_key: str      # e.g. 'analyst', 'answer-classifier'
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     payload: dict[str, Any] = field(default_factory=dict)
+    run_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.run_id is None:
+            self.run_id = _RUN_ID_CTX.get()
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -39,6 +67,7 @@ class AgentTraceEvent:
             "agent_key": self.agent_key,
             "timestamp": self.timestamp.isoformat(),
             "payload": self.payload,
+            "run_id": self.run_id,
         }
 
 
@@ -121,4 +150,62 @@ async def emit_if(trace: AgentTrace | None, event: AgentTraceEvent) -> None:
         await trace.emit(event)
 
 
-__all__ = ["AgentTrace", "AgentTraceEvent", "emit_if"]
+# How much of any one text payload to dump into logs. The UI already
+# has the full text via the websocket; logs are for grep-friendly
+# post-mortem, not full prompt archives.
+_TRACE_LOG_TEXT_LIMIT = 500
+
+
+def _format_event_for_log(event: AgentTraceEvent) -> str:
+    """One-line, grep-friendly digest of an event. Long fields are
+    truncated; the UI keeps the full original."""
+    parts: list[str] = [
+        f"trace[{event.run_id or '-'}] {event.type} agent={event.agent_key}",
+    ]
+    payload = event.payload or {}
+    for key, value in payload.items():
+        if isinstance(value, str):
+            short = value if len(value) <= _TRACE_LOG_TEXT_LIMIT else (
+                value[:_TRACE_LOG_TEXT_LIMIT] + f"…[+{len(value) - _TRACE_LOG_TEXT_LIMIT}]"
+            )
+            parts.append(f"{key}={short!r}")
+        elif isinstance(value, (int, float, bool)) or value is None:
+            parts.append(f"{key}={value}")
+        else:
+            try:
+                serialised = json.dumps(value, ensure_ascii=False)
+            except TypeError:
+                serialised = repr(value)
+            short = serialised if len(serialised) <= _TRACE_LOG_TEXT_LIMIT else (
+                serialised[:_TRACE_LOG_TEXT_LIMIT]
+                + f"…[+{len(serialised) - _TRACE_LOG_TEXT_LIMIT}]"
+            )
+            parts.append(f"{key}={short}")
+    return " ".join(parts)
+
+
+async def consume_trace_to_logs(trace: AgentTrace) -> None:
+    """Drain ``trace`` into loguru DEBUG, one record per event.
+
+    Long-running coroutine — start it as a background task in the app
+    lifespan. Cancelling the task stops the drain. Each emit binds the
+    event's ``run_id`` into loguru context so format strings including
+    ``{extra[run_id]}`` light up.
+    """
+    sub = trace.subscribe()
+    try:
+        async for event in sub:
+            line = _format_event_for_log(event)
+            with logger.contextualize(run_id=event.run_id or "-"):
+                logger.debug(line)
+    except asyncio.CancelledError:
+        pass
+
+
+__all__ = [
+    "AgentTrace",
+    "AgentTraceEvent",
+    "bind_run_id",
+    "consume_trace_to_logs",
+    "emit_if",
+]

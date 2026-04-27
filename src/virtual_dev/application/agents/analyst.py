@@ -26,6 +26,7 @@ the whole conversation itself.
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,7 @@ from virtual_dev.application.services import (
     PromptsLoader,
     ResearcherToolkit,
 )
+from virtual_dev.application.services.agent_trace import bind_run_id
 from virtual_dev.domain.models.analyst_conversation import (
     ConversationStep,
     ConversationStepKind,
@@ -145,6 +147,17 @@ class AnalystAgent:
     async def run(self, inp: AnalystRunInput) -> AnalystRunResult:
         """Run the agent once on this task with the given history.
         Returns AnalystRunResult with the side-effects to apply."""
+        # Stable correlation id for every event emitted in this run —
+        # lets ops grep one analyst invocation end-to-end across logs
+        # even when multiple tickets are interleaving in the same proc.
+        run_id = (
+            f"{inp.task_row.tracker}:{inp.task_row.external_id}:"
+            f"{uuid.uuid4().hex[:8]}"
+        )
+        with bind_run_id(run_id):
+            return await self._run_inner(inp)
+
+    async def _run_inner(self, inp: AnalystRunInput) -> AnalystRunResult:
         target_repo = inp.target_repo or self._guess_target_repo(inp.task_row)
         cwd = inp.repo_workspace or self._resolve_cwd(target_repo)
 
