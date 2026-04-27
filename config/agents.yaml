@@ -79,7 +79,7 @@ agents:
   # Один агент-планировщик решает каждый шаг: задать вопрос
   # (с заново сформулированным текстом), достичь цели, эскалировать,
   # сдаться, подождать. Имеет Read/Grep + Researcher MCP +
-  # lookup_mm_user — для self-research до DM-инга людей.
+  # lookup_chat_user — для self-research до DM-инга людей.
   clarification_planner:
     model: default
     max_iterations_per_task: 20

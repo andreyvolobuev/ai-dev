@@ -1,6 +1,6 @@
 """Tests for the test-analyst InMemoryChat adapter.
 
-Pins the contract that ``lookup_mm_user`` (via
+Pins the contract that ``lookup_chat_user`` (via
 ``find_user_by_username``) must not synthesize random users — it
 only resolves handles the operator has spoken as. The earlier
 permissive behaviour caused the planner to DM "Вася Курочкин" without

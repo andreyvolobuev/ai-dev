@@ -69,7 +69,7 @@ class InMemoryChat(ChatPort):
         # username → ChatUser for handles the operator has actually
         # spoken as (or registered via ``register_user``). Distinguishes
         # "real" people from fictional names the planner might guess —
-        # without this, ``lookup_mm_user`` would say everyone exists and
+        # without this, ``lookup_chat_user`` would say everyone exists and
         # Vasya Kurochkin (who isn't on the team) gets DM'd.
         self._known_users: dict[str, ChatUser] = {
             user_name: ChatUser(id=user_id, username=user_name),
@@ -227,7 +227,7 @@ class InMemoryChat(ChatPort):
         if author_username:
             author_id = f"uid-{author_username}"
             default_channel = f"dm-{author_id}"
-            # Register: from now on lookup_mm_user finds this handle.
+            # Register: from now on lookup_chat_user finds this handle.
             self._known_users.setdefault(
                 author_username,
                 ChatUser(id=author_id, username=author_username),

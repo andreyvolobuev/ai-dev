@@ -11,8 +11,8 @@ Flow per invocation:
 1. Re-fetch task, conversation history, prior research notes.
 2. Render user prompt (ticket + context + history + how-to-proceed).
 3. Run the agent. Inside one run it can chain SYNC tools freely
-   (Read / Grep / Researcher MCP / find_mm_user_by_name /
-   lookup_mm_user). When it needs a human, it calls ``ask_mm_user``
+   (Read / Grep / Researcher MCP / find_chat_user_by_name /
+   lookup_chat_user). When it needs a human, it calls ``dm_user``
    (ASYNC — ends the turn). When it has the plan, it calls
    ``submit_plan`` (terminal).
 4. Return :class:`AnalystRunResult` with the side-effects observed.
@@ -61,7 +61,7 @@ from virtual_dev.infrastructure.db.mappers import plan_to_row
 _ANALYST_PROMPT_NAME = "analyst"
 _ANALYST_FALLBACK_PROMPT = (
     "You are the Analyst agent. Read the ticket, research, ask humans "
-    "via ask_mm_user when stuck, then call submit_plan when ready.\n\n"
+    "via dm_user when stuck, then call submit_plan when ready.\n\n"
     "{untrusted_warning}"
 )
 
@@ -258,21 +258,21 @@ class AnalystAgent:
         parts.append("## How to proceed")
         parts.append(
             "Within this run you may chain SYNC tools freely "
-            "(find_mm_user_by_name, lookup_mm_user, Read/Glob/Grep, "
+            "(find_chat_user_by_name, lookup_chat_user, Read/Glob/Grep, "
             "Researcher MCP). Read results, think, call another."
         )
         parts.append(
             "When you reach a decision point, end with EXACTLY ONE of:"
         )
         parts.append(
-            "- `ask_mm_user` (ASYNC) — DM a human; END YOUR TURN after "
+            "- `dm_user` (ASYNC) — DM a human; END YOUR TURN after "
             "this. You'll be re-invoked when they reply."
         )
         parts.append(
             "- `submit_plan` — you have everything you need; ship the "
             "actionable plan. **Status MUST be `ready` when calling "
             "submit_plan** — there's no longer a `clarifying` path; if "
-            "you need more info, call ask_mm_user instead and let the "
+            "you need more info, call dm_user instead and let the "
             "loop continue."
         )
         parts.append(
@@ -335,9 +335,9 @@ class AnalystAgent:
             effects, plan_capture, run_state,
         )
         allowed.extend([
-            "mcp__virtual_dev_analyst__find_mm_user_by_name",
-            "mcp__virtual_dev_analyst__lookup_mm_user",
-            "mcp__virtual_dev_analyst__ask_mm_user",
+            "mcp__virtual_dev_analyst__find_chat_user_by_name",
+            "mcp__virtual_dev_analyst__lookup_chat_user",
+            "mcp__virtual_dev_analyst__dm_user",
             "mcp__virtual_dev_analyst__submit_plan",
             "mcp__virtual_dev_analyst__escalate_to_lead",
             "mcp__virtual_dev_analyst__abandon",
@@ -357,11 +357,11 @@ class AnalystAgent:
         communicator = self._communicator
 
         @tool(
-            "find_mm_user_by_name",
-            "Fuzzy-search Mattermost directory by name (Russian or "
-            "English). Matches first_name / last_name / nickname / "
-            "username. Use the surname when possible. Returns 0..N "
-            "candidates. **Use BEFORE asking anyone about a person "
+            "find_chat_user_by_name",
+            "Fuzzy-search the chat-platform user directory by name "
+            "(Russian or English). Matches first_name / last_name / "
+            "nickname / username. Use the surname when possible. Returns "
+            "0..N candidates. **Use BEFORE asking anyone about a person "
             "whose handle you don't know.**",
             {
                 "type": "object",
@@ -386,7 +386,7 @@ class AnalystAgent:
                 "query": query,
                 "matches": [
                     {
-                        "handle": u.username, "mm_user_id": u.id,
+                        "handle": u.username, "user_id": u.id,
                         "email": u.email,
                         "first_name": u.first_name,
                         "last_name": u.last_name,
@@ -398,9 +398,9 @@ class AnalystAgent:
             })
 
         @tool(
-            "lookup_mm_user",
-            "Resolve a Mattermost user by exact handle or email. "
-            "Returns {found: bool, mm_user_id?, display_name?}.",
+            "lookup_chat_user",
+            "Resolve a chat-platform user by exact handle or email. "
+            "Returns {found: bool, user_id?, display_name?}.",
             {
                 "type": "object",
                 "properties": {
@@ -418,16 +418,17 @@ class AnalystAgent:
             if uid is None:
                 return _wrap({"found": False, "reason": "not_found"})
             return _wrap({
-                "found": True, "mm_user_id": uid,
+                "found": True, "user_id": uid,
                 "display_name": handle or email,
             })
 
         @tool(
-            "ask_mm_user",
-            "DM a Mattermost user one question. Pass to_handle OR "
-            "to_email. **THIS IS ASYNC** — after calling, END YOUR "
-            "TURN; you'll be re-invoked when the human replies. Do NOT "
-            "call any other tools after this in the same turn.",
+            "dm_user",
+            "Send a direct message to a chat-platform user with one "
+            "question. Pass to_handle OR to_email. **THIS IS ASYNC** — "
+            "after calling, END YOUR TURN; you'll be re-invoked when "
+            "the human replies. Do NOT call any other tools after this "
+            "in the same turn.",
             {
                 "type": "object",
                 "properties": {
@@ -446,7 +447,7 @@ class AnalystAgent:
                     "sent": False,
                     "reason": "already_dispatched_this_run",
                     "instruction": (
-                        "You already called ask_mm_user once this turn. "
+                        "You already called dm_user once this turn. "
                         "ASK is async — END YOUR TURN now. The "
                         "orchestrator will re-invoke you when the human "
                         "replies, and only then you can ask another "
@@ -472,9 +473,9 @@ class AnalystAgent:
                 return _wrap({
                     "sent": False, "reason": f"unresolved:{label}",
                     "hint": (
-                        "Don't guess transliterations. find_mm_user_by_name "
-                        "first, or DM the issue reporter for a confirmed "
-                        "handle."
+                        "Don't guess transliterations. "
+                        "find_chat_user_by_name first, or DM the issue "
+                        "reporter for a confirmed handle."
                     ),
                 })
             outcome = await communicator.send_dm(uid, message)
@@ -511,7 +512,7 @@ class AnalystAgent:
             "Submit your final, READY plan. Call this when you've "
             "gathered all info needed and a Dev agent could implement "
             "from the steps. Status MUST be 'ready'. If something's "
-            "still missing, use ask_mm_user instead.",
+            "still missing, use dm_user instead.",
             _SUBMIT_PLAN_SCHEMA,
         )
         async def _submit_plan(args: dict[str, Any]) -> dict[str, Any]:
@@ -520,7 +521,7 @@ class AnalystAgent:
                     "recorded": False,
                     "reason": "ask_pending",
                     "instruction": (
-                        "You called ask_mm_user this turn — that DM is "
+                        "You called dm_user this turn — that DM is "
                         "in flight, you don't have the answer yet. "
                         "END YOUR TURN now. The orchestrator will "
                         "re-invoke you with the human's reply, and "
