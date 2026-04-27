@@ -117,18 +117,43 @@ def parse_jira_attachment_id(url: str) -> str | None:
 def fetch_jira_attachment_content(
     *, jira_url: str, jira_token: str, attachment_id: str,
 ) -> bytes:
-    """Download attachment bytes via Jira REST API. Sync — wrap with
+    """Download attachment bytes from Jira. Sync — wrap with
     ``asyncio.to_thread``. Uses ``atlassian-python-api`` so it picks
-    up the same auth shape as the rest of the Jira-tracker code.
+    up the same auth shape (PAT Bearer) as the rest of the Jira code.
+
+    Two-step on Server/DC:
+
+    1. ``GET /rest/api/2/attachment/<id>`` returns metadata with a
+       ``content`` field — the actual download URL on
+       ``/secure/attachment/<id>/<filename>``.
+    2. Fetch that URL via the same authenticated session.
+
+    The shortcut ``client.get_attachment_content(id)`` exists in the
+    library but only works on Jira Cloud — Server/DC returns 404.
     """
     from atlassian import Jira
     client = Jira(url=jira_url, token=jira_token, cloud=False)
-    body = client.get_attachment_content(attachment_id)
-    if not isinstance(body, (bytes, bytearray)):
+
+    meta = client.get_attachment(attachment_id)
+    if not isinstance(meta, dict):
         raise RuntimeError(
-            f"Unexpected attachment response type: {type(body).__name__}"
+            f"Unexpected attachment metadata: {type(meta).__name__}"
         )
-    return bytes(body)
+    content_url = meta.get("content")
+    if not content_url:
+        raise RuntimeError(
+            f"Jira attachment {attachment_id} metadata has no `content` URL "
+            f"(keys: {sorted(meta.keys())})"
+        )
+
+    response = client._session.get(content_url, allow_redirects=True)
+    if response.status_code != 200:
+        body_preview = (response.text or "")[:200]
+        raise RuntimeError(
+            f"Jira attachment download failed: HTTP {response.status_code} "
+            f"from {content_url} (body: {body_preview!r})"
+        )
+    return response.content
 
 
 def parse_mm_post_id(url_or_id: str) -> str | None:
