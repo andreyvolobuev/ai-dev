@@ -25,14 +25,12 @@ the whole conversation itself.
 
 from __future__ import annotations
 
-import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk import create_sdk_mcp_server, tool
 from claude_agent_sdk.types import McpSdkServerConfig  # type: ignore[attr-defined]
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -44,6 +42,7 @@ from virtual_dev.application.services import (
     PromptsLoader,
     ResearcherToolkit,
 )
+from virtual_dev.application.services.agent_effects import AnalystEffect
 from virtual_dev.application.services.agent_trace import bind_run_id
 from virtual_dev.domain.models.analyst_conversation import (
     ConversationStep,
@@ -58,7 +57,7 @@ from virtual_dev.infrastructure.config import AppConfig, Settings
 from virtual_dev.infrastructure.db import PlanRow, TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import plan_to_row
-
+from virtual_dev.tools import ToolContext, build_tool_servers
 
 _ANALYST_PROMPT_NAME = "analyst"
 _ANALYST_FALLBACK_PROMPT = (
@@ -66,14 +65,6 @@ _ANALYST_FALLBACK_PROMPT = (
     "via dm_user when stuck, then call submit_plan when ready.\n\n"
     "{untrusted_warning}"
 )
-
-
-@dataclass
-class AnalystEffect:
-    """One side-effect a tool produced during the analyst run."""
-
-    kind: str   # "ask_dispatched" | "plan_submitted" | "escalate" | "abandon"
-    payload: dict[str, Any]
 
 
 @dataclass
@@ -322,7 +313,7 @@ class AnalystAgent:
             body = body[:3000] + "\n[truncated]"
         return head + "\n" + body
 
-    # --- MCP server: research + clarification + submit_plan ---
+    # --- MCP server: tools/ auto-discovery + filesystem ---
 
     def _build_mcp(
         self,
@@ -330,287 +321,17 @@ class AnalystAgent:
         plan_capture: dict[str, Any],
         run_state: dict[str, Any],
     ) -> tuple[dict[str, McpSdkServerConfig], list[str]]:
-        servers: dict[str, McpSdkServerConfig] = {}
-        allowed: list[str] = []
-
-        # Researcher (read-only).
-        servers["virtual_dev_researcher"] = self._researcher.build_mcp_server()
-        allowed.extend([
-            "mcp__virtual_dev_researcher__search_code",
-            "mcp__virtual_dev_researcher__read_file",
-            "mcp__virtual_dev_researcher__kb_search",
-            "mcp__virtual_dev_researcher__kb_fetch_page_by_url",
-            "mcp__virtual_dev_researcher__search_mr_history",
-        ])
-
-        # Analyst-private toolset: clarification + plan submission.
-        servers["virtual_dev_analyst"] = self._build_analyst_server(
-            effects, plan_capture, run_state,
+        ctx = ToolContext(
+            communicator=self._communicator,
+            researcher=self._researcher,
+            effects=effects,
+            plan_capture=plan_capture,
+            run_state=run_state,
         )
-        allowed.extend([
-            "mcp__virtual_dev_analyst__find_chat_user_by_name",
-            "mcp__virtual_dev_analyst__lookup_chat_user",
-            "mcp__virtual_dev_analyst__dm_user",
-            "mcp__virtual_dev_analyst__submit_plan",
-            "mcp__virtual_dev_analyst__escalate_to_lead",
-            "mcp__virtual_dev_analyst__abandon",
-        ])
-
-        # Filesystem.
+        servers, allowed = build_tool_servers(ctx)
+        # Filesystem builtins still come from the SDK, not from tools/.
         allowed.extend(["Read", "Glob", "Grep"])
-
         return servers, allowed
-
-    def _build_analyst_server(
-        self,
-        effects: list[AnalystEffect],
-        plan_capture: dict[str, Any],
-        run_state: dict[str, Any],
-    ) -> McpSdkServerConfig:
-        communicator = self._communicator
-
-        @tool(
-            "find_chat_user_by_name",
-            "Fuzzy-search the chat-platform user directory by name "
-            "(Russian or English). Matches first_name / last_name / "
-            "nickname / username. Use the surname when possible. Returns "
-            "0..N candidates. **Use BEFORE asking anyone about a person "
-            "whose handle you don't know.**",
-            {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "limit": {"type": ["integer", "null"]},
-                },
-                "required": ["query"],
-            },
-        )
-        async def _find(args: dict[str, Any]) -> dict[str, Any]:
-            query = str(args.get("query") or "").strip()
-            if not query:
-                return _wrap({"matches": [], "reason": "empty_query"})
-            try:
-                limit = int(args.get("limit") or 10)
-            except (TypeError, ValueError):
-                limit = 10
-            limit = max(1, min(limit, 25))
-            users = await communicator.search_users_by_name(query, limit=limit)
-            return _wrap({
-                "query": query,
-                "matches": [
-                    {
-                        "handle": u.username, "user_id": u.id,
-                        "email": u.email,
-                        "first_name": u.first_name,
-                        "last_name": u.last_name,
-                        "display_name": u.display_name,
-                        "position": u.position,
-                    }
-                    for u in users
-                ],
-            })
-
-        @tool(
-            "lookup_chat_user",
-            "Resolve a chat-platform user by exact handle or email. "
-            "Returns {found: bool, user_id?, display_name?}.",
-            {
-                "type": "object",
-                "properties": {
-                    "handle": {"type": ["string", "null"]},
-                    "email": {"type": ["string", "null"]},
-                },
-            },
-        )
-        async def _lookup(args: dict[str, Any]) -> dict[str, Any]:
-            handle = (args.get("handle") or "").strip().lstrip("@") or None
-            email = (args.get("email") or "").strip() or None
-            if not handle and not email:
-                return _wrap({"found": False, "reason": "no_handle_or_email"})
-            uid = await communicator.resolve_user_id(username=handle, email=email)
-            if uid is None:
-                return _wrap({"found": False, "reason": "not_found"})
-            return _wrap({
-                "found": True, "user_id": uid,
-                "display_name": handle or email,
-            })
-
-        @tool(
-            "dm_user",
-            "Send a direct message to a chat-platform user with one "
-            "question. Pass to_handle OR to_email. **THIS IS ASYNC** — "
-            "after calling, END YOUR TURN; you'll be re-invoked when "
-            "the human replies. Do NOT call any other tools after this "
-            "in the same turn.",
-            {
-                "type": "object",
-                "properties": {
-                    "to_handle": {"type": ["string", "null"]},
-                    "to_email": {"type": ["string", "null"]},
-                    "message": {"type": "string"},
-                    "dedupe_key": {"type": ["string", "null"]},
-                },
-                "required": ["message"],
-            },
-        )
-        async def _ask(args: dict[str, Any]) -> dict[str, Any]:
-            # Enforce one-ASK-per-run + no-mixing-with-terminals.
-            if run_state.get("ask_dispatched"):
-                return _wrap({
-                    "sent": False,
-                    "reason": "already_dispatched_this_run",
-                    "instruction": (
-                        "You already called dm_user once this turn. "
-                        "ASK is async — END YOUR TURN now. The "
-                        "orchestrator will re-invoke you when the human "
-                        "replies, and only then you can ask another "
-                        "person."
-                    ),
-                })
-            if run_state.get("terminal"):
-                return _wrap({
-                    "sent": False, "reason": "after_terminal",
-                    "instruction": "You already called a terminal tool. End your turn.",
-                })
-            handle = (args.get("to_handle") or "").strip().lstrip("@") or None
-            email = (args.get("to_email") or "").strip() or None
-            message = str(args.get("message") or "").strip()
-            dedupe_key = (args.get("dedupe_key") or "").strip() or None
-            if not message:
-                return _wrap({"sent": False, "reason": "empty_message"})
-            if not handle and not email:
-                return _wrap({"sent": False, "reason": "missing_target"})
-            uid = await communicator.resolve_user_id(username=handle, email=email)
-            if uid is None:
-                label = handle or email or ""
-                return _wrap({
-                    "sent": False, "reason": f"unresolved:{label}",
-                    "hint": (
-                        "Don't guess transliterations. "
-                        "find_chat_user_by_name first, or DM the issue "
-                        "reporter for a confirmed handle."
-                    ),
-                })
-            outcome = await communicator.send_dm(uid, message)
-            if not outcome.sent or outcome.message is None:
-                return _wrap({
-                    "sent": False,
-                    "reason": f"send_failed:{outcome.skip_reason or 'unknown'}",
-                })
-            effects.append(AnalystEffect(
-                kind="ask_dispatched",
-                payload={
-                    "asked_post_id": outcome.message.id,
-                    "channel_id": outcome.message.channel_id,
-                    "target_user_id": uid,
-                    "target_username": handle,
-                    "target_email": email,
-                    "asked_text": message,
-                    "dedupe_key": dedupe_key,
-                },
-            ))
-            run_state["ask_dispatched"] = True
-            return _wrap({
-                "sent": True, "to_user_id": uid,
-                "channel_id": outcome.message.channel_id,
-                "asked_post_id": outcome.message.id,
-                "instruction": (
-                    "DM dispatched. END YOUR TURN now. The orchestrator "
-                    "will re-invoke you with the human's reply."
-                ),
-            })
-
-        @tool(
-            "submit_plan",
-            "Submit your final, READY plan. Call this when you've "
-            "gathered all info needed and a Dev agent could implement "
-            "from the steps. Status MUST be 'ready'. If something's "
-            "still missing, use dm_user instead.",
-            _SUBMIT_PLAN_SCHEMA,
-        )
-        async def _submit_plan(args: dict[str, Any]) -> dict[str, Any]:
-            if run_state.get("ask_dispatched"):
-                return _wrap({
-                    "recorded": False,
-                    "reason": "ask_pending",
-                    "instruction": (
-                        "You called dm_user this turn — that DM is "
-                        "in flight, you don't have the answer yet. "
-                        "END YOUR TURN now. The orchestrator will "
-                        "re-invoke you with the human's reply, and "
-                        "only THEN you can submit_plan once you've "
-                        "actually got what you needed."
-                    ),
-                })
-            if run_state.get("terminal"):
-                return _wrap({"recorded": False, "reason": "already_terminal"})
-            plan_capture.clear()
-            plan_capture.update(args)
-            effects.append(AnalystEffect(
-                kind="plan_submitted",
-                payload={
-                    "summary": str(args.get("summary") or "")[:200],
-                    "status": str(args.get("status") or "ready"),
-                    "target_repo_key": args.get("target_repo_key"),
-                },
-            ))
-            run_state["terminal"] = True
-            return _wrap({"recorded": True, "instruction": "Plan recorded. End your turn."})
-
-        @tool(
-            "escalate_to_lead",
-            "Give up and DM the team-lead with the chain. Use when "
-            "you're truly stuck after multiple angles.",
-            {
-                "type": "object",
-                "properties": {"reason": {"type": "string"}},
-                "required": ["reason"],
-            },
-        )
-        async def _escalate(args: dict[str, Any]) -> dict[str, Any]:
-            if run_state.get("ask_dispatched"):
-                return _wrap({
-                    "recorded": False, "reason": "ask_pending",
-                    "instruction": "ASK in flight — end your turn first.",
-                })
-            if run_state.get("terminal"):
-                return _wrap({"recorded": False, "reason": "already_terminal"})
-            reason = str(args.get("reason") or "").strip() or "no_reason"
-            effects.append(AnalystEffect(
-                kind="escalate", payload={"reason": reason},
-            ))
-            run_state["terminal"] = True
-            return _wrap({"recorded": True, "instruction": "Escalation queued. End your turn."})
-
-        @tool(
-            "abandon",
-            "Soft give-up — close without escalating. Use when the "
-            "ticket self-contradicts or is no longer relevant.",
-            {
-                "type": "object",
-                "properties": {"reason": {"type": "string"}},
-                "required": ["reason"],
-            },
-        )
-        async def _abandon(args: dict[str, Any]) -> dict[str, Any]:
-            if run_state.get("ask_dispatched"):
-                return _wrap({
-                    "recorded": False, "reason": "ask_pending",
-                    "instruction": "ASK in flight — end your turn first.",
-                })
-            if run_state.get("terminal"):
-                return _wrap({"recorded": False, "reason": "already_terminal"})
-            reason = str(args.get("reason") or "").strip() or "no_reason"
-            effects.append(AnalystEffect(
-                kind="abandon", payload={"reason": reason},
-            ))
-            run_state["terminal"] = True
-            return _wrap({"recorded": True, "instruction": "Abandoned. End your turn."})
-
-        return create_sdk_mcp_server(
-            name="virtual_dev_analyst", version="0.1.0",
-            tools=[_find, _lookup, _ask, _submit_plan, _escalate, _abandon],
-        )
 
     # --- helpers ---
 
@@ -672,54 +393,6 @@ class AnalystAgent:
 
 
 # --- helpers ---
-
-
-def _wrap(payload: dict[str, Any]) -> dict[str, Any]:
-    return {"content": [{
-        "type": "text",
-        "text": json.dumps(payload, ensure_ascii=False),
-    }]}
-
-
-_SUBMIT_PLAN_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-        "steps": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "order": {"type": "integer"},
-                    "summary": {"type": "string"},
-                    "details": {"type": "string"},
-                    "repo_key": {"type": ["string", "null"]},
-                    "files_touched": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["order", "summary"],
-            },
-        },
-        # Vestigial — phase 5.0 has no separate clarifying flow. The
-        # analyst either submits a ready plan or asks more questions.
-        "open_questions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string"},
-                    "why_it_matters": {"type": "string"},
-                    "ask_whom": {"type": ["string", "null"]},
-                },
-                "required": ["question"],
-            },
-        },
-        "risks": {"type": "array", "items": {"type": "string"}},
-        "confidence": {"type": "number"},
-        "target_repo_key": {"type": ["string", "null"]},
-        "status": {"type": "string", "enum": ["ready", "failed"]},
-    },
-    "required": ["summary", "steps", "risks", "confidence", "status"],
-}
 
 
 def _plan_from_submission(
@@ -795,5 +468,4 @@ __all__ = [
     "AnalystRunResult",
     "AnalystRunStats",
     "_plan_from_submission",
-    "_SUBMIT_PLAN_SCHEMA",
 ]

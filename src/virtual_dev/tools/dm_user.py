@@ -1,0 +1,106 @@
+"""DM a chat-platform user one question. ASYNC — ends the analyst's turn."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from claude_agent_sdk import tool
+
+from virtual_dev.application.services.agent_effects import AnalystEffect
+from virtual_dev.tools import ToolContext, wrap_text
+
+TOOL_GROUP = "analyst"
+
+
+def build(ctx: ToolContext):
+    if ctx.communicator is None or ctx.effects is None or ctx.run_state is None:
+        return None
+    communicator = ctx.communicator
+    effects = ctx.effects
+    run_state = ctx.run_state
+
+    @tool(
+        "dm_user",
+        "Send a direct message to a chat-platform user with one "
+        "question. Pass to_handle OR to_email. **THIS IS ASYNC** — "
+        "after calling, END YOUR TURN; you'll be re-invoked when "
+        "the human replies. Do NOT call any other tools after this "
+        "in the same turn.",
+        {
+            "type": "object",
+            "properties": {
+                "to_handle": {"type": ["string", "null"]},
+                "to_email": {"type": ["string", "null"]},
+                "message": {"type": "string"},
+                "dedupe_key": {"type": ["string", "null"]},
+            },
+            "required": ["message"],
+        },
+    )
+    async def _ask(args: dict[str, Any]) -> dict[str, Any]:
+        if run_state.get("ask_dispatched"):
+            return wrap_text({
+                "sent": False,
+                "reason": "already_dispatched_this_run",
+                "instruction": (
+                    "You already called dm_user once this turn. "
+                    "ASK is async — END YOUR TURN now. The "
+                    "orchestrator will re-invoke you when the human "
+                    "replies, and only then you can ask another "
+                    "person."
+                ),
+            })
+        if run_state.get("terminal"):
+            return wrap_text({
+                "sent": False, "reason": "after_terminal",
+                "instruction": "You already called a terminal tool. End your turn.",
+            })
+        handle = (args.get("to_handle") or "").strip().lstrip("@") or None
+        email = (args.get("to_email") or "").strip() or None
+        message = str(args.get("message") or "").strip()
+        dedupe_key = (args.get("dedupe_key") or "").strip() or None
+        if not message:
+            return wrap_text({"sent": False, "reason": "empty_message"})
+        if not handle and not email:
+            return wrap_text({"sent": False, "reason": "missing_target"})
+        uid = await communicator.resolve_user_id(username=handle, email=email)
+        if uid is None:
+            label = handle or email or ""
+            return wrap_text({
+                "sent": False, "reason": f"unresolved:{label}",
+                "hint": (
+                    "Don't guess transliterations. "
+                    "find_chat_user_by_name first, or DM the issue "
+                    "reporter for a confirmed handle."
+                ),
+            })
+        outcome = await communicator.send_dm(uid, message)
+        if not outcome.sent or outcome.message is None:
+            return wrap_text({
+                "sent": False,
+                "reason": f"send_failed:{outcome.skip_reason or 'unknown'}",
+            })
+        effects.append(AnalystEffect(
+            kind="ask_dispatched",
+            payload={
+                "asked_post_id": outcome.message.id,
+                "channel_id": outcome.message.channel_id,
+                "target_user_id": uid,
+                "target_username": handle,
+                "target_email": email,
+                "asked_text": message,
+                "dedupe_key": dedupe_key,
+            },
+        ))
+        run_state["ask_dispatched"] = True
+        return wrap_text({
+            "sent": True, "to_user_id": uid,
+            "channel_id": outcome.message.channel_id,
+            "asked_post_id": outcome.message.id,
+            "instruction": (
+                "DM dispatched. END YOUR TURN now. The orchestrator "
+                "will re-invoke you with the human's reply."
+            ),
+        })
+
+    return _ask

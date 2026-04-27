@@ -1,0 +1,39 @@
+"""Shared dependency bag passed to every tool's ``build(ctx)``.
+
+Tools take what they need and ignore the rest. Optional services are
+typed ``| None`` so a tool with a missing dep can short-circuit by
+returning ``None`` from ``build()`` (the loader skips it).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from virtual_dev.application.services import (
+        CommunicatorService,
+        ResearcherToolkit,
+    )
+    from virtual_dev.application.services.agent_effects import AnalystEffect
+
+
+@dataclass
+class ToolContext:
+    """Dependencies + per-run state every tool can read.
+
+    * **Long-lived** services (``communicator``, ``researcher``) are
+      shared across the process; tools may keep them as plain
+      attributes.
+    * **Per-run** buckets (``effects``, ``plan_capture``, ``run_state``)
+      are mutated by tools to record their side-effects. They're
+      ``None`` outside an agent run; tools that need them must
+      return ``None`` from ``build()`` when missing.
+    """
+
+    communicator: CommunicatorService | None = None
+    researcher: ResearcherToolkit | None = None
+    effects: list[AnalystEffect] | None = None
+    plan_capture: dict[str, Any] | None = None
+    run_state: dict[str, Any] | None = None
+    extras: dict[str, Any] = field(default_factory=dict)
