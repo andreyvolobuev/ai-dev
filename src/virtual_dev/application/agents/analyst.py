@@ -153,6 +153,10 @@ class AnalystAgent:
         )
         effects: list[AnalystEffect] = []
         plan_capture: dict[str, Any] = {}
+        # Run-scoped flags to enforce one-ASK-per-run (otherwise the
+        # agent can stack asks + submit_plan in the same turn,
+        # bypassing the "end your turn after ask" rule).
+        run_state: dict[str, Any] = {"ask_dispatched": False, "terminal": False}
 
         request = CodeAgentRequest(
             agent_key=self.agent_key,
@@ -166,7 +170,7 @@ class AnalystAgent:
             max_turns=self._max_turns,
             model=self._config.agents.models.default,
         )
-        mcp_servers, allowed = self._build_mcp(effects, plan_capture)
+        mcp_servers, allowed = self._build_mcp(effects, plan_capture, run_state)
         request.extras["mcp_servers"] = mcp_servers
         request.extras["allowed_tool_names"] = allowed
 
@@ -311,6 +315,7 @@ class AnalystAgent:
         self,
         effects: list[AnalystEffect],
         plan_capture: dict[str, Any],
+        run_state: dict[str, Any],
     ) -> tuple[dict[str, McpSdkServerConfig], list[str]]:
         servers: dict[str, McpSdkServerConfig] = {}
         allowed: list[str] = []
@@ -327,7 +332,7 @@ class AnalystAgent:
 
         # Analyst-private toolset: clarification + plan submission.
         servers["virtual_dev_analyst"] = self._build_analyst_server(
-            effects, plan_capture,
+            effects, plan_capture, run_state,
         )
         allowed.extend([
             "mcp__virtual_dev_analyst__find_mm_user_by_name",
@@ -347,6 +352,7 @@ class AnalystAgent:
         self,
         effects: list[AnalystEffect],
         plan_capture: dict[str, Any],
+        run_state: dict[str, Any],
     ) -> McpSdkServerConfig:
         communicator = self._communicator
 
@@ -434,6 +440,24 @@ class AnalystAgent:
             },
         )
         async def _ask(args: dict[str, Any]) -> dict[str, Any]:
+            # Enforce one-ASK-per-run + no-mixing-with-terminals.
+            if run_state.get("ask_dispatched"):
+                return _wrap({
+                    "sent": False,
+                    "reason": "already_dispatched_this_run",
+                    "instruction": (
+                        "You already called ask_mm_user once this turn. "
+                        "ASK is async — END YOUR TURN now. The "
+                        "orchestrator will re-invoke you when the human "
+                        "replies, and only then you can ask another "
+                        "person."
+                    ),
+                })
+            if run_state.get("terminal"):
+                return _wrap({
+                    "sent": False, "reason": "after_terminal",
+                    "instruction": "You already called a terminal tool. End your turn.",
+                })
             handle = (args.get("to_handle") or "").strip().lstrip("@") or None
             email = (args.get("to_email") or "").strip() or None
             message = str(args.get("message") or "").strip()
@@ -471,6 +495,7 @@ class AnalystAgent:
                     "dedupe_key": dedupe_key,
                 },
             ))
+            run_state["ask_dispatched"] = True
             return _wrap({
                 "sent": True, "to_user_id": uid,
                 "channel_id": outcome.message.channel_id,
@@ -490,6 +515,21 @@ class AnalystAgent:
             _SUBMIT_PLAN_SCHEMA,
         )
         async def _submit_plan(args: dict[str, Any]) -> dict[str, Any]:
+            if run_state.get("ask_dispatched"):
+                return _wrap({
+                    "recorded": False,
+                    "reason": "ask_pending",
+                    "instruction": (
+                        "You called ask_mm_user this turn — that DM is "
+                        "in flight, you don't have the answer yet. "
+                        "END YOUR TURN now. The orchestrator will "
+                        "re-invoke you with the human's reply, and "
+                        "only THEN you can submit_plan once you've "
+                        "actually got what you needed."
+                    ),
+                })
+            if run_state.get("terminal"):
+                return _wrap({"recorded": False, "reason": "already_terminal"})
             plan_capture.clear()
             plan_capture.update(args)
             effects.append(AnalystEffect(
@@ -500,6 +540,7 @@ class AnalystAgent:
                     "target_repo_key": args.get("target_repo_key"),
                 },
             ))
+            run_state["terminal"] = True
             return _wrap({"recorded": True, "instruction": "Plan recorded. End your turn."})
 
         @tool(
@@ -513,10 +554,18 @@ class AnalystAgent:
             },
         )
         async def _escalate(args: dict[str, Any]) -> dict[str, Any]:
+            if run_state.get("ask_dispatched"):
+                return _wrap({
+                    "recorded": False, "reason": "ask_pending",
+                    "instruction": "ASK in flight — end your turn first.",
+                })
+            if run_state.get("terminal"):
+                return _wrap({"recorded": False, "reason": "already_terminal"})
             reason = str(args.get("reason") or "").strip() or "no_reason"
             effects.append(AnalystEffect(
                 kind="escalate", payload={"reason": reason},
             ))
+            run_state["terminal"] = True
             return _wrap({"recorded": True, "instruction": "Escalation queued. End your turn."})
 
         @tool(
@@ -530,10 +579,18 @@ class AnalystAgent:
             },
         )
         async def _abandon(args: dict[str, Any]) -> dict[str, Any]:
+            if run_state.get("ask_dispatched"):
+                return _wrap({
+                    "recorded": False, "reason": "ask_pending",
+                    "instruction": "ASK in flight — end your turn first.",
+                })
+            if run_state.get("terminal"):
+                return _wrap({"recorded": False, "reason": "already_terminal"})
             reason = str(args.get("reason") or "").strip() or "no_reason"
             effects.append(AnalystEffect(
                 kind="abandon", payload={"reason": reason},
             ))
+            run_state["terminal"] = True
             return _wrap({"recorded": True, "instruction": "Abandoned. End your turn."})
 
         return create_sdk_mcp_server(

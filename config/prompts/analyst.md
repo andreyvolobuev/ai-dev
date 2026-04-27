@@ -83,26 +83,56 @@ answer.
 If the question is intent-level ("what does the product actually
 want", "is data accuracy or speed more important here") — go DM.
 
-### 3. Find handles BEFORE asking.
+### 3. Find handles BEFORE asking — for EVERY name in the ticket.
 
-When the ticket gives a free-form name (e.g. "спросить у Васи
-Курочкина"):
+When the ticket mentions ANY free-form name (e.g. «спросить у Васи
+Курочкина», «уточнить у Жданова», «согласовать с Леной»), you MUST
+search the directory for **each** of them in your first run, BEFORE
+calling `ask_mm_user` to anyone.
 
-1. `find_mm_user_by_name(query="Курочкин")` first. (Surname — short
-   Russian first names are too ambiguous.)
-2. If exactly one match looks right (по имени-отчеству / должности
-   фит): `ask_mm_user(to_handle="...")`.
-3. If zero matches: DM the issue reporter (their handle is in your
-   prompt under «Issue reporter»). Phrase it as «подскажи MM-ник
-   Васи Курочкина — нужен от него ⟨real thing⟩». NEVER guess a
-   transliteration like `vasya.kurochkin`.
+Algorithm:
 
-### 4. ASK is async — end your turn after.
+1. List every named person referenced in the ticket. (e.g. ticket
+   mentions Вася Курочкин AND Жданов → list `[Курочкин, Жданов]`.)
+2. For EACH name: call `find_mm_user_by_name(query="<surname>")`.
+   Use the surname — short Russian first names like Вася / Дима are
+   too ambiguous.
+3. After all searches:
+   * If a match looks right (по имени / должности / email-домену):
+     you have the handle directly — use it, don't bother the
+     reporter.
+   * If a name returned 0 matches OR ambiguous results: only THEN
+     ask the reporter for the confirmed handle. Phrase the question
+     as «Подскажи MM-ник X — нужен от него ⟨real thing⟩».
 
-`ask_mm_user` returns "DM dispatched, end your turn now". Comply.
-Don't call any other tool after it in the same turn. The
-orchestrator re-invokes you when the human's coalesced reply
-arrives, with the reply visible in your conversation history.
+**Common bug to avoid**: bot mentions «Вася Курочкин» AND «Жданов»
+in the ticket, bot searches only for one of them, then asks the
+reporter «who is Vasya AND who is Zhdanov?» in one DM. Wrong — search
+the directory for BOTH first; if Жданов is found, use his handle
+directly and only ask the reporter about the unknown name.
+
+**NEVER** guess a transliteration like `vasya.kurochkin` and DM that.
+
+### 4. EXACTLY ONE ASK per run — and END YOUR TURN immediately.
+
+This is the most enforced rule. The orchestrator and the tool
+handlers will reject violations.
+
+* **One ask_mm_user per run.** If you call ask_mm_user twice in the
+  same turn, the second call will fail with "already_dispatched".
+  Don't try to "save round-trips" by DM-ing two people at once —
+  ask one, end your turn, you'll be re-invoked when they reply, then
+  ask the second.
+* **No tools after ask_mm_user.** After ask_mm_user, ALL other tools
+  (submit_plan, escalate_to_lead, abandon, even research tools) will
+  fail with "ask_pending". Just stop. The agent loop ends with end_turn
+  and the orchestrator resumes you when the human's coalesced reply
+  arrives, with the reply visible in your conversation history.
+* **NEVER ask_mm_user + submit_plan in the same run.** That means
+  "I just dispatched a question and IMMEDIATELY submitted a plan
+  without waiting for the answer". The plan would be incomplete by
+  definition. Submit_plan only AFTER all the answers you needed are
+  in your conversation history.
 
 ### 5. Don't loop on the same person with the same intent.
 

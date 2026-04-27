@@ -174,6 +174,8 @@ d.shvarts|Дмитрий|Шварц|Backend"></textarea>
   <div class="panel">
     <div class="panel-header">
       Activity feed
+      <button id="expand-all-btn" type="button"
+              style="float:right;margin-left:6px;padding:2px 8px;font-size:11px;background:#21262d;color:#8b949e;border:1px solid #30363d;">▼ Expand all</button>
       <span id="event-count" style="float:right;color:#8b949e;font-weight:normal">0 events</span>
     </div>
     <div class="panel-body" id="activity"></div>
@@ -247,6 +249,15 @@ d.shvarts|Дмитрий|Шварц|Backend"></textarea>
     div.appendChild(meta);
     div.appendChild(renderPayload(ev));
     activity.appendChild(div);
+    // If the user has toggled "expand all" on, apply the same to
+    // newly-arriving events so they don't show up collapsed mid-feed.
+    if (allExpanded) {
+      div.querySelectorAll('details').forEach((d) => { d.open = true; });
+      div.querySelectorAll('.event-collapsed').forEach((el) => {
+        el.classList.add('event-was-collapsed');
+        el.classList.remove('event-collapsed');
+      });
+    }
     activity.scrollTop = activity.scrollHeight;
   }
 
@@ -480,6 +491,27 @@ d.shvarts|Дмитрий|Шварц|Backend"></textarea>
     } else {
       setStatus('ws not connected', 'status-error');
     }
+  };
+
+  let allExpanded = false;
+  $('expand-all-btn').onclick = () => {
+    allExpanded = !allExpanded;
+    // Toggle every <details> open/closed.
+    activity.querySelectorAll('details').forEach((d) => {
+      d.open = allExpanded;
+    });
+    // Also unfold any .event-collapsed (long llm_text / system_prompt
+    // panels): just remove the class so the body shows in full.
+    activity.querySelectorAll('.event-collapsed').forEach((el) => {
+      if (allExpanded) {
+        el.classList.add('event-was-collapsed');
+        el.classList.remove('event-collapsed');
+      } else if (el.classList.contains('event-was-collapsed')) {
+        el.classList.add('event-collapsed');
+        el.classList.remove('event-was-collapsed');
+      }
+    });
+    $('expand-all-btn').textContent = allExpanded ? '▲ Collapse all' : '▼ Expand all';
   };
 
   $('reset-btn').onclick = () => {
