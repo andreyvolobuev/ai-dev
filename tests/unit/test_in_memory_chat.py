@@ -52,6 +52,33 @@ async def test_speaking_as_registers_username_for_lookup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_at_mention_in_operator_message_auto_registers_handle() -> None:
+    """When the operator types ``@v.kura`` in a reply, that handle
+    becomes resolvable. Mirrors production where any workspace handle
+    resolves on first DM — without this the bot can't follow «у него
+    ник @v.kura» pointers and stays stuck searching the directory.
+
+    Pure-handle text like ``@v.kura`` should register; non-handle ats
+    (emails, addresses) shouldn't pollute the directory."""
+    chat = InMemoryChat()
+    assert await chat.find_user_by_username("v.kura") is None
+    await chat.post_user_message("у него ник @v.kura, спрашивай его")
+    user = await chat.find_user_by_username("v.kura")
+    assert user is not None
+    assert user.id == "uid-v.kura"
+
+
+@pytest.mark.asyncio
+async def test_at_mention_skips_email_local_parts() -> None:
+    """An email-looking ``foo@bar.com`` shouldn't auto-register ``foo``
+    or ``bar.com`` as Mattermost handles — only ``@handle`` patterns."""
+    chat = InMemoryChat()
+    await chat.post_user_message("write to vasya@example.com instead")
+    assert await chat.find_user_by_username("vasya") is None
+    assert await chat.find_user_by_username("example.com") is None
+
+
+@pytest.mark.asyncio
 async def test_known_users_are_consistent_across_email_and_username() -> None:
     """``find_user_by_email("v.kura@2gis.ru")`` should resolve to the
     same id as ``find_user_by_username("v.kura")`` once registered."""

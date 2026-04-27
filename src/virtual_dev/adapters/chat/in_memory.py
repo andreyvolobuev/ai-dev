@@ -13,6 +13,7 @@ the same as MattermostChat, so the orchestrator code-path is identical.
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timezone
@@ -31,6 +32,10 @@ from virtual_dev.domain.ports.chat import ChatPort
 _BOT_USER_ID = "bot"
 _DEFAULT_USER_ID = "test-user"
 _DEFAULT_USER_NAME = "you"
+
+# `@handle` mentions in operator messages — must be preceded by start
+# or whitespace (so `vasya@example.com` does NOT match `@example`).
+_AT_MENTION_RE = re.compile(r"(?:^|\s)@([a-z][a-z0-9._-]*[a-z0-9])", re.IGNORECASE)
 
 
 class InMemoryChat(ChatPort):
@@ -230,6 +235,15 @@ class InMemoryChat(ChatPort):
         else:
             author_id = self._user_id
             default_channel = f"dm-{self._user_id}"
+        # Auto-register @handles the operator mentions: in real
+        # Mattermost any workspace handle resolves; without this the
+        # bot can't act on «у него ник @v.kura» pointers (DM fails
+        # with unresolved and the agent loops back to the operator).
+        for handle in _AT_MENTION_RE.findall(text or ""):
+            self._known_users.setdefault(
+                handle,
+                ChatUser(id=f"uid-{handle}", username=handle),
+            )
         msg = ChatMessage(
             id=f"user-{self._counter}-{uuid.uuid4().hex[:8]}",
             channel_id=channel_id or default_channel,
