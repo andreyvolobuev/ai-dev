@@ -33,7 +33,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents import DevAgent, ResponderAction, ThreadResponderAgent
-from virtual_dev.application.services.clarification import TaskOrchestrator
+from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
@@ -42,7 +42,7 @@ from virtual_dev.domain.ports.vcs import VcsPort
 from pathlib import Path
 
 from virtual_dev.infrastructure.config import AppConfig, Settings
-from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow
+from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow, TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
 
@@ -81,7 +81,7 @@ class MmThreadListener:
         config: AppConfig,
         settings: Settings,
         vcs: VcsPort | None = None,
-        task_orchestrator: TaskOrchestrator | None = None,
+        analyst_inbox: AnalystInbox | None = None,
         subscription_initial_backoff: float = 5.0,
         subscription_max_backoff: float = 300.0,
     ) -> None:
@@ -93,7 +93,7 @@ class MmThreadListener:
         self._config = config
         self._settings = settings
         self._vcs = vcs
-        self._tasks = task_orchestrator
+        self._analyst_inbox = analyst_inbox
         self._stop_event = asyncio.Event()
         self._running = False
         # Reconnect cadence after subscribe() crashes. Defaults are
@@ -285,20 +285,18 @@ class MmThreadListener:
                     MergeRequestRow.review_thread_channel_id.is_not(None),
                 )
             )).scalars().all())
-            from virtual_dev.infrastructure.db import TaskRowClar
             qs = list((await session.execute(
-                select(TaskRowClar).where(
-                    TaskRowClar.closed.is_(False),
-                    TaskRowClar.awaiting_channel_id.is_not(None),
+                select(TaskRow).where(
+                    TaskRow.awaiting_channel_id.is_not(None),
                 )
             )).scalars().all())
 
-        # Active clarification tasks awaiting a reply.
+        # Active analyst sessions awaiting a reply.
         for q in qs:
             ch = q.awaiting_channel_id
             if not ch:
                 continue
-            cursor = _aware(q.last_fragment_at or q.created_at) or now
+            cursor = _aware(q.last_fragment_at or q.discovered_at) or now
             if cursor < floor:
                 cursor = floor
             existing = out.get(ch)
@@ -330,29 +328,30 @@ class MmThreadListener:
         if event.trusted:
             return
 
-        # Clarification fragment? Phase 4.5 (task-driven) model: each
-        # MM event under a bot-asked question is one *fragment* of the
-        # task's outstanding answer — we append it; the coalescer
-        # eventually merges + validates. NO immediate ack here
-        # (mid-message acks read as the bot interrupting).
+        # Phase 5.0 (analyst-driven): an MM event under a bot-asked
+        # post is one fragment of the analyst's pending question. We
+        # append it; the coalescer flushes after the idle window and
+        # re-runs the analyst with the merged reply in its prompt.
+        # No immediate ack — mid-message reactions read as
+        # interruption.
         #
-        # Two routing forms:
-        #   * Thread-reply → match by ``awaiting_post_id``.
-        #   * Plain DM (no thread root) → most-recent active task for
-        #     this channel + author.
-        if self._tasks is not None:
-            task = None
+        # Routing:
+        #   * Thread-reply → match by tasks.awaiting_post_id.
+        #   * Plain DM (no thread root) → most-recent task awaiting
+        #     this channel+user.
+        if self._analyst_inbox is not None:
+            task_row: TaskRow | None = None
             if event.thread_root_id:
-                task = await self._tasks.find_task_by_thread(
+                task_row = await self._analyst_inbox.find_task_by_thread(
                     event.thread_root_id,
                 )
-            if task is None:
-                task = await self._tasks.find_task_by_channel(
+            if task_row is None:
+                task_row = await self._analyst_inbox.find_task_by_channel(
                     mm_channel_id=event.channel_id,
                     mm_user_id=event.author_id,
                 )
-            if task is not None:
-                await self._handle_task_fragment(task, event)
+            if task_row is not None:
+                await self._handle_task_fragment(task_row, event)
                 return
 
         # Below this point we only act on threaded replies (review thread routing).
@@ -431,42 +430,36 @@ class MmThreadListener:
             logger.warning("MmThreadListener: add_reaction failed for post {}", event.id)
 
     async def _handle_task_fragment(
-        self, task: object, event: ChatMessage,
+        self, task_row: TaskRow, event: ChatMessage,
     ) -> None:
-        """Append the incoming MM event as a fragment of this task.
+        """Append the incoming MM event as a fragment of this ticket.
 
-        Phase 4.5 contract: don't classify here. The AnswerCoalescer
-        merges fragments after the idle window and runs the validator.
+        Phase 5.0: don't classify here. The AnswerCoalescer merges
+        fragments after the idle window and re-runs the analyst.
         Idempotency:
         * Bot's ✅-reaction acts as a fast no-op for replays.
-        * ``clar_task_fragments.UNIQUE(task_id, mm_post_id)`` makes a
-          duplicate WS-delivery a silent no-op.
+        * ``analyst_conversation_fragments`` UNIQUE(task_id, mm_post_id)
+          makes a duplicate WS-delivery a silent no-op.
         """
-        from virtual_dev.domain.models.clarification_task import (
-            ClarificationTask as _Task,
-        )
-
-        assert self._tasks is not None
-        assert isinstance(task, _Task)
+        assert self._analyst_inbox is not None
 
         fresh_post = await self._chat.get_post(event.id)
         if fresh_post is not None and _PROCESSED_REACTION in fresh_post.bot_reactions:
             logger.debug(
-                "MmThreadListener: task fragment {} already processed",
-                event.id,
+                "MmThreadListener: fragment {} already processed", event.id,
             )
             return
 
         try:
-            await self._tasks.append_fragment(task.id, event)
+            await self._analyst_inbox.append_fragment(task_row.id, event)
         except Exception:
             logger.exception(
                 "MmThreadListener: append_fragment crashed for task {}",
-                task.id,
+                task_row.id,
             )
             return
         # No ✅-reaction here — that goes on the LAST fragment when
-        # the coalescer flushes (see TaskOrchestrator._coalesce_and_validate).
+        # the coalescer flushes (see AnalystInbox._coalesce_and_resume).
 
     async def _run_iteration(
         self,

@@ -323,10 +323,11 @@ def plan_task(
     )
     inbox = AnalystInbox(
         analyst=analyst,
+        session_repo=container.analyst_session_repo,
+        communicator=container.communicator,
         task_tracker=container.task_tracker if post_to_tracker else None,
         config=container.config,
         post_to_tracker=post_to_tracker,
-        task_orchestrator=container.task_orchestrator,
         session_factory=container.session_factory,
     )
 
@@ -416,54 +417,63 @@ def clarifications_show(
 ) -> None:
     """Print the task-step timeline for one ticket.
 
-    For each ClarificationTask on the ticket, shows the task question,
-    info_source, is_solved, and the append-only history (planner picks,
-    tool invocations, tool results, human replies, validator verdicts).
+    Phase 5.0: prints the analyst's conversation log for one ticket
+    (every BOT_ASKED, HUMAN_REPLIED, run summary, etc.). One ticket =
+    one analyst session.
     """
     _bootstrap()
     container = build_container()
 
     async def _run() -> None:
-        repo = container.task_repo
-        tasks = await repo.list_for_task(tracker, external_id)
-        if not tasks:
+        repo = container.analyst_session_repo
+        from sqlalchemy import select
+
+        from virtual_dev.infrastructure.db import TaskRow
+        from virtual_dev.infrastructure.db.base import session_scope
+
+        async with session_scope(container.session_factory) as session:
+            task_row = (await session.execute(
+                select(TaskRow).where(
+                    TaskRow.tracker == tracker,
+                    TaskRow.external_id == external_id,
+                )
+            )).scalar_one_or_none()
+        if task_row is None:
             console.print(
-                f"[yellow]No clarification tasks for {tracker}:{external_id}[/yellow]"
+                f"[yellow]No task {tracker}:{external_id}[/yellow]"
+            )
+            await container.dispose()
+            return
+        steps = await repo.list_steps(task_row.id)
+        if not steps:
+            console.print(
+                f"[yellow]No conversation log for {tracker}:{external_id}[/yellow]"
             )
             await container.dispose()
             return
 
         from rich.tree import Tree
 
-        for task in tasks:
-            steps = await repo.list_steps(task.id)
-            status = "✓ solved" if task.is_solved else (
-                "× closed" if task.closed else "… active"
+        header = (
+            f"[bold]{tracker}:{external_id} — {task_row.title[:80]}[/bold]\n"
+            f"  status: {task_row.internal_status}\n"
+            f"  iterations: {task_row.analyst_iteration_count}"
+        )
+        if task_row.awaiting_post_id:
+            header += (
+                f"\n  awaiting reply from "
+                f"@{task_row.awaiting_username or task_row.awaiting_user_id}"
             )
-            header = (
-                f"[bold]Task #{task.id} (depth {task.depth}) — {status}[/bold]\n"
-                f"  question: {task.question[:240]}\n"
-                f"  info_source: {task.info_source or '(?)'} "
-                f"({task.info_source_class or '?'})\n"
-                f"  iterations: {task.iteration_count}"
+        tree = Tree(header)
+        for s in steps:
+            label = (
+                f"[dim]\\[{s.seq}][/dim] "
+                f"[bold]{s.kind.value}[/bold]"
             )
-            if task.final_answer:
-                header += (
-                    f"\n  [green]final_answer:[/green] "
-                    f"{task.final_answer[:300]} "
-                    f"(confidence={task.confidence:.2f})"
-                )
-            tree = Tree(header)
-            for s in steps:
-                label = (
-                    f"[dim]\\[{s.seq}][/dim] "
-                    f"[bold]{s.kind.value}[/bold]"
-                )
-                if s.text:
-                    label += f"\n   {s.text[:300]}"
-                tree.add(label)
-            console.print(tree)
-            console.print()
+            if s.text:
+                label += f"\n   {s.text[:300]}"
+            tree.add(label)
+        console.print(tree)
         await container.dispose()
 
     asyncio.run(_run())

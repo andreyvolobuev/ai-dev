@@ -35,9 +35,6 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from virtual_dev.adapters.chat.in_memory import InMemoryChat
 from virtual_dev.adapters.code_agent import ClaudeAgentSdkCodeAgent
 from virtual_dev.application.agents import AnalystAgent
-from virtual_dev.application.agents.clarification_agent import (
-    ClarificationAgent,
-)
 from virtual_dev.application.services import (
     CommunicatorService,
     InjectionFilter,
@@ -48,10 +45,10 @@ from virtual_dev.application.services.agent_trace import (
     AgentTrace,
     AgentTraceEvent,
 )
-from virtual_dev.application.services.clarification import (
-    ClarificationTaskRepository,
-    TaskOrchestrator,
+from virtual_dev.application.services.analyst_session_repo import (
+    AnalystSessionRepository,
 )
+from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
 from virtual_dev.domain.models.task import TaskStatus
@@ -86,7 +83,7 @@ class TestAnalystState:
         trace: AgentTrace,
         chat: InMemoryChat,
         analyst: AnalystAgent,
-        task_orchestrator: TaskOrchestrator,
+        analyst_inbox: AnalystInbox,
     ) -> None:
         self.engine = engine
         self.session_factory = session_factory
@@ -95,7 +92,7 @@ class TestAnalystState:
         self.trace = trace
         self.chat = chat
         self.analyst = analyst
-        self.task_orchestrator = task_orchestrator
+        self.analyst_inbox = analyst_inbox
 
 
 async def _build_state(
@@ -165,22 +162,16 @@ async def _build_state(
         prompts_loader=prompts_loader,
     )
 
-    clarification_agent = ClarificationAgent(
-        code_agent=code_agent,
-        config=config,
-        prompts_loader=prompts_loader,
+    analyst_session_repo = AnalystSessionRepository(session_factory)
+    analyst_inbox = AnalystInbox(
+        analyst=analyst,
+        session_repo=analyst_session_repo,
         communicator=communicator,
-        researcher=researcher,
-        injection_filter=injection_filter,
-        trace=trace,
-    )
-    task_orchestrator = TaskOrchestrator(
-        repo=ClarificationTaskRepository(session_factory),
-        communicator=communicator,
-        agent=clarification_agent,
+        task_tracker=None,
         config=config,
-        session_factory=session_factory,
         message_bus=None,
+        post_to_tracker=False,
+        session_factory=session_factory,
         trace=trace,
     )
 
@@ -192,7 +183,7 @@ async def _build_state(
         trace=trace,
         chat=chat,
         analyst=analyst,
-        task_orchestrator=task_orchestrator,
+        analyst_inbox=analyst_inbox,
     )
 
 
@@ -218,7 +209,7 @@ def build_test_analyst_app(
         # live app, but the operator can edit clarification.coalesce_window
         # in agents.yaml.
         coalescer = make_answer_coalescer_worker(
-            orchestrator=state.task_orchestrator,
+            orchestrator=state.analyst_inbox,
             interval_seconds=10,
         )
         coalescer_task = asyncio.create_task(coalescer.run_forever(), name="coalescer")
@@ -310,11 +301,11 @@ async def _forward_events(ws: WebSocket, subscription: AsyncIterator[AgentTraceE
 
 
 async def _run_task(state: TestAnalystState, raw: dict[str, Any]) -> None:
-    """Insert a synthetic task row, then run the analyst against it.
+    """Insert a synthetic task row and drive the AnalystInbox.
 
-    On READY → emit ``orchestrator: task_done``. On CLARIFYING the
-    orchestrator will DM into chat, which the operator sees on the
-    right panel.
+    Phase 5.0: a single agent handles the ticket end-to-end. The
+    inbox runs the analyst, installs awaiting state on async DM
+    dispatch, and finalises the plan when the agent is ready.
     """
     external_id = str(raw.get("external_id") or "DM-TEST")
     title = str(raw.get("title") or "(no title)")
@@ -326,7 +317,6 @@ async def _run_task(state: TestAnalystState, raw: dict[str, Any]) -> None:
     ))
 
     async with session_scope(state.session_factory) as session:
-        # Replace any existing task with the same id.
         from sqlalchemy import select
         existing = (await session.execute(
             select(TaskRow).where(
@@ -338,6 +328,8 @@ async def _run_task(state: TestAnalystState, raw: dict[str, Any]) -> None:
             existing.title = title
             existing.description = description
             existing.internal_status = TaskStatus.DISCOVERED.value
+            existing.analyst_iteration_count = 0
+            existing.analyst_deadline_at = None
         else:
             session.add(TaskRow(
                 tracker="jira",
@@ -351,92 +343,22 @@ async def _run_task(state: TestAnalystState, raw: dict[str, Any]) -> None:
                 reporter_id="you",
             ))
 
+    from virtual_dev.domain.ports.message_bus import AgentMessage
+    msg = AgentMessage(
+        id="test-" + external_id,
+        from_agent="test-runner",
+        to_agent="analyst",
+        topic="task.discovered",
+        payload={"tracker": "jira", "external_id": external_id},
+    )
     try:
-        plan = await state.analyst.handle_task("jira", external_id)
+        await state.analyst_inbox.handle(msg)
     except Exception as exc:
-        logger.exception("test-analyst: handle_task crashed")
+        logger.exception("test-analyst: analyst_inbox.handle crashed")
         await state.trace.emit(AgentTraceEvent(
             type="orchestrator", agent_key="test-runner",
             payload={"action": "task_failed", "detail": str(exc)[:300]},
         ))
-        return
-
-    if plan is None:
-        await state.trace.emit(AgentTraceEvent(
-            type="orchestrator", agent_key="test-runner",
-            payload={"action": "task_done", "detail": "skipped (no plan)"},
-        ))
-        return
-
-    await state.trace.emit(AgentTraceEvent(
-        type="orchestrator", agent_key="test-runner",
-        payload={
-            "action": "plan_received",
-            "status": plan.status.value,
-            "summary": plan.summary,
-            "open_questions": [
-                {"q": q.question, "ask_whom": q.ask_whom or "", "why": q.why_it_matters}
-                for q in plan.open_questions
-            ],
-            "target_repo": plan.target_repo_key,
-        },
-    ))
-
-    if plan.status == PlanStatus.CLARIFYING and plan.open_questions:
-        await _kick_clarifications(state, external_id, plan)
-    else:
-        await state.trace.emit(AgentTraceEvent(
-            type="orchestrator", agent_key="test-runner",
-            payload={
-                "action": "task_done",
-                "detail": f"plan {plan.status.value}; "
-                          f"{len(plan.steps)} steps, "
-                          f"{len(plan.open_questions)} open questions",
-            },
-        ))
-
-
-async def _kick_clarifications(
-    state: TestAnalystState, external_id: str, plan: object,
-) -> None:
-    """Spawn questions in the orchestrator after Analyst returns CLARIFYING."""
-    from sqlalchemy import select
-
-    async with state.session_factory() as session:
-        task_row = (await session.execute(
-            select(TaskRow).where(
-                TaskRow.tracker == "jira",
-                TaskRow.external_id == external_id,
-            )
-        )).scalar_one_or_none()
-        plan_row = (await session.execute(
-            select(PlanRow)
-            .where(
-                PlanRow.tracker == "jira",
-                PlanRow.task_external_id == external_id,
-                PlanRow.status != PlanStatus.SUPERSEDED.value,
-            )
-            .order_by(PlanRow.created_at.desc())
-            .limit(1)
-        )).scalar_one_or_none()
-
-    if task_row is None or plan_row is None:
-        await state.trace.emit(AgentTraceEvent(
-            type="orchestrator", agent_key="test-runner",
-            payload={"action": "task_failed", "detail": "task or plan row missing"},
-        ))
-        return
-
-    sent = await state.task_orchestrator.request_clarifications(
-        task_row=task_row, plan=plan, plan_row_id=plan_row.id,  # type: ignore[arg-type]
-    )
-    await state.trace.emit(AgentTraceEvent(
-        type="orchestrator", agent_key="test-runner",
-        payload={
-            "action": "goals_created",
-            "detail": f"{sent} goal(s) spawned; planner running for each",
-        },
-    ))
 
 
 async def _drive_chat_inbox(state: TestAnalystState) -> None:
@@ -460,17 +382,17 @@ async def _drive_chat_inbox(state: TestAnalystState) -> None:
 
 
 async def _route_user_event(state: TestAnalystState, event: ChatMessage) -> None:
-    task = None
+    task_row = None
     if event.thread_root_id:
-        task = await state.task_orchestrator.find_task_by_thread(
+        task_row = await state.analyst_inbox.find_task_by_thread(
             event.thread_root_id,
         )
-    if task is None:
-        task = await state.task_orchestrator.find_task_by_channel(
+    if task_row is None:
+        task_row = await state.analyst_inbox.find_task_by_channel(
             mm_channel_id=event.channel_id,
             mm_user_id=event.author_id,
         )
-    if task is None:
+    if task_row is None:
         await state.trace.emit(AgentTraceEvent(
             type="orchestrator", agent_key="test-runner",
             payload={
@@ -480,27 +402,25 @@ async def _route_user_event(state: TestAnalystState, event: ChatMessage) -> None
             },
         ))
         return
-    await state.task_orchestrator.append_fragment(task.id, event)
+    await state.analyst_inbox.append_fragment(task_row.id, event)
 
 
 async def _reset_state(state: TestAnalystState) -> None:
-    """Wipe clarification tasks + plans + tracker tasks for a fresh run."""
+    """Wipe analyst conversation tables + plans + tracker tasks."""
     from sqlalchemy import delete
 
     from virtual_dev.infrastructure.db import (
         AgentMessageRow,
+        AnalystConversationFragmentRow,
+        AnalystConversationStepRow,
         PlanRow,
-        TaskFragmentRow,
         TaskRow,
-        TaskRowClar,
-        TaskStepRow,
     )
 
     async with session_scope(state.session_factory) as session:
         for cls in (
-            TaskFragmentRow,
-            TaskStepRow,
-            TaskRowClar,
+            AnalystConversationFragmentRow,
+            AnalystConversationStepRow,
             PlanRow,
             TaskRow,
             AgentMessageRow,

@@ -27,9 +27,6 @@ from virtual_dev.application.agents.dev import DevAgent
 from virtual_dev.application.agents.devops import DevOpsAgent
 from virtual_dev.application.agents.orchestrator import dev_agent_key
 from virtual_dev.application.agents.reviewer import ReviewerAgent
-from virtual_dev.application.agents.clarification_agent import (
-    ClarificationAgent,
-)
 from virtual_dev.application.agents.thread_responder import ThreadResponderAgent
 from virtual_dev.application.services import (
     CommunicatorService,
@@ -38,9 +35,8 @@ from virtual_dev.application.services import (
     ResearcherToolkit,
     RulesLoader,
 )
-from virtual_dev.application.services.clarification import (
-    ClarificationTaskRepository,
-    TaskOrchestrator,
+from virtual_dev.application.services.analyst_session_repo import (
+    AnalystSessionRepository,
 )
 from virtual_dev.domain.ports.chat import ChatPort
 from virtual_dev.domain.ports.code_agent import CodeAgentPort
@@ -89,10 +85,9 @@ class Container:
     reviewer: ReviewerAgent
     devops: DevOpsAgent
     thread_responder: ThreadResponderAgent
-    # Phase 4.6: single-agent clarification subsystem.
-    task_repo: ClarificationTaskRepository
-    clarification_agent: ClarificationAgent
-    task_orchestrator: TaskOrchestrator
+    # Phase 5.0: analyst is the only agent. Session state per ticket
+    # lives on TaskRow + analyst_conversation_steps.
+    analyst_session_repo: AnalystSessionRepository
 
     async def init_db(self) -> None:
         """Create all tables. Used by ``virtual-dev db init``."""
@@ -266,23 +261,9 @@ def build_container(config_dir: Path | str = "config") -> Container:
         prompts_loader=prompts_loader,
     )
 
-    # Phase 4.6: single-agent clarification subsystem.
-    task_repo = ClarificationTaskRepository(session_factory=session_factory)
-    clarification_agent = ClarificationAgent(
-        code_agent=code_agent,
-        config=config,
-        prompts_loader=prompts_loader,
-        communicator=communicator,
-        researcher=researcher,
-        injection_filter=injection_filter,
-    )
-    task_orchestrator = TaskOrchestrator(
-        repo=task_repo,
-        communicator=communicator,
-        agent=clarification_agent,
-        config=config,
+    # Phase 5.0: analyst is the only agent.
+    analyst_session_repo = AnalystSessionRepository(
         session_factory=session_factory,
-        message_bus=message_bus,
     )
 
     # bot_username here is the GitLab username — comments authored by that
@@ -336,9 +317,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         reviewer=reviewer,
         devops=devops,
         thread_responder=thread_responder,
-        task_repo=task_repo,
-        clarification_agent=clarification_agent,
-        task_orchestrator=task_orchestrator,
+        analyst_session_repo=analyst_session_repo,
     )
 
 

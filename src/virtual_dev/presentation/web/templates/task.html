@@ -48,23 +48,17 @@
     {% endif %}
 
     {% if questions %}
-        <h3>Уточнения (clarification tasks)</h3>
+        <h3>Analyst conversation</h3>
         {% for q in questions %}
-            {% set ctask = q.row %}
+            {% set tr = q.row %}
             {% set steps = q.steps %}
             <section style="border:1px solid #e5e5e5; border-radius:4px; padding:0.75rem; margin-bottom:1rem;">
                 <p>
-                    {% if ctask.is_solved %}<span class="status status-solved">solved</span>{% elif ctask.closed %}<span class="status status-closed">closed</span>{% else %}<span class="status status-active">active</span>{% endif %}
-                    · depth {{ ctask.depth }} · iterations: {{ ctask.iteration_count }}
-                    {% if ctask.deadline_at %}· deadline: {{ ctask.deadline_at.strftime("%Y-%m-%d %H:%M") }}{% endif %}
+                    iterations: {{ tr.analyst_iteration_count }}
+                    {% if tr.awaiting_post_id %}
+                        · awaiting reply from <code>@{{ tr.awaiting_username or tr.awaiting_user_id }}</code>
+                    {% endif %}
                 </p>
-                <p><strong>{{ ctask.question }}</strong></p>
-                {% if ctask.info_source %}
-                    <p><small>info_source: <code>{{ ctask.info_source }}</code> ({{ ctask.info_source_class or "?" }})</small></p>
-                {% endif %}
-                {% if ctask.final_answer %}
-                    <p><small><strong>final_answer:</strong> {{ ctask.final_answer | truncate(400) }} (confidence={{ "%.2f"|format(ctask.confidence) }})</small></p>
-                {% endif %}
                 {% if steps %}
                     <ol style="font-size: 0.85rem; padding-left: 1.5rem;">
                         {% for s in steps %}

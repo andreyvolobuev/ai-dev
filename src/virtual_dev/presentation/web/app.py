@@ -27,11 +27,10 @@ from virtual_dev.application.agents.orchestrator import (
 )
 from virtual_dev.infrastructure.container import Container
 from virtual_dev.infrastructure.db import (
+    AnalystConversationStepRow,
     MergeRequestRow,
     PlanRow,
     TaskRow,
-    TaskRowClar,
-    TaskStepRow,
 )
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
@@ -71,10 +70,11 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
     )
     analyst_inbox = AnalystInbox(
         analyst=analyst,
+        session_repo=container.analyst_session_repo,
+        communicator=container.communicator,
         task_tracker=container.task_tracker,
         config=container.config,
         message_bus=container.message_bus,
-        task_orchestrator=container.task_orchestrator,
         session_factory=container.session_factory,
     )
     analyst_runner = AgentRunner(
@@ -112,7 +112,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
     )
 
     coalescer_poller = make_answer_coalescer_worker(
-        orchestrator=container.task_orchestrator,
+        orchestrator=analyst_inbox,
         interval_seconds=container.settings.answer_coalesce_poll_interval_seconds,
     )
 
@@ -128,7 +128,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             config=container.config,
             settings=container.settings,
             vcs=container.vcs,
-            task_orchestrator=container.task_orchestrator,
+            analyst_inbox=analyst_inbox,
         )
         # Catch-up tick — runs independently of the WS health, so
         # missed posts get replayed even if the listener's
@@ -254,35 +254,20 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                         .order_by(MergeRequestRow.created_at.desc())
                     )
                 ).scalars().all())
-                # Phase 4.5: task-driven clarifications. Fetch
-                # clarification tasks + their step history for this
-                # ticket so the template can render a per-task timeline.
-                clar_rows = list((
+                # Phase 5.0: analyst conversation log per ticket.
+                conv_steps = list((
                     await session.execute(
-                        select(TaskRowClar)
-                        .where(
-                            TaskRowClar.tracker == row.tracker,
-                            TaskRowClar.task_external_id == row.external_id,
-                        )
-                        .order_by(TaskRowClar.id.asc())
+                        select(AnalystConversationStepRow)
+                        .where(AnalystConversationStepRow.task_id == row.id)
+                        .order_by(AnalystConversationStepRow.seq.asc())
                     )
                 ).scalars().all())
-                step_rows = list((
-                    await session.execute(
-                        select(TaskStepRow)
-                        .where(
-                            TaskStepRow.task_id.in_([c.id for c in clar_rows])
-                        )
-                        .order_by(TaskStepRow.task_id.asc(), TaskStepRow.seq.asc())
-                    )
-                ).scalars().all()) if clar_rows else []
-                steps_by_task: dict[int, list[TaskStepRow]] = {}
-                for s in step_rows:
-                    steps_by_task.setdefault(s.task_id, []).append(s)
-                questions = [
-                    {"row": c, "steps": steps_by_task.get(c.id, [])}
-                    for c in clar_rows
-                ]
+                # Render as a single "conversation" entry the template
+                # can show as a timeline.
+                if conv_steps:
+                    questions = [{"row": row, "steps": conv_steps}]
+                else:
+                    questions = []
             else:
                 questions = []
         if row is None:

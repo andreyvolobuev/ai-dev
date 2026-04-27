@@ -1,11 +1,7 @@
 """MM catch-up: REST replay of missed posts + listener resilience.
 
-Covers the WebSocket SPOF fix:
-- ``MmThreadListener.catch_up()`` pulls missed posts via
-  ``ChatPort.read_channel_since`` and replays through ``_dispatch``.
-- Idempotency: clarification fragments collapse on UNIQUE per
-  ``(task_id, mm_post_id)``.
-- ``run_forever`` restarts ``subscribe()`` after a crash with backoff.
+Phase 5.0 surface — listener now routes fragments to the analyst
+inbox via TaskRow.awaiting_post_id.
 """
 
 from __future__ import annotations
@@ -22,12 +18,11 @@ from virtual_dev.application.services import (
     CommunicatorService,
     InjectionFilter,
 )
-from virtual_dev.application.services.clarification import (
-    ClarificationTaskRepository,
-    TaskOrchestrator,
+from virtual_dev.application.services.analyst_session_repo import (
+    AnalystSessionRepository,
 )
 from virtual_dev.domain.models.chat import ChatMessage, ChatUser
-from virtual_dev.domain.models.clarification_task import ClarificationTask
+from virtual_dev.domain.models.task import TaskStatus
 from virtual_dev.domain.ports.chat import ChatPort
 from virtual_dev.infrastructure.config import (
     AgentsCfg,
@@ -38,6 +33,9 @@ from virtual_dev.infrastructure.config import (
     RepositoryCfg,
     Settings,
 )
+from virtual_dev.infrastructure.db import TaskRow
+from virtual_dev.infrastructure.db.base import session_scope
+from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
 from virtual_dev.runtime.workers.mm_thread_listener import (
     _PROCESSED_REACTION,
     MmThreadListener,
@@ -109,7 +107,7 @@ class _CatchupChat(ChatPort):
 
             async def _crash() -> AsyncIterator[ChatMessage]:
                 if False:
-                    yield  # pragma: no cover (forces this to be a generator)
+                    yield  # pragma: no cover
                 raise RuntimeError(f"WS crash #{calls}")
 
             return _crash()
@@ -145,69 +143,79 @@ def _config() -> AppConfig:
     )
 
 
-async def _seed_task(
+async def _seed_task_awaiting(
     session_factory: async_sessionmaker[AsyncSession],
-) -> ClarificationTask:
-    """Seed an active clarification task awaiting a reply from alice."""
-    repo = ClarificationTaskRepository(session_factory)
-    task = await repo.create_task(
-        plan_id=1, parent_id=None,
-        tracker="jira", task_external_id="DM-1",
-        question="нужен пример body",
-        info_source="alice",
-        info_source_class="mattermost",
-        coalesce_window_seconds=600,
-        deadline_at=datetime.now(timezone.utc) + timedelta(hours=48),
-    )
-    await repo.update(
-        task.id,
-        awaiting_post_id="bot-post-q",
-        awaiting_user_id="uid-alice",
-        awaiting_username="alice",
-        awaiting_channel_id="dm-uid-alice",
-    )
-    return task
+) -> TaskRow:
+    """Insert a TaskRow with awaiting_* set so the listener routes
+    fragments to it."""
+    async with session_scope(session_factory) as session:
+        row = TaskRow(
+            tracker="jira", external_id="DM-1",
+            title="t", description="",
+            url="", priority="medium", external_status="To Do",
+            internal_status=TaskStatus.PLANNING.value,
+            awaiting_post_id="bot-post-q",
+            awaiting_user_id="uid-alice",
+            awaiting_username="alice",
+            awaiting_channel_id="dm-uid-alice",
+            coalesce_window_seconds=600,
+        )
+        session.add(row)
+        await session.flush()
+        return row
 
 
-def _orchestrator(
+def _make_inbox(
     session_factory: async_sessionmaker[AsyncSession],
     chat: ChatPort,
-) -> TaskOrchestrator:
+) -> AnalystInbox:
+    repo = AnalystSessionRepository(session_factory)
     communicator = CommunicatorService(
         chat, InjectionFilter(), respect_working_hours=False,
     )
-    return TaskOrchestrator(
-        repo=ClarificationTaskRepository(session_factory),
+    return AnalystInbox(
+        analyst=_StubAnalyst(),                       # type: ignore[arg-type]
+        session_repo=repo,
         communicator=communicator,
-        agent=_StubAgent(),                            # type: ignore[arg-type]
+        task_tracker=None,
         config=_config(),
-        session_factory=session_factory,
         message_bus=None,
+        post_to_tracker=False,
+        session_factory=session_factory,
     )
 
 
 def _listener(
     session_factory: async_sessionmaker[AsyncSession],
     chat: ChatPort,
-    orchestrator: TaskOrchestrator | None,
+    inbox: AnalystInbox | None,
 ) -> MmThreadListener:
     return MmThreadListener(
         chat=chat,
         communicator=CommunicatorService(
             chat, InjectionFilter(), respect_working_hours=False,
         ),
-        responder=None,                                # type: ignore[arg-type]
+        responder=None,                               # type: ignore[arg-type]
         dev_agents={},
         session_factory=session_factory,
         config=_config(),
         settings=Settings(),
-        task_orchestrator=orchestrator,
+        analyst_inbox=inbox,
     )
 
 
-class _StubAgent:
+class _StubAnalyst:
     async def run(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
-        raise AssertionError("agent should not run during catch-up tests")
+        raise AssertionError("analyst should not run during catch-up tests")
+
+    async def load_task(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+        raise AssertionError("load_task should not run during catch-up tests")
+
+    async def has_fresh_plan(self, *args: Any, **kwargs: Any) -> bool:  # pragma: no cover
+        return False
+
+    async def save_plan(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover
+        return None
 
 
 # ============================================================
@@ -219,7 +227,7 @@ class _StubAgent:
 async def test_catchup_replays_missed_clarification_fragment(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    q = await _seed_task(session_factory)
+    task_row = await _seed_task_awaiting(session_factory)
     missed = ChatMessage(
         id="missed-1", channel_id="dm-uid-alice", author_id="uid-alice",
         text="вот ответ который бот пропустил",
@@ -227,11 +235,11 @@ async def test_catchup_replays_missed_clarification_fragment(
         thread_root_id="bot-post-q", trusted=False,
     )
     chat = _CatchupChat(catchup_posts={"dm-uid-alice": [missed]})
-    listener = _listener(session_factory, chat, _orchestrator(session_factory, chat))
+    listener = _listener(session_factory, chat, _make_inbox(session_factory, chat))
 
     total = await listener.catch_up()
     assert total == 1
-    fragments = await ClarificationTaskRepository(session_factory).list_unflushed_fragments(q.id)
+    fragments = await AnalystSessionRepository(session_factory).list_unflushed_fragments(task_row.id)
     assert [f.mm_post_id for f in fragments] == ["missed-1"]
 
 
@@ -239,7 +247,7 @@ async def test_catchup_replays_missed_clarification_fragment(
 async def test_catchup_idempotent_on_replayed_fragment(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    q = await _seed_task(session_factory)
+    task_row = await _seed_task_awaiting(session_factory)
     missed = ChatMessage(
         id="missed-2", channel_id="dm-uid-alice", author_id="uid-alice",
         text="ответ",
@@ -247,11 +255,11 @@ async def test_catchup_idempotent_on_replayed_fragment(
         thread_root_id="bot-post-q", trusted=False,
     )
     chat = _CatchupChat(catchup_posts={"dm-uid-alice": [missed]})
-    listener = _listener(session_factory, chat, _orchestrator(session_factory, chat))
+    listener = _listener(session_factory, chat, _make_inbox(session_factory, chat))
 
     await listener.catch_up()
     await listener.catch_up()
-    fragments = await ClarificationTaskRepository(session_factory).list_unflushed_fragments(q.id)
+    fragments = await AnalystSessionRepository(session_factory).list_unflushed_fragments(task_row.id)
     assert [f.mm_post_id for f in fragments] == ["missed-2"]
 
 
@@ -259,19 +267,19 @@ async def test_catchup_idempotent_on_replayed_fragment(
 async def test_catchup_skips_bot_authored_posts(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    q = await _seed_task(session_factory)
+    task_row = await _seed_task_awaiting(session_factory)
     own = ChatMessage(
         id="own-1", channel_id="dm-uid-alice", author_id="uid-bot",
-        text="мой собственный пост",
+        text="мой пост",
         timestamp=datetime.now(timezone.utc),
         thread_root_id="bot-post-q", trusted=True,
     )
     chat = _CatchupChat(catchup_posts={"dm-uid-alice": [own]})
-    listener = _listener(session_factory, chat, _orchestrator(session_factory, chat))
+    listener = _listener(session_factory, chat, _make_inbox(session_factory, chat))
 
     total = await listener.catch_up()
     assert total == 0
-    fragments = await ClarificationTaskRepository(session_factory).list_unflushed_fragments(q.id)
+    fragments = await AnalystSessionRepository(session_factory).list_unflushed_fragments(task_row.id)
     assert fragments == []
 
 
@@ -279,51 +287,40 @@ async def test_catchup_skips_bot_authored_posts(
 async def test_catchup_uses_oldest_relevant_cursor_per_channel(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    repo = ClarificationTaskRepository(session_factory)
-    deadline = datetime.now(timezone.utc) + timedelta(hours=48)
     older_t = datetime.now(timezone.utc) - timedelta(hours=2)
     newer_t = datetime.now(timezone.utc) - timedelta(hours=1)
 
-    g_old = await repo.create_task(
-        plan_id=1, parent_id=None, tracker="jira", task_external_id="DM-1",
-        question="old", info_source="alice", info_source_class="mattermost",
-        coalesce_window_seconds=600, deadline_at=deadline,
-    )
-    await repo.update(
-        g_old.id,
-        awaiting_post_id="post-old",
-        awaiting_user_id="uid-alice",
-        awaiting_username="alice",
-        awaiting_channel_id="dm-uid-alice",
-    )
-    g_new = await repo.create_task(
-        plan_id=2, parent_id=None, tracker="jira", task_external_id="DM-2",
-        question="new", info_source="alice", info_source_class="mattermost",
-        coalesce_window_seconds=600, deadline_at=deadline,
-    )
-    await repo.update(
-        g_new.id,
-        awaiting_post_id="post-new",
-        awaiting_user_id="uid-alice",
-        awaiting_username="alice",
-        awaiting_channel_id="dm-uid-alice",
-    )
-    from sqlalchemy import select
-
-    from virtual_dev.infrastructure.db import TaskRowClar
-    from virtual_dev.infrastructure.db.base import session_scope
     async with session_scope(session_factory) as session:
-        row_old = (await session.execute(
-            select(TaskRowClar).where(TaskRowClar.id == g_old.id)
-        )).scalar_one()
-        row_new = (await session.execute(
-            select(TaskRowClar).where(TaskRowClar.id == g_new.id)
-        )).scalar_one()
-        row_old.created_at = older_t
-        row_new.created_at = newer_t
+        row_old = TaskRow(
+            tracker="jira", external_id="DM-1",
+            title="x", description="", url="",
+            priority="medium", external_status="x",
+            internal_status=TaskStatus.PLANNING.value,
+            awaiting_post_id="post-old",
+            awaiting_user_id="uid-alice",
+            awaiting_username="alice",
+            awaiting_channel_id="dm-uid-alice",
+            coalesce_window_seconds=600,
+            discovered_at=older_t,
+        )
+        row_new = TaskRow(
+            tracker="jira", external_id="DM-2",
+            title="y", description="", url="",
+            priority="medium", external_status="x",
+            internal_status=TaskStatus.PLANNING.value,
+            awaiting_post_id="post-new",
+            awaiting_user_id="uid-alice",
+            awaiting_username="alice",
+            awaiting_channel_id="dm-uid-alice",
+            coalesce_window_seconds=600,
+            discovered_at=newer_t,
+        )
+        session.add(row_old)
+        session.add(row_new)
+        await session.flush()
 
     chat = _CatchupChat(catchup_posts={})
-    listener = _listener(session_factory, chat, _orchestrator(session_factory, chat))
+    listener = _listener(session_factory, chat, _make_inbox(session_factory, chat))
     await listener.catch_up()
 
     assert len(chat.read_channel_calls) == 1
@@ -342,12 +339,12 @@ async def test_run_forever_restarts_after_subscribe_crash(
         communicator=CommunicatorService(
             chat, InjectionFilter(), respect_working_hours=False,
         ),
-        responder=None,                                # type: ignore[arg-type]
+        responder=None,                               # type: ignore[arg-type]
         dev_agents={},
         session_factory=session_factory,
         config=_config(),
         settings=Settings(),
-        task_orchestrator=None,
+        analyst_inbox=None,
         subscription_initial_backoff=0.05,
         subscription_max_backoff=0.1,
     )
@@ -357,8 +354,6 @@ async def test_run_forever_restarts_after_subscribe_crash(
     await listener.stop()
     await run_task
 
-    assert chat.subscribe_calls >= 2, (
-        "listener must restart subscription after crash"
-    )
+    assert chat.subscribe_calls >= 2
     assert listener.stats.subscription_restarts >= 1
     assert listener.stats.errors >= 1

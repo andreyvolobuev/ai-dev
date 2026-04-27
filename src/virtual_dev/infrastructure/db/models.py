@@ -66,6 +66,23 @@ class TaskRow(Base):
     discovered_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
+    # Phase 5.0: the analyst's session state per ticket. ``awaiting_*``
+    # fields are filled when the analyst dispatches an ASK and is
+    # waiting on a human reply; the listener routes reply fragments
+    # by ``awaiting_post_id`` / ``awaiting_channel_id``.
+    awaiting_post_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True,
+    )
+    awaiting_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    awaiting_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    awaiting_channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    awaiting_dedupe_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_fragment_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    coalesce_window_seconds: Mapped[int] = mapped_column(Integer, default=60)
+    analyst_iteration_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_analyst_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    analyst_deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
 
 class MergeRequestRow(Base):
     """Persistent projection of a VCS merge request."""
@@ -200,74 +217,18 @@ class MrHistoryRow(Base):
     indexed_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
 
-class TaskRowClar(Base):
-    """One ``ClarificationTask`` — phase 4.5 task-driven model.
+class AnalystConversationStepRow(Base):
+    """Append-only conversation log per ticket (Phase 5.0).
 
-    Replaces ``clarification_goals``. The fields mirror the user's
-    spec (info_source / info_source_class / current_response /
-    is_solved). Internal loop state (awaiting_*, last_planning_started_at)
-    is kept here for crash recovery; nothing in the LLM-facing surface
-    treats this as a state machine.
+    The analyst is now a continuous-reasoning agent — its memory of
+    "what I've done on this ticket so far" lives here. Steps are
+    PLANNER_DECIDED (run summary), BOT_ASKED (DM dispatched),
+    HUMAN_REPLIED (coalesced reply), NOTE / STALE_FRAGMENT.
     """
 
-    __tablename__ = "clarification_tasks"
+    __tablename__ = "analyst_conversation_steps"
     __table_args__ = (
-        Index("ix_clar_tasks_solved_lastfrag", "is_solved", "last_fragment_at"),
-        Index("ix_clar_tasks_solved_nextrun", "is_solved", "next_planner_run_at"),
-        Index("ix_clar_tasks_solved_deadline", "is_solved", "deadline_at"),
-        Index("ix_clar_tasks_tracker_extid", "tracker", "task_external_id"),
-        Index("ix_clar_tasks_parent", "parent_id"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-
-    plan_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
-    parent_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    tracker: Mapped[str] = mapped_column(String(32))
-    task_external_id: Mapped[str] = mapped_column(String(64))
-
-    question: Mapped[str] = mapped_column(Text)
-    info_source: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    info_source_class: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    current_response: Mapped[str | None] = mapped_column(Text, nullable=True)
-    is_solved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    final_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
-    confidence: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
-
-    # Handle of the issue reporter — agent uses this to DM them when
-    # it needs context only the reporter has (e.g. "who is Vasya?").
-    reporter_handle: Mapped[str | None] = mapped_column(String(128), nullable=True)
-
-    depth: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    iteration_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    tools_tried_json: Mapped[list[str]] = mapped_column(JSON, default=list)
-    closed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-
-    # Outstanding async wait — filled when an ASYNC tool started a
-    # conversation; cleared when the reply coalesces.
-    awaiting_post_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    awaiting_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    awaiting_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    awaiting_channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    awaiting_dedupe_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    last_fragment_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-
-    coalesce_window_seconds: Mapped[int] = mapped_column(Integer, default=60)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    solved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    last_planning_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    next_planner_run_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-
-
-class TaskStepRow(Base):
-    """Append-only history entry for one clarification task."""
-
-    __tablename__ = "clar_task_steps"
-    __table_args__ = (
-        UniqueConstraint("task_id", "seq", name="uq_clar_task_step_seq"),
+        UniqueConstraint("task_id", "seq", name="uq_analyst_conv_step_seq"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -279,13 +240,18 @@ class TaskStepRow(Base):
     metadata_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
 
 
-class TaskFragmentRow(Base):
-    """Raw MM message buffered while the task waits on a human reply."""
+class AnalystConversationFragmentRow(Base):
+    """Raw MM message buffered while the analyst waits on a reply.
 
-    __tablename__ = "clar_task_fragments"
+    Per-task UNIQUE on ``(task_id, mm_post_id)`` so a duplicate WS
+    delivery is a silent no-op but two tickets sharing a DM channel
+    can each see the same post.
+    """
+
+    __tablename__ = "analyst_conversation_fragments"
     __table_args__ = (
         UniqueConstraint(
-            "task_id", "mm_post_id", name="uq_clar_task_fragment_post",
+            "task_id", "mm_post_id", name="uq_analyst_conv_fragment_post",
         ),
     )
 

@@ -8,27 +8,25 @@ from virtual_dev.infrastructure.db.base import (
 )
 from virtual_dev.infrastructure.db.models import (
     AgentMessageRow,
+    AnalystConversationFragmentRow,
+    AnalystConversationStepRow,
     EventRow,
     MergeRequestRow,
     MrHistoryRow,
     PlanRow,
-    TaskFragmentRow,
     TaskRow,
-    TaskRowClar,
-    TaskStepRow,
 )
 
 __all__ = [
     "AgentMessageRow",
+    "AnalystConversationFragmentRow",
+    "AnalystConversationStepRow",
     "Base",
     "EventRow",
     "MergeRequestRow",
     "MrHistoryRow",
     "PlanRow",
-    "TaskFragmentRow",
     "TaskRow",
-    "TaskRowClar",
-    "TaskStepRow",
     "make_engine",
     "make_session_factory",
     "session_scope",
