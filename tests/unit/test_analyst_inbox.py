@@ -350,16 +350,6 @@ async def test_inbox_resumes_analyst_after_coalesced_reply(
     second_history_kinds = {s.kind.value for s in analyst.calls[1].history}
     assert "human_replied" in second_history_kinds
 
-    # The orchestrator acknowledged receipt with a short DM to the
-    # awaitee (alice). It must NOT install awaiting state — the bot
-    # is not waiting for a reply to "Спасибо".
-    from virtual_dev.runtime.workers.analyst_inbox import _ACK_PHRASES
-
-    ack_dms = [d for d in chat.sent_dms if d[0] == "uid-alice" and d[1] in _ACK_PHRASES]
-    assert ack_dms, (
-        f"expected one ack DM to uid-alice; got {chat.sent_dms!r}"
-    )
-
     async with session_factory() as session:
         refreshed = (await session.execute(
             select(TaskRow).where(TaskRow.external_id == "DM-42")

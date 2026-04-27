@@ -17,7 +17,6 @@ TaskOrchestrator → analyst replan``. Now: ONE agent, ONE driver.
 
 from __future__ import annotations
 
-import random
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -56,26 +55,6 @@ from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 from virtual_dev.infrastructure.config import AppConfig
 from virtual_dev.infrastructure.db import TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
-
-
-# Short text replies used to acknowledge a coalesced human reply.
-# Replaces the silent ✅ reaction so the human sees a normal-looking
-# "got it" message in the DM channel. The acknowledgement is sent
-# via send_dm directly (NOT via the dm_user tool) so it does NOT
-# install awaiting state — the bot is not waiting for a response to
-# "Спасибо".
-_ACK_PHRASES: tuple[str, ...] = (
-    "Спасибо!",
-    "Понял.",
-    "Принял к сведению.",
-    "Окей, спасибо!",
-    "Принял, спасибо.",
-    "Понял, спасибо!",
-)
-
-
-def _pick_ack_phrase() -> str:
-    return random.choice(_ACK_PHRASES)
 
 
 def _render_plan_comment(
@@ -286,27 +265,7 @@ class AnalystInbox:
             },
         )
         await self._sessions.mark_fragments_flushed(task_row.id)
-        # Acknowledge receipt with a short text DM instead of a silent
-        # ✅ reaction — feels less robotic to the human. Sent via
-        # send_dm (not dm_user) so it does NOT install awaiting state;
-        # the bot continues to next step without expecting a reply to
-        # «Спасибо». Fall back to the reaction if we don't have a
-        # target user_id (shouldn't happen for awaiting flows, but be
-        # safe).
-        ack_target = task_row.awaiting_user_id
-        if ack_target:
-            try:
-                await self._communicator.send_dm(ack_target, _pick_ack_phrase())
-            except Exception:
-                logger.exception(
-                    "AnalystInbox: ack send_dm failed for task {}; "
-                    "falling back to reaction", task_row.id,
-                )
-                if last_post_id:
-                    await self._communicator.add_reaction(
-                        last_post_id, "white_check_mark",
-                    )
-        elif last_post_id:
+        if last_post_id:
             await self._communicator.add_reaction(last_post_id, "white_check_mark")
         await self._sessions.clear_awaiting(task_row.id)
         refreshed = await self._sessions.get_task(task_row.id)
