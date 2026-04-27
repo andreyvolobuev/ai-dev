@@ -1,4 +1,10 @@
-"""Unit tests for ResearcherToolkit — direct tool invocations."""
+"""Unit tests for the researcher tool implementations.
+
+The tools live in ``virtual_dev.tools.<name>`` (one file each); each
+exports an ``async def run(researcher, args)`` entry point that the
+@tool wrapper calls. Tests target ``run`` directly so they don't need
+the SDK / MCP wiring on the path.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +23,9 @@ from virtual_dev.infrastructure.config.schema import (
     MappingsCfg,
     RepositoryCfg,
 )
+from virtual_dev.tools.kb_search import run as run_kb_search
+from virtual_dev.tools.read_file import run as run_read_file
+from virtual_dev.tools.search_code import run as run_search_code
 
 
 class _FakeKb(KnowledgeBasePort):
@@ -70,7 +79,7 @@ async def test_search_code_finds_matches(git_repo: Path) -> None:
         knowledge_base=None,
         injection_filter=InjectionFilter(),
     )
-    result = await toolkit._run_search_code({"pattern": "needle-in-alpha", "repo_key": "demo"})
+    result = await run_search_code(toolkit, {"pattern": "needle-in-alpha", "repo_key": "demo"})
     text = result["content"][0]["text"]
     assert "alpha.py" in text
     assert "needle-in-alpha" in text
@@ -86,7 +95,7 @@ async def test_search_code_reports_missing_repo(tmp_path: Path) -> None:
         knowledge_base=None,
         injection_filter=InjectionFilter(),
     )
-    result = await toolkit._run_search_code({"pattern": "x", "repo_key": "demo"})
+    result = await run_search_code(toolkit, {"pattern": "x", "repo_key": "demo"})
     assert result.get("is_error") is True
 
 
@@ -98,7 +107,7 @@ async def test_read_file_blocks_path_escape(git_repo: Path) -> None:
         knowledge_base=None,
         injection_filter=InjectionFilter(),
     )
-    result = await toolkit._run_read_file({"path": "../../etc/passwd", "repo_key": "demo"})
+    result = await run_read_file(toolkit, {"path": "../../etc/passwd", "repo_key": "demo"})
     assert result.get("is_error") is True
 
 
@@ -110,7 +119,7 @@ async def test_read_file_returns_content(git_repo: Path) -> None:
         knowledge_base=None,
         injection_filter=InjectionFilter(),
     )
-    result = await toolkit._run_read_file({"path": "pkg/alpha.py", "repo_key": "demo"})
+    result = await run_read_file(toolkit, {"path": "pkg/alpha.py", "repo_key": "demo"})
     text = result["content"][0]["text"]
     assert "needle-in-alpha" in text
 
@@ -123,7 +132,7 @@ async def test_kb_search_without_adapter_errors(tmp_path: Path) -> None:
         knowledge_base=None,
         injection_filter=InjectionFilter(),
     )
-    result = await toolkit._run_kb_search({"query": "x"})
+    result = await run_kb_search(toolkit, {"query": "x"})
     assert result.get("is_error") is True
 
 
@@ -139,7 +148,7 @@ async def test_kb_search_returns_wrapped_results(tmp_path: Path) -> None:
         knowledge_base=kb,
         injection_filter=InjectionFilter(),
     )
-    result = await toolkit._run_kb_search({"query": "ingest"})
+    result = await run_kb_search(toolkit, {"query": "ingest"})
     text = result["content"][0]["text"]
     assert "Pipeline architecture" in text
     assert "<untrusted_content" in text

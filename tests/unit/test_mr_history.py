@@ -243,11 +243,12 @@ async def test_search_on_empty_query_returns_empty(
 async def test_researcher_search_mr_history_tool(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """End-to-end through ResearcherToolkit._run_search_mr_history."""
+    """End-to-end through tools.search_mr_history.run."""
     from virtual_dev.application.services import InjectionFilter, ResearcherToolkit
     from virtual_dev.infrastructure.config.schema import (
         AgentsCfg, AppConfig, MappingsCfg, RepositoryCfg,
     )
+    from virtual_dev.tools.search_mr_history import run as run_search_mr_history
 
     vcs = _FakeVcsWithMergedMrs([
         _mr(1, "Add users endpoint", "POST /users ...."),
@@ -266,8 +267,8 @@ async def test_researcher_search_mr_history_tool(
         injection_filter=InjectionFilter(),
         mr_history=idx,
     )
-    result = await toolkit._run_search_mr_history(
-        {"repo_key": "demo", "query": "add users endpoint", "k": 2}
+    result = await run_search_mr_history(
+        toolkit, {"repo_key": "demo", "query": "add users endpoint", "k": 2},
     )
     text = result["content"][0]["text"]
     assert "!1" in text
@@ -284,6 +285,7 @@ async def test_researcher_search_mr_history_without_adapter_errors(
     from virtual_dev.infrastructure.config.schema import (
         AgentsCfg, AppConfig, MappingsCfg, RepositoryCfg,
     )
+    from virtual_dev.tools.search_mr_history import run as run_search_mr_history
 
     toolkit = ResearcherToolkit(
         config=AppConfig(
@@ -295,8 +297,8 @@ async def test_researcher_search_mr_history_without_adapter_errors(
         injection_filter=InjectionFilter(),
         mr_history=None,
     )
-    result = await toolkit._run_search_mr_history(
-        {"repo_key": "demo", "query": "x"}
+    result = await run_search_mr_history(
+        toolkit, {"repo_key": "demo", "query": "x"},
     )
     assert result.get("is_error") is True
     assert "index-mrs" in result["content"][0]["text"]

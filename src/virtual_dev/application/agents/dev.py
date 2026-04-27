@@ -30,10 +30,8 @@ testable and local.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -56,7 +54,6 @@ from virtual_dev.infrastructure.config import AppConfig, Settings
 from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow, TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
-
 
 _SLUG_SAFE_RE = re.compile(r"[^a-z0-9]+")
 
@@ -435,9 +432,20 @@ class DevAgent:
         ]
         # MR-history search is the one piece the Dev doesn't get from
         # built-in tools: let it peek at how similar changes were done before.
+        # Use the tools/ loader so this stays in sync with what the
+        # analyst sees — the SDK allow-list still keeps Dev scoped to
+        # just search_mr_history out of the researcher group.
         if self._researcher is not None:
-            mcp_servers["virtual_dev_researcher"] = self._researcher.build_mcp_server()
-            allowed_tool_names.append("mcp__virtual_dev_researcher__search_mr_history")
+            from virtual_dev.tools import ToolContext, build_tool_servers
+            researcher_servers, _all_researcher_tools = build_tool_servers(
+                ToolContext(researcher=self._researcher),
+            )
+            researcher_server = researcher_servers.get("virtual_dev_researcher")
+            if researcher_server is not None:
+                mcp_servers["virtual_dev_researcher"] = researcher_server
+                allowed_tool_names.append(
+                    "mcp__virtual_dev_researcher__search_mr_history",
+                )
         request.extras["mcp_servers"] = mcp_servers
         request.extras["allowed_tool_names"] = allowed_tool_names
 
