@@ -299,7 +299,25 @@ class AnalystAgent:
         self, step: ConversationStep, filt: InjectionFilter,
     ) -> str:
         ts = step.timestamp.strftime("%H:%M:%S") if step.timestamp else ""
-        head = f"**[{step.seq}] {step.kind.value}** ({ts})"
+        # Include recipient (bot_asked) / sender (human_replied) so the
+        # agent doesn't conflate replies from different people. Without
+        # this, after dm_user(v.shvarts) followed by a reply from
+        # v.shvarts, the agent sees "step 6 human_replied" with no
+        # author and may mis-attribute it to whoever it last addressed.
+        meta = step.metadata or {}
+        attribution = ""
+        if step.kind == ConversationStepKind.BOT_ASKED:
+            target = meta.get("target_username") or meta.get("target_user_id")
+            if target:
+                attribution = f" → @{target}"
+        elif step.kind in (
+            ConversationStepKind.HUMAN_REPLIED,
+            ConversationStepKind.STALE_FRAGMENT,
+        ):
+            sender = meta.get("from_username") or meta.get("from_user_id")
+            if sender:
+                attribution = f" ← @{sender}"
+        head = f"**[{step.seq}] {step.kind.value}{attribution}** ({ts})"
         body = step.text.strip()
         if not body:
             return head
