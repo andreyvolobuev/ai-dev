@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk.types import McpSdkServerConfig  # type: ignore[attr-defined]
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -370,9 +371,26 @@ class AnalystAgent:
         repo_cfg = self._config.get_repository(repo_key)
         if repo_cfg is None:
             return None
-        if repo_cfg.local_path:
-            return Path(repo_cfg.local_path)
-        return Path(self._settings.workspaces_dir) / repo_key
+        candidate = (
+            Path(repo_cfg.local_path) if repo_cfg.local_path
+            else Path(self._settings.workspaces_dir) / repo_key
+        )
+        # Degrade gracefully when the path doesn't exist (e.g. test-
+        # analyst session with no REPO_LOCAL_PATHS set and no VCS to
+        # clone). The SDK chokes on a missing cwd; passing None lets
+        # it run from the process cwd. Read/Grep on the target repo
+        # won't work, but the agent can still research via MCP tools
+        # and write a plan from the ticket text alone.
+        if not candidate.exists():
+            logger.warning(
+                "Analyst: target repo {!r} has no local checkout at {} "
+                "(set REPO_LOCAL_PATHS in .env, or run the prod stack "
+                "so vcs.ensure_clone can populate workspaces/). "
+                "Running agent without a repo cwd.",
+                repo_key, candidate,
+            )
+            return None
+        return candidate
 
     # --- DB helpers (used by AnalystOrchestrator too) ---
 
