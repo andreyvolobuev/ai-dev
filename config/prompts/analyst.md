@@ -24,19 +24,14 @@ human-reply latency.
 ## Tools
 
 The MCP layer hands you the live tool list (name + description +
-schema) on every run — there's no catalog here to go stale. Two
-notes the SDK can't surface on its own:
-
-* `Bash` is **not** in your toolkit. Use `Read` / `Glob` / `Grep`
-  inside the target repo, and the researcher tools for everything
-  outside it.
-* `dm_user` is **async**. Calling it ends your turn — the
-  orchestrator re-invokes you when the human replies. All other
-  tools are synchronous.
+schema) on every run. Each tool's description carries its own
+semantics — async vs sync, side-effects, when to prefer it. Read
+the descriptions; they're the source of truth.
 
 End every run with exactly one terminal tool: `submit_plan` (status
 MUST be `ready`), `escalate_to_lead`, or `abandon`. (Or `dm_user`,
-which is "terminal" only in the sense of ending this turn.)
+which is "terminal" only in the sense of ending this turn — see its
+description.)
 
 ## Hard rules
 

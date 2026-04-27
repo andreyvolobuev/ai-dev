@@ -95,11 +95,22 @@ the `@tool` name + description + schema as part of the tool list on
 every run. You do **not** need to update `config/prompts/analyst.md`
 just to make the model aware the tool exists.
 
-The only time you edit `analyst.md` is to add **strategic guidance**
-that can't fit in a tool description: when to prefer this tool over
-another, ordering ("call `find_chat_user_by_name` before `dm_user`"),
-or hard rules the policy needs ("one `dm_user` per run"). Most simple
-fetch-and-return tools need none of that.
+**Special semantics live in the tool's `description` string.** If
+your tool is async (ends the agent's turn), has irreversible
+side-effects, can only be called once, must be sequenced after
+another tool, or returns data the model should treat as untrusted —
+spell that out in the `description` arg of `@tool(...)`. The LLM
+reads it on every run; the prompt doesn't have to repeat it. See
+`dm_user.py` for an example: its description carries the "**THIS IS
+ASYNC** — END YOUR TURN after calling" semantics, so `analyst.md`
+doesn't need to.
+
+The only time you edit `analyst.md` is to add **cross-tool strategy**
+that doesn't belong in any single tool's description: ordering rules
+that span multiple tools ("find_chat_user_by_name BEFORE dm_user"),
+budget rules ("one dm_user per run"), or workflow gates ("re-read the
+ticket before calling submit_plan"). Most simple fetch-and-return
+tools need none of that.
 
 ## Removing a tool
 
