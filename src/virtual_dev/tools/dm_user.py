@@ -22,7 +22,12 @@ def build(ctx: ToolContext):
     @tool(
         "dm_user",
         "Send a direct message to a chat-platform user with one "
-        "question. Pass to_handle OR to_email. **THIS IS ASYNC** — "
+        "question. The `message` argument is the ONLY thing the human "
+        "sees — your reasoning text, llm_text blocks, and tool-result "
+        "summaries are invisible to them. So if you want to "
+        "acknowledge or answer something they said, the "
+        "acknowledgement must be INSIDE `message=`, not in your "
+        "thinking. Pass to_handle OR to_email. **THIS IS ASYNC** — "
         "after calling, END YOUR TURN; you'll be re-invoked when "
         "the human replies. Do NOT call any other tools after this "
         "in the same turn.",
