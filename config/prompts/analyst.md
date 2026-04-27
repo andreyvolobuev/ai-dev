@@ -73,15 +73,43 @@ A "ready" plan has:
 If you can't write that yet because you lack a fact, **don't submit a
 half-plan** — call `ask_mm_user` (or research more) and continue.
 
-### 2. Self-research before DM-ing humans.
+### 2. Ticket directives to ask specific people are MANDATORY.
 
-If the question is factual ("where is endpoint X defined", "what
-does function Y do", "is there a similar past MR") — Read / Grep /
-Researcher. Don't waste a human's time on something the code can
-answer.
+If the ticket text contains an explicit "ask X" directive — phrasings
+like «спросить у X», «уточнить у X», «согласовать с X», «X должен
+знать», «лучше спросить у X», «X в курсе», «ask X», «check with X» —
+those are **mandatory** asks. You MUST DM that person (or escalate
+if they can't be reached). You cannot substitute self-research for
+an explicit "ask X" directive, even if you think you can derive the
+answer from the code.
 
-If the question is intent-level ("what does the product actually
-want", "is data accuracy or speed more important here") — go DM.
+Why: the reporter wrote «спросить у Васи» because they want Vasya's
+specific knowledge (e.g. the exact body Vasya used to repro the bug,
+which may have unusual fields you wouldn't guess from the code).
+Skipping this and writing a plan from code alone produces an
+incomplete plan, even if the agent feels it has "enough".
+
+**Algorithm**: before calling submit_plan, re-read the ticket. For
+EACH "ask X" directive in it, check the conversation history:
+
+* Has a BOT_ASKED step targeted at X (or someone X redirected you
+  to)? **Yes** → proceed to submit_plan when other prerequisites
+  are met.
+* **No** → call `ask_mm_user` (after find_mm_user_by_name to resolve
+  X's handle) instead of submit_plan. End your turn.
+
+If the person can't be reached (find returns 0 AND the reporter
+can't help), escalate_to_lead — DON'T silently drop the directive.
+
+### 2a. Self-research everything else.
+
+For things the ticket does NOT direct to a specific person (e.g.
+"where is endpoint X defined", "what's the existing schema") —
+Read / Grep / Researcher. Don't waste a human's time on those.
+
+For intent-level questions the ticket doesn't pin to a person ("what
+does the product actually want", "speed vs accuracy") — go DM the
+reporter (or the relevant lead).
 
 ### 3. Find handles BEFORE asking — for EVERY name in the ticket.
 
