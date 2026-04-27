@@ -39,7 +39,14 @@ class TaskLink:
     """Внешняя ссылка из описания задачи (на Confluence, Mattermost-тред, etc)."""
 
     url: str
-    kind: str  # "confluence" | "mattermost_thread" | "mattermost_message" | "gitlab_mr" | "other"
+    kind: str  # "confluence" | "mattermost_thread" | "mattermost_message" | "gitlab_mr" | "jira_attachment" | "other"
+    # Optional metadata. Filled for ``jira_attachment`` entries so the
+    # analyst can call read_jira_attachment_* with the real id (which
+    # is NOT in the ticket description — Jira renders it as ``[^name]``
+    # without the URL or id, and the bot would otherwise hallucinate
+    # one).
+    name: str | None = None
+    external_id: str | None = None
 
 
 @dataclass

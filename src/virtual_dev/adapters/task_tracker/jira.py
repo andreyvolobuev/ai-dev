@@ -182,4 +182,20 @@ def _extract_links(fields: dict[str, Any]) -> list[TaskLink]:
             related = link.get(side)
             if isinstance(related, dict) and related.get("key"):
                 links.append(TaskLink(url=str(related.get("self", "")), kind="jira_issue"))
+    # Attachments: Jira returns each as {id, filename, content (URL),
+    # mimeType, size}. We surface id + name so read_jira_attachment_*
+    # tools can use the real id instead of guessing from the
+    # description's ``[^filename]`` shorthand.
+    for att in fields.get("attachment") or []:
+        if not isinstance(att, dict):
+            continue
+        att_id = att.get("id")
+        if att_id is None:
+            continue
+        links.append(TaskLink(
+            url=str(att.get("content") or ""),
+            kind="jira_attachment",
+            name=str(att.get("filename") or ""),
+            external_id=str(att_id),
+        ))
     return links

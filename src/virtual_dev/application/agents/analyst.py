@@ -249,6 +249,29 @@ class AnalystAgent:
         parts.append(desc_wrapped.wrapped_text)
         parts.append("")
 
+        # Attachments + non-attachment external links surfaced from the
+        # tracker. Jira renders attachments in the description as
+        # ``[^filename]`` shorthand (no id, no URL) — without this
+        # block the analyst would have to guess attachment ids and
+        # would hallucinate them. We list each with the REAL id so
+        # ``read_jira_attachment_*(url=<id>)`` works on the first try.
+        attachments: list[dict[str, Any]] = [
+            link for link in (task_row.links_json or [])
+            if isinstance(link, dict) and link.get("kind") == "jira_attachment"
+        ]
+        if attachments:
+            parts.append("## Attachments on this ticket")
+            for att in attachments:
+                name = att.get("name") or "(unnamed)"
+                ext_id = att.get("external_id") or "?"
+                url = att.get("url") or ""
+                parts.append(
+                    f"* `{name}` — id=`{ext_id}` — pass either the id "
+                    f"or this URL to `read_jira_attachment_*` tools: "
+                    f"{url}"
+                )
+            parts.append("")
+
         # Re-render the conversation log so the analyst has continuity.
         if history:
             parts.append("## Everything you've done on this ticket so far")
