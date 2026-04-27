@@ -88,16 +88,23 @@ as "skip me."
    `researcher` for read-only research tools that may also be exposed
    to the dev agent later).
 3. Create `src/virtual_dev/tools/<name>.py` from the template above.
-4. Update `config/prompts/analyst.md` so the LLM knows the new tool
-   exists and when to use it. The MCP layer alone won't tell the LLM
-   what the tool is for.
-5. Restart the process. The loader picks the tool up at import time.
+4. Restart the process. The loader picks the tool up at import time.
+
+The LLM learns about your new tool **automatically** — the SDK passes
+the `@tool` name + description + schema as part of the tool list on
+every run. You do **not** need to update `config/prompts/analyst.md`
+just to make the model aware the tool exists.
+
+The only time you edit `analyst.md` is to add **strategic guidance**
+that can't fit in a tool description: when to prefer this tool over
+another, ordering ("call `find_chat_user_by_name` before `dm_user`"),
+or hard rules the policy needs ("one `dm_user` per run"). Most simple
+fetch-and-return tools need none of that.
 
 ## Removing a tool
 
-Delete the file. That's it. Also remove any references in
-`config/prompts/analyst.md` so the LLM stops being told the tool is
-available.
+Delete the file. That's it. If you also added strategy text in
+`analyst.md` about it, drop those rules.
 
 ## Conventions
 
