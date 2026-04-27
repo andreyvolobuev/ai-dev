@@ -147,7 +147,12 @@
       </div>
       <div class="form-row">
         <button id="run-btn" type="button">▶ Run analyst</button>
+        <button id="run-jira-btn" type="button" title="Fetch the ticket from real Jira (uses JIRA_URL/JIRA_TOKEN). Bot DMs still go here, not real MM." style="background:#3b82f6">⤓ Fetch from Jira</button>
         <button id="reset-btn" type="button" style="background:#6e7681">⟲ Reset</button>
+      </div>
+      <div style="margin-top: 6px; font-size: 10px; color: #8b949e;">
+        <strong>▶ Run analyst</strong> uses the typed title/description above (legacy fake mode).<br>
+        <strong>⤓ Fetch from Jira</strong> pulls the ticket text + components from real Jira by the External id; bot DMs are still routed here, not to real MM (HybridChat).
       </div>
       <div id="status" class="status-line">idle</div>
       <div style="margin-top:12px;">
@@ -469,6 +474,17 @@ d.shvarts|Дмитрий|Шварц|Backend"></textarea>
     };
   }
 
+  function clearActivityUi() {
+    activity.innerHTML = '';
+    chat.innerHTML = '';
+    chatPosts.clear();
+    questionsByPostId.clear();
+    activeThreadRoot = null;
+    $('reply-target').textContent = 'click a bot message to choose which question you\'re answering';
+    eventCount = 0;
+    $('event-count').textContent = '0 events';
+  }
+
   $('run-btn').onclick = async () => {
     const id = $('task-id').value.trim();
     const title = $('task-title').value.trim();
@@ -478,16 +494,24 @@ d.shvarts|Дмитрий|Шварц|Backend"></textarea>
       return;
     }
     setStatus('running…', 'status-running');
-    activity.innerHTML = '';
-    chat.innerHTML = '';
-    chatPosts.clear();
-    questionsByPostId.clear();
-    activeThreadRoot = null;
-    $('reply-target').textContent = 'click a bot message to choose which question you\'re answering';
-    eventCount = 0;
-    $('event-count').textContent = '0 events';
+    clearActivityUi();
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'run_task', external_id: id, title, description: desc }));
+    } else {
+      setStatus('ws not connected', 'status-error');
+    }
+  };
+
+  $('run-jira-btn').onclick = async () => {
+    const id = $('task-id').value.trim();
+    if (!id) {
+      alert('Need a Jira issue key (e.g. DM-3342)');
+      return;
+    }
+    setStatus('fetching from Jira…', 'status-running');
+    clearActivityUi();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'fetch_jira_ticket', external_id: id }));
     } else {
       setStatus('ws not connected', 'status-error');
     }

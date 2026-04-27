@@ -32,7 +32,10 @@ from fastapi.templating import Jinja2Templates
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from virtual_dev.adapters.chat.hybrid import HybridChat
 from virtual_dev.adapters.chat.in_memory import InMemoryChat
+from virtual_dev.adapters.chat.mattermost import MattermostChat
+from virtual_dev.adapters.task_tracker import JiraTaskTracker
 from virtual_dev.adapters.code_agent import ClaudeAgentSdkCodeAgent
 from virtual_dev.application.agents import AnalystAgent
 from virtual_dev.application.services import (
@@ -51,6 +54,7 @@ from virtual_dev.application.services.analyst_session_repo import (
 )
 from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
 from virtual_dev.domain.models.chat import ChatMessage
+from virtual_dev.domain.ports.chat import ChatPort
 from virtual_dev.domain.models.plan import PlanStatus
 from virtual_dev.domain.models.task import TaskStatus
 from virtual_dev.infrastructure.config import (
@@ -85,6 +89,7 @@ class TestAnalystState:
         chat: InMemoryChat,
         analyst: AnalystAgent,
         analyst_inbox: AnalystInbox,
+        task_tracker: JiraTaskTracker | None,
     ) -> None:
         self.engine = engine
         self.session_factory = session_factory
@@ -94,6 +99,10 @@ class TestAnalystState:
         self.chat = chat
         self.analyst = analyst
         self.analyst_inbox = analyst_inbox
+        # Optional: real Jira so the operator can debug an actual
+        # ticket end-to-end without manually retyping the description.
+        # None when JIRA_URL/JIRA_TOKEN aren't set.
+        self.task_tracker = task_tracker
 
 
 async def _build_state(
@@ -122,17 +131,47 @@ async def _build_state(
     session_factory = make_session_factory(engine)
 
     trace = AgentTrace()
-    chat = InMemoryChat(trace=trace)
+    fake_chat = InMemoryChat(trace=trace)
     # Seed the operator into the directory with a real first/last name
     # so search_mm_users_by_name("you" / "operator") returns them and
     # the planner has SOMEONE to ask when the analyst's hint is empty.
-    chat.register_user(
+    fake_chat.register_user(
         "you",
         first_name="Тестировщик",
         last_name="Оператор",
         position="Issue reporter (test-analyst session)",
     )
     injection_filter = InjectionFilter()
+
+    # If real Mattermost creds are present in .env, the bot READS from
+    # the live workspace (real users, real threads — read_mattermost_thread,
+    # find_chat_user_by_name see the actual directory) but WRITES are
+    # routed into the in-memory chat the UI renders. So debugging an
+    # actual ticket doesn't spam real teammates with bot DMs.
+    real_mm: MattermostChat | None = None
+    if settings.mattermost_url and settings.mattermost_token:
+        real_mm = MattermostChat(
+            url=settings.mattermost_url,
+            token=settings.mattermost_token,
+            bot_username=settings.mattermost_bot_username or None,
+            ssl_verify=settings.mattermost_ssl_verify,
+            ssl_ca_file=settings.mattermost_ssl_ca_file or None,
+        )
+    chat: ChatPort = (
+        HybridChat(reads=real_mm, writes=fake_chat)
+        if real_mm is not None else fake_chat
+    )
+
+    # Real Jira tracker for "fetch_jira_ticket" UI flow. Optional —
+    # if creds aren't set, the UI's manual-description form is the
+    # only way to seed a task.
+    task_tracker: JiraTaskTracker | None = None
+    if settings.jira_url and settings.jira_token:
+        task_tracker = JiraTaskTracker(
+            url=settings.jira_url,
+            token=settings.jira_token,
+            user=settings.jira_user,
+        )
 
     code_agent = ClaudeAgentSdkCodeAgent(
         default_model=config.agents.models.default,
@@ -181,9 +220,10 @@ async def _build_state(
         config=config,
         settings=settings,
         trace=trace,
-        chat=chat,
+        chat=fake_chat,
         analyst=analyst,
         analyst_inbox=analyst_inbox,
+        task_tracker=task_tracker,
     )
 
 
@@ -261,6 +301,11 @@ def build_test_analyst_app(
                     asyncio.create_task(
                         _run_task(state, raw),
                         name=f"run-{raw.get('external_id')}",
+                    )
+                elif kind == "fetch_jira_ticket":
+                    asyncio.create_task(
+                        _run_jira_task(state, raw),
+                        name=f"jira-{raw.get('external_id')}",
                     )
                 elif kind == "chat":
                     await state.chat.post_user_message(
@@ -351,6 +396,97 @@ async def _run_task(state: TestAnalystState, raw: dict[str, Any]) -> None:
                 reporter_id="you",
             ))
 
+    await _drive_inbox(state, external_id)
+
+
+async def _run_jira_task(state: TestAnalystState, raw: dict[str, Any]) -> None:
+    """Fetch a real Jira ticket and seed the same TaskRow shape the
+    production poller writes.
+
+    Difference from ``_run_task``: instead of typing title/description
+    manually, the operator enters a Jira key (e.g. DM-3342) and we
+    pull description + components + links from the real tracker.
+    Bot DMs still go to the in-memory chat (HybridChat routes writes
+    there) — the only thing that changes is where the TASK comes from.
+    """
+    external_id = str(raw.get("external_id") or "").strip()
+    if not external_id:
+        await state.trace.emit(AgentTraceEvent(
+            type="orchestrator", agent_key="test-runner",
+            payload={"action": "task_failed", "detail": "empty Jira key"},
+        ))
+        return
+
+    if state.task_tracker is None:
+        await state.trace.emit(AgentTraceEvent(
+            type="orchestrator", agent_key="test-runner",
+            payload={
+                "action": "task_failed",
+                "detail": (
+                    "Jira tracker not configured (set JIRA_URL + "
+                    "JIRA_TOKEN in .env)"
+                ),
+                "external_id": external_id,
+            },
+        ))
+        return
+
+    await state.trace.emit(AgentTraceEvent(
+        type="orchestrator", agent_key="test-runner",
+        payload={"action": "jira_fetch_started", "external_id": external_id},
+    ))
+
+    try:
+        task = await state.task_tracker.get_task(external_id)
+    except Exception as exc:
+        logger.exception("test-analyst: jira fetch failed")
+        await state.trace.emit(AgentTraceEvent(
+            type="orchestrator", agent_key="test-runner",
+            payload={
+                "action": "task_failed",
+                "detail": f"jira fetch failed: {exc}",
+                "external_id": external_id,
+            },
+        ))
+        return
+
+    # Same Task → TaskRow path the production Jira poller uses, so
+    # the analyst sees identical data shape regardless of how the
+    # ticket was discovered.
+    from virtual_dev.infrastructure.db.mappers import (
+        task_to_row, update_row_from_task,
+    )
+    async with session_scope(state.session_factory) as session:
+        from sqlalchemy import select
+        existing = (await session.execute(
+            select(TaskRow).where(
+                TaskRow.tracker == task.tracker,
+                TaskRow.external_id == task.external_id,
+            )
+        )).scalar_one_or_none()
+        if existing is not None:
+            update_row_from_task(existing, task)
+            existing.internal_status = TaskStatus.DISCOVERED.value
+            existing.analyst_iteration_count = 0
+            existing.analyst_deadline_at = None
+        else:
+            session.add(task_to_row(task))
+
+    await state.trace.emit(AgentTraceEvent(
+        type="orchestrator", agent_key="test-runner",
+        payload={
+            "action": "task_started",
+            "external_id": task.external_id,
+            "title": task.title,
+            "components": task.components,
+        },
+    ))
+    await _drive_inbox(state, task.external_id)
+
+
+async def _drive_inbox(state: TestAnalystState, external_id: str) -> None:
+    """Common tail for both manual and Jira-fetched task seeds —
+    publishes ``task.discovered`` and lets the analyst inbox pick it up."""
     from virtual_dev.domain.ports.message_bus import AgentMessage
     msg = AgentMessage(
         id="test-" + external_id,
