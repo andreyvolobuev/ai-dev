@@ -3,8 +3,11 @@
 All YAML files are committed to the repository — there are no
 uncommitted overlays. Deploy-specific values (lead handle, default
 channel, per-machine repo paths) live in ``.env`` and are applied
-on top of the YAML config inside ``build_container``. See
-:func:`virtual_dev.infrastructure.config.settings.Settings`.
+on top of the YAML config via :func:`apply_settings_overrides`. Both
+the production wiring (``build_container``) and the test-analyst UI
+call it. See
+:func:`virtual_dev.infrastructure.config.settings.Settings` for the
+list of overridable env vars.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from virtual_dev.infrastructure.config.schema import (
     NotificationsCfg,
     RepositoriesCfg,
 )
+from virtual_dev.infrastructure.config.settings import Settings
 
 
 class ConfigError(RuntimeError):
@@ -65,3 +69,25 @@ def load_config(config_dir: Path | str = "config") -> AppConfig:
         repositories=repositories, agents=agents,
         mappings=mappings, notifications=notifications,
     )
+
+
+def apply_settings_overrides(config: AppConfig, settings: Settings) -> None:
+    """Layer deploy-specific values from ``.env`` on top of the YAML
+    config. Replaces the old ``config/local.yaml`` overlay so all
+    deploy-specific values live in one place (the environment).
+
+    Empty env values fall through to whatever's in YAML. Call from
+    every entry point that builds an ``AppConfig`` for live use —
+    both ``build_container`` (production) and the test-analyst UI
+    must call this, or env values like ``REPO_LOCAL_PATHS`` silently
+    do nothing.
+    """
+    if settings.escalation_user:
+        config.agents.escalation.mattermost_user = settings.escalation_user
+    if settings.default_team_channel:
+        config.mappings.team_channels["default"] = settings.default_team_channel
+    if settings.repo_local_paths:
+        for repo in config.repositories:
+            override = settings.repo_local_paths.get(repo.key)
+            if override:
+                repo.local_path = override

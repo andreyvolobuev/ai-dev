@@ -49,7 +49,12 @@ from virtual_dev.domain.ports.mr_history import MrHistoryPort
 from virtual_dev.domain.ports.secrets import SecretsPort
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 from virtual_dev.domain.ports.vcs import VcsPort
-from virtual_dev.infrastructure.config import AppConfig, Settings, load_config
+from virtual_dev.infrastructure.config import (
+    AppConfig,
+    Settings,
+    apply_settings_overrides,
+    load_config,
+)
 from virtual_dev.infrastructure.db import Base, make_engine, make_session_factory
 
 
@@ -125,7 +130,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
     """
     settings = Settings()
     config = load_config(config_dir)
-    _apply_settings_overrides(config, settings)
+    apply_settings_overrides(config, settings)
 
     engine = make_engine(settings.db_url)
     session_factory = make_session_factory(engine)
@@ -323,24 +328,6 @@ def _host(url: str) -> str | None:
     if not url:
         return None
     return urlparse(url).hostname
-
-
-def _apply_settings_overrides(config: AppConfig, settings: Settings) -> None:
-    """Layer deploy-specific values from ``.env`` on top of the YAML
-    config. Replaces the old ``config/local.yaml`` overlay so all
-    deploy-specific values live in one place (the environment).
-
-    Empty env values fall through to whatever's in YAML.
-    """
-    if settings.escalation_user:
-        config.agents.escalation.mattermost_user = settings.escalation_user
-    if settings.default_team_channel:
-        config.mappings.team_channels["default"] = settings.default_team_channel
-    if settings.repo_local_paths:
-        for repo in config.repositories:
-            override = settings.repo_local_paths.get(repo.key)
-            if override:
-                repo.local_path = override
 
 
 def _build_chat_adapter(settings: Settings) -> "ChatPort | None":

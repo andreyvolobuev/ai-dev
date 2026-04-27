@@ -60,6 +60,7 @@ from virtual_dev.domain.models.task import TaskStatus
 from virtual_dev.infrastructure.config import (
     AppConfig,
     Settings,
+    apply_settings_overrides,
     load_config,
 )
 from virtual_dev.infrastructure.db import (
@@ -112,6 +113,12 @@ async def _build_state(
 ) -> TestAnalystState:
     settings = Settings()
     config = load_config(config_dir)
+    # Layer .env-based overrides on top of YAML — same as build_container
+    # does in prod. Without this REPO_LOCAL_PATHS / ESCALATION_USER /
+    # DEFAULT_TEAM_CHANNEL silently no-op in the test-analyst session
+    # and the agent ends up running against a non-existent
+    # workspaces/<key> dir.
+    apply_settings_overrides(config, settings)
     # Tighter idle window for the test UI (default 30s instead of the
     # production 10 min) — when iterating on the analyst manually we
     # don't want to wait that long after each reply.

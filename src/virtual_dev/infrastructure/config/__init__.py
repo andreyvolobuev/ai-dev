@@ -1,6 +1,10 @@
 """Configuration layer: pydantic-settings for env, YAML loader for everything else."""
 
-from virtual_dev.infrastructure.config.loader import ConfigError, load_config
+from virtual_dev.infrastructure.config.loader import (
+    ConfigError,
+    apply_settings_overrides,
+    load_config,
+)
 from virtual_dev.infrastructure.config.schema import (
     AgentCfg,
     AgentsCfg,
@@ -32,5 +36,6 @@ __all__ = [
     "RepositoryCfg",
     "Settings",
     "WorkingHoursCfg",
+    "apply_settings_overrides",
     "load_config",
 ]
