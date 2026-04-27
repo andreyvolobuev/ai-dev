@@ -4,15 +4,20 @@ Tool files import from here when they need:
 
 * the ``content``-block wrapping shape Claude expects (``text_result``,
   ``error_text``);
-* the ``git grep`` shell-out used by code-search tools.
+* the ``git grep`` shell-out used by code-search tools;
+* HTTP fetch with platform-specific bearer auth, used by attachment-
+  reading tools.
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
+import httpx
 from loguru import logger
 
 
@@ -67,4 +72,63 @@ def git_grep(repo_path: Path, pattern: str, max_results: int) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["error_text", "git_grep", "text_result"]
+def _host_of(url: str) -> str:
+    return (urlparse(url).hostname or "").lower()
+
+
+def fetch_url_with_bearer(url: str, token: str, *, timeout: float = 30.0) -> bytes:
+    """GET ``url`` with ``Authorization: Bearer <token>``. Returns the
+    response body. Raises on non-2xx. Sync — wrap in ``asyncio.to_thread``."""
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        resp = client.get(url, headers={"Authorization": f"Bearer {token}"})
+        resp.raise_for_status()
+        return resp.content
+
+
+_MM_PERMALINK_RE = re.compile(r"/pl/([a-z0-9]+)/?", re.IGNORECASE)
+
+
+def parse_mm_post_id(url_or_id: str) -> str | None:
+    """Extract the post id from a Mattermost permalink, or return the
+    arg as-is if it looks like a bare id (26-char alnum). Returns
+    ``None`` for inputs we can't parse."""
+    s = (url_or_id or "").strip()
+    if not s:
+        return None
+    m = _MM_PERMALINK_RE.search(s)
+    if m:
+        return m.group(1)
+    # Bare id: Mattermost post ids are 26-char alnum (lower).
+    if re.fullmatch(r"[a-z0-9]{20,40}", s):
+        return s
+    return None
+
+
+def url_is_on_host(url: str, expected_host: str) -> bool:
+    """True if ``url``'s host equals (or ends with) ``expected_host``.
+
+    ``expected_host`` may be a bare hostname (``jira.2gis.ru``) or a
+    full URL (``https://jira.2gis.ru/``); both work. Empty arg or
+    unparseable URL returns False.
+    """
+    if not expected_host:
+        return False
+    url_host = _host_of(url)
+    if not url_host:
+        return False
+    # Treat ``expected_host`` as URL first; if no host parses out,
+    # fall back to using it as a literal hostname.
+    expected = (urlparse(expected_host).hostname or expected_host).lower()
+    if not expected:
+        return False
+    return url_host == expected or url_host.endswith("." + expected)
+
+
+__all__ = [
+    "error_text",
+    "fetch_url_with_bearer",
+    "git_grep",
+    "parse_mm_post_id",
+    "text_result",
+    "url_is_on_host",
+]

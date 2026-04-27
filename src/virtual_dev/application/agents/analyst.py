@@ -342,6 +342,8 @@ class AnalystAgent:
         ctx = ToolContext(
             communicator=self._communicator,
             researcher=self._researcher,
+            chat=getattr(self._communicator, "_chat", None),
+            settings=self._settings,
             effects=effects,
             plan_capture=plan_capture,
             run_state=run_state,

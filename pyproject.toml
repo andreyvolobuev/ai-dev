@@ -53,6 +53,11 @@ dependencies = [
     # при первом embed() и кэшируется в ~/.cache/fastembed.
     "fastembed>=0.4",
     "numpy>=1.26",
+
+    # Attachment readers — used by tools/read_jira_attachment_*.py.
+    "pypdf>=5.0",          # PDF text extraction
+    "python-docx>=1.1",    # DOCX text extraction
+    "openpyxl>=3.1",       # XLSX text extraction (the test ticket has one)
 ]
 
 [dependency-groups]
