@@ -121,7 +121,7 @@ def build_tool_servers(
 
 
 _GROUP_HEADERS: dict[str, str] = {
-    "researcher": "Researcher tools (read tickets / code / external docs)",
+    "shared": "Shared tools (read tickets / code / external docs — any agent can use)",
     "analyst": "Analyst tools (talk to humans, terminate the run)",
     "dev": "Dev tools (terminate the implementation run)",
     "responder": "Responder tools (terminate the review-reply decision)",

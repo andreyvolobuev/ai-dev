@@ -11,7 +11,7 @@ from claude_agent_sdk import tool
 from virtual_dev.tools import ToolContext
 from virtual_dev.tools._helpers import error_text, text_result
 
-TOOL_GROUP = "researcher"
+TOOL_GROUP = "shared"
 
 
 def build(ctx: ToolContext):

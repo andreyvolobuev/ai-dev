@@ -26,8 +26,9 @@ from virtual_dev.tools import ToolContext, wrap_text
 
 TOOL_GROUP = "analyst"   # optional; defaults to "analyst". Picks
                          # which MCP server name the tool ends up
-                         # under. Use "researcher" for read-only
-                         # research tools.
+                         # under. Use "shared" for read-only research
+                         # tools any agent can call; "dev"/"responder"
+                         # for tools owned by those agents only.
 
 
 def build(ctx: ToolContext):
@@ -84,9 +85,10 @@ as "skip me."
 
 1. Pick a short, action-first name (`read_docx_attachment`, not
    `docx_handler`). The name becomes the LLM-visible identifier.
-2. Decide the group (`analyst` for things only the analyst calls;
-   `researcher` for read-only research tools that may also be exposed
-   to the dev agent later).
+2. Decide the group (`analyst` / `dev` / `responder` for tools owned
+   by one specific agent; `shared` for read-only research tools any
+   agent can call). Each agent's `_call_model` opts in to the groups
+   it wants via `build_tool_servers(..., only_groups=...)`.
 3. Create `src/virtual_dev/tools/<name>.py` from the template above.
 4. Restart the process. The loader picks the tool up at import time.
 

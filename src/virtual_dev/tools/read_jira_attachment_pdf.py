@@ -24,7 +24,7 @@ from virtual_dev.tools._helpers import (
     text_result,
 )
 
-TOOL_GROUP = "researcher"
+TOOL_GROUP = "shared"
 
 # Truncate per-tool result so a 200-page PDF doesn't blow up the
 # prompt. The agent can re-call with a different ``max_chars`` if it

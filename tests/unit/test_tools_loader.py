@@ -138,7 +138,7 @@ def test_tool_group_routes_to_distinct_mcp_server(
         lambda pkg: ["one", "two"],
     )
     _install_module(
-        fake_pkg, "one", build=lambda ctx: _make_tool("a"), group="researcher",
+        fake_pkg, "one", build=lambda ctx: _make_tool("a"), group="shared",
     )
     _install_module(
         fake_pkg, "two", build=lambda ctx: _make_tool("b"), group="analyst",
@@ -146,14 +146,14 @@ def test_tool_group_routes_to_distinct_mcp_server(
     servers, allowed, groups = build_tool_servers(
         ToolContext(), package_name=fake_pkg,
     )
-    assert "virtual_dev_researcher" in servers
+    assert "virtual_dev_shared" in servers
     assert "virtual_dev_analyst" in servers
-    assert "mcp__virtual_dev_researcher__a" in allowed
+    assert "mcp__virtual_dev_shared__a" in allowed
     assert "mcp__virtual_dev_analyst__b" in allowed
     # Groups are exposed verbatim so the caller can introspect tool
     # ``.name`` / ``.description`` for catalogue rendering.
-    assert {"researcher", "analyst"} <= set(groups)
-    assert [t.name for t in groups["researcher"]] == ["a"]
+    assert {"shared", "analyst"} <= set(groups)
+    assert [t.name for t in groups["shared"]] == ["a"]
     assert [t.name for t in groups["analyst"]] == ["b"]
 
 
@@ -177,14 +177,14 @@ def test_render_tools_catalog_groups_and_lists(
     async def _beta(args: dict[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": "ok"}]}
 
-    _install_module(fake_pkg, "alpha", build=lambda ctx: _alpha, group="researcher")
+    _install_module(fake_pkg, "alpha", build=lambda ctx: _alpha, group="shared")
     _install_module(fake_pkg, "beta", build=lambda ctx: _beta, group="analyst")
 
     _, _, groups = build_tool_servers(ToolContext(), package_name=fake_pkg)
     catalog = render_tools_catalog(groups, extra_builtins="**Builtins**: foo, bar.")
 
-    # Researcher group rendered first (declared in _GROUP_HEADERS), then analyst.
-    assert catalog.index("Researcher tools") < catalog.index("Analyst tools")
+    # Shared group rendered first (declared in _GROUP_HEADERS), then analyst.
+    assert catalog.index("Shared tools") < catalog.index("Analyst tools")
     assert "* `alpha` — Reads things from somewhere." in catalog
     assert "* `beta` — Writes things back." in catalog
     assert catalog.endswith("**Builtins**: foo, bar.")

@@ -408,24 +408,24 @@ class DevAgent:
 
         # ``submit_mr`` (the dev's terminal tool) lives in
         # ``tools/submit_mr.py``; auto-discovery wires it in alongside
-        # the researcher group's ``search_mr_history``. The
-        # ``only_groups`` filter keeps the dev scoped — it must not
-        # see analyst-only tools like ``dm_user`` or ``submit_plan``.
+        # the shared group's ``search_mr_history``. The ``only_groups``
+        # filter keeps the dev scoped — it must not see analyst-only
+        # tools like ``dm_user`` or ``submit_plan``.
         captured: dict[str, Any] = {}
         ctx = ToolContext(
             researcher=self._researcher,
             submit_capture=captured,
         )
         mcp_servers, allowed_tool_names, _ = build_tool_servers(
-            ctx, only_groups={"dev", "researcher"},
+            ctx, only_groups={"dev", "shared"},
         )
-        # Restrict the researcher surface to just ``search_mr_history``
-        # — the dev shouldn't be poking at random Jira attachments
+        # Restrict the shared surface to just ``search_mr_history`` —
+        # the dev shouldn't be poking at random Jira attachments
         # mid-implementation. Strip everything else from that group.
         allowed_tool_names = [
             name for name in allowed_tool_names
-            if not name.startswith("mcp__virtual_dev_researcher__")
-            or name == "mcp__virtual_dev_researcher__search_mr_history"
+            if not name.startswith("mcp__virtual_dev_shared__")
+            or name == "mcp__virtual_dev_shared__search_mr_history"
         ]
         # Full Claude Code tool surface in the workspace (filesystem +
         # bash) comes from the SDK builtins, not from ``tools/``.

@@ -17,7 +17,7 @@ from virtual_dev.tools import ToolContext
 from virtual_dev.tools._helpers import error_text, parse_mm_post_id, text_result
 from virtual_dev.tools.read_jira_attachment_pdf import _wrap_untrusted
 
-TOOL_GROUP = "researcher"
+TOOL_GROUP = "shared"
 
 _DEFAULT_MAX_CHARS = 30_000
 

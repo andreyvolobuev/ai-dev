@@ -34,7 +34,7 @@ from loguru import logger
 from virtual_dev.tools import ToolContext
 from virtual_dev.tools._helpers import error_text, text_result, url_is_on_host
 
-TOOL_GROUP = "researcher"
+TOOL_GROUP = "shared"
 
 _DEFAULT_MAX_CHARS = 30_000
 _DEFAULT_TIMEOUT = 30.0

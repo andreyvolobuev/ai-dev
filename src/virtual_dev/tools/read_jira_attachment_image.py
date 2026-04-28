@@ -28,7 +28,7 @@ from virtual_dev.tools._helpers import (
     parse_jira_attachment_id,
 )
 
-TOOL_GROUP = "researcher"
+TOOL_GROUP = "shared"
 
 # Anthropic vision accepts these mime types (and only these, as of
 # 2026-04). Claude rejects anything else with a 400.

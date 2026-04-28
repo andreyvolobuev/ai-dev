@@ -24,7 +24,7 @@ from virtual_dev.tools._helpers import (
 )
 from virtual_dev.tools.read_jira_attachment_pdf import _wrap_untrusted
 
-TOOL_GROUP = "researcher"
+TOOL_GROUP = "shared"
 
 _DEFAULT_MAX_CHARS = 30_000
 

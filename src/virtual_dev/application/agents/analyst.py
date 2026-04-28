@@ -393,11 +393,11 @@ class AnalystAgent:
             run_state=run_state,
         )
         # Analyst only ever needs its own group (chat / submit_plan /
-        # stuck / blocked) plus the shared researcher group. Other
+        # stuck / blocked) plus the shared read-only group. Other
         # agents' terminal tools (submit_mr, submit_response) live in
         # ``tools/`` too but are filtered out here.
         servers, allowed, groups = build_tool_servers(
-            ctx, only_groups={"analyst", "researcher"},
+            ctx, only_groups={"analyst", "shared"},
         )
         # Filesystem builtins still come from the SDK, not from tools/.
         allowed.extend(["Read", "Glob", "Grep"])
