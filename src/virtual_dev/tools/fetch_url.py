@@ -1,11 +1,11 @@
 """Generic HTTP GET for URLs the analyst surfaces in tickets.
 
-Tickets routinely point at Confluence pages, Mattermost permalinks,
-team wikis, public docs. The specialised tools (``kb_fetch_page_by_url``,
-``read_mattermost_thread``) handle structured cases when the relevant
-adapter is configured; this tool is the catch-all for everything else,
-and the Confluence fallback when the KB adapter isn't wired (e.g. the
-test-analyst session, where ``knowledge_base=None``).
+Tickets routinely point at Confluence pages, team wikis, public
+docs. ``read_mattermost_thread`` handles MM permalinks (which need
+post-id parsing + thread reconstruction), but for everything else
+(including Confluence) this generic tool is what the agent reaches
+for: a plain HTTP GET, with PAT auth attached when the host matches
+a configured internal service.
 
 Auth is host-aware:
 * ``CONFLUENCE_URL`` host → HTTP Basic ``CONFLUENCE_USER:CONFLUENCE_TOKEN``
@@ -86,7 +86,11 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
     host = (parsed.hostname or "").strip()
     if not host:
         return error_text(f"Couldn't extract hostname from {url!r}.")
-    if _is_private_host(host):
+    # Corporate Confluence / Jira / Mattermost legitimately resolve to
+    # RFC1918 over VPN — the SSRF guard would otherwise block the very
+    # hosts the analyst needs most. Trust them by name; the
+    # private-IP check still applies to everything else.
+    if not _is_trusted_internal(url, settings) and _is_private_host(host):
         return error_text(
             f"Refusing to fetch from private/internal host {host!r}."
         )
@@ -161,6 +165,22 @@ def _to_plain_text(body: str, content_type: str) -> str:
 
         return re.sub(r"<[^>]+>", "", body)
     return BeautifulSoup(body, "html.parser").get_text("\n").strip()
+
+
+def _is_trusted_internal(url: str, settings) -> bool:
+    """True if ``url`` is on one of the configured internal services.
+
+    Corporate VPN hosts (CONFLUENCE_URL / JIRA_URL / MATTERMOST_URL)
+    routinely resolve to RFC1918. The operator already trusts them
+    enough to put a PAT in ``.env`` for them, so it would be silly to
+    refuse the fetch on private-IP grounds. Untrusted hosts still go
+    through the standard guard.
+    """
+    for url_attr in ("confluence_url", "jira_url", "mattermost_url"):
+        configured = (getattr(settings, url_attr, "") or "").strip()
+        if configured and url_is_on_host(url, configured):
+            return True
+    return False
 
 
 def _is_private_host(host: str) -> bool:

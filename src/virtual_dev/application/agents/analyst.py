@@ -58,7 +58,11 @@ from virtual_dev.infrastructure.config import AppConfig, Settings
 from virtual_dev.infrastructure.db import PlanRow, TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import plan_to_row
-from virtual_dev.tools import ToolContext, build_tool_servers
+from virtual_dev.tools import (
+    ToolContext,
+    build_tool_servers,
+    render_tools_catalog,
+)
 
 _ANALYST_PROMPT_NAME = "analyst"
 _ANALYST_FALLBACK_PROMPT = (
@@ -163,19 +167,34 @@ class AnalystAgent:
         # bypassing the "end your turn after ask" rule).
         run_state: dict[str, Any] = {"ask_dispatched": False, "terminal": False}
 
+        # Build tools first so the catalog (auto-discovered list of
+        # ``tools/<file>.py`` modules) can be inlined into the system
+        # prompt — adding a new tool to the package is enough; no
+        # prompt edit needed.
+        mcp_servers, allowed, groups = self._build_mcp(
+            effects, plan_capture, run_state,
+        )
+        tools_catalog = render_tools_catalog(
+            groups,
+            extra_builtins=(
+                "**Filesystem builtins** (no MCP layer): `Read`, `Glob`, "
+                "`Grep` work directly on the target-repo working tree."
+            ),
+        )
+
         request = CodeAgentRequest(
             agent_key=self.agent_key,
             system_prompt=self._prompts.render(
                 _ANALYST_PROMPT_NAME,
                 fallback=_ANALYST_FALLBACK_PROMPT,
                 untrusted_warning=SYSTEM_PROMPT_ABOUT_UNTRUSTED,
+                tools_catalog=tools_catalog,
             ),
             user_prompt=prompt,
             working_dir=str(cwd) if cwd else None,
             max_turns=self._max_turns,
             model=self._config.agents.models.default,
         )
-        mcp_servers, allowed = self._build_mcp(effects, plan_capture, run_state)
         request.extras["mcp_servers"] = mcp_servers
         request.extras["allowed_tool_names"] = allowed
 
@@ -363,7 +382,7 @@ class AnalystAgent:
         effects: list[AnalystEffect],
         plan_capture: dict[str, Any],
         run_state: dict[str, Any],
-    ) -> tuple[dict[str, McpSdkServerConfig], list[str]]:
+    ) -> tuple[dict[str, McpSdkServerConfig], list[str], dict[str, list[Any]]]:
         ctx = ToolContext(
             communicator=self._communicator,
             researcher=self._researcher,
@@ -373,10 +392,10 @@ class AnalystAgent:
             plan_capture=plan_capture,
             run_state=run_state,
         )
-        servers, allowed = build_tool_servers(ctx)
+        servers, allowed, groups = build_tool_servers(ctx)
         # Filesystem builtins still come from the SDK, not from tools/.
         allowed.extend(["Read", "Glob", "Grep"])
-        return servers, allowed
+        return servers, allowed, groups
 
     # --- helpers ---
 

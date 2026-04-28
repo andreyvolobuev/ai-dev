@@ -18,7 +18,12 @@ from typing import Any
 import pytest
 from claude_agent_sdk import tool
 
-from virtual_dev.tools import ToolContext, build_tool_servers, discover_tools
+from virtual_dev.tools import (
+    ToolContext,
+    build_tool_servers,
+    discover_tools,
+    render_tools_catalog,
+)
 
 
 @pytest.fixture
@@ -138,10 +143,48 @@ def test_tool_group_routes_to_distinct_mcp_server(
     _install_module(
         fake_pkg, "two", build=lambda ctx: _make_tool("b"), group="analyst",
     )
-    servers, allowed = build_tool_servers(
+    servers, allowed, groups = build_tool_servers(
         ToolContext(), package_name=fake_pkg,
     )
     assert "virtual_dev_researcher" in servers
     assert "virtual_dev_analyst" in servers
     assert "mcp__virtual_dev_researcher__a" in allowed
     assert "mcp__virtual_dev_analyst__b" in allowed
+    # Groups are exposed verbatim so the caller can introspect tool
+    # ``.name`` / ``.description`` for catalogue rendering.
+    assert {"researcher", "analyst"} <= set(groups)
+    assert [t.name for t in groups["researcher"]] == ["a"]
+    assert [t.name for t in groups["analyst"]] == ["b"]
+
+
+def test_render_tools_catalog_groups_and_lists(
+    fake_pkg: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The catalogue exposes one bullet per discovered tool with its
+    description verbatim. Adding a ``tools/<file>.py`` is then enough
+    to surface the new tool in the analyst's system prompt — no manual
+    edit to ``analyst.md`` required."""
+    monkeypatch.setattr(
+        "virtual_dev.tools._loader._iter_module_names",
+        lambda pkg: ["alpha", "beta"],
+    )
+
+    @tool("alpha", "Reads things from somewhere.", {"type": "object"})
+    async def _alpha(args: dict[str, Any]) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    @tool("beta", "Writes things back.", {"type": "object"})
+    async def _beta(args: dict[str, Any]) -> dict[str, Any]:
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    _install_module(fake_pkg, "alpha", build=lambda ctx: _alpha, group="researcher")
+    _install_module(fake_pkg, "beta", build=lambda ctx: _beta, group="analyst")
+
+    _, _, groups = build_tool_servers(ToolContext(), package_name=fake_pkg)
+    catalog = render_tools_catalog(groups, extra_builtins="**Builtins**: foo, bar.")
+
+    # Researcher group rendered first (declared in _GROUP_HEADERS), then analyst.
+    assert catalog.index("Researcher tools") < catalog.index("Analyst tools")
+    assert "* `alpha` — Reads things from somewhere." in catalog
+    assert "* `beta` — Writes things back." in catalog
+    assert catalog.endswith("**Builtins**: foo, bar.")

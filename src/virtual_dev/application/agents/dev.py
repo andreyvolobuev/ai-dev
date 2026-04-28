@@ -437,7 +437,7 @@ class DevAgent:
         # just search_mr_history out of the researcher group.
         if self._researcher is not None:
             from virtual_dev.tools import ToolContext, build_tool_servers
-            researcher_servers, _all_researcher_tools = build_tool_servers(
+            researcher_servers, _all_researcher_tools, _ = build_tool_servers(
                 ToolContext(researcher=self._researcher),
             )
             researcher_server = researcher_servers.get("virtual_dev_researcher")

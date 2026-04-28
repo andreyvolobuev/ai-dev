@@ -37,7 +37,7 @@ def build(ctx: ToolContext):
         "(other MM threads, Jira tickets, Confluence pages) found in "
         "the thread under a `links` section. Decide whether each one "
         "is worth opening — if yes, call the matching tool "
-        "(`read_mattermost_thread`, `kb_fetch_page_by_url`, "
+        "(`read_mattermost_thread`, `fetch_url`, "
         "`read_jira_attachment_*`). Don't blindly recurse — only "
         "follow links that look load-bearing for the ticket. "
         "Truncates at max_chars (default 30000).",
