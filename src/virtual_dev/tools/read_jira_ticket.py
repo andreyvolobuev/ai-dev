@@ -113,12 +113,27 @@ def _format_task(task: Any) -> str:
         for att in attachments:
             name = att.name or "(unnamed)"
             ext_id = att.external_id or "?"
+            tool_hint = _attachment_tool_hint(name)
             parts.append(
-                f"* `{name}` — id=`{ext_id}` — pass to "
-                f"`read_jira_attachment_*`: {att.url}"
+                f"* `{name}` — id=`{ext_id}` — call "
+                f"{tool_hint}(url=\"{att.url}\")"
             )
         parts.append("")
     return "\n".join(parts).rstrip()
+
+
+def _attachment_tool_hint(filename: str) -> str:
+    """Pick the right ``read_<format>_url`` tool for a file by name."""
+    ext = (filename.rsplit(".", 1)[-1] if "." in filename else "").lower()
+    if ext == "pdf":
+        return "`read_pdf_url`"
+    if ext == "docx":
+        return "`read_docx_url`"
+    if ext in ("xlsx", "xls"):
+        return "`read_xlsx_url`"
+    if ext in ("png", "jpg", "jpeg", "gif", "webp"):
+        return "`read_image_url`"
+    return "`fetch_url`"
 
 
 def _wrap_untrusted(text: str, *, source: str) -> str:

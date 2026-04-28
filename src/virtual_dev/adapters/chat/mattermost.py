@@ -28,7 +28,7 @@ from loguru import logger
 from mattermostdriver import Driver
 from mattermostdriver.websocket import Websocket
 
-from virtual_dev.domain.models.chat import ChatMessage, ChatUser
+from virtual_dev.domain.models.chat import ChatFile, ChatMessage, ChatUser
 from virtual_dev.domain.ports.chat import ChatPort
 
 
@@ -153,6 +153,11 @@ class MattermostChat(ChatPort):
                 "timeout": 30,
             }
         )
+        # Stash the original URL so we can build absolute file-download
+        # links (``<base>/api/v4/files/<id>``) for ``ChatFile.url``. The
+        # driver stores host/port/scheme separately, so reconstructing
+        # would lose any path prefix the operator embedded in the URL.
+        self._base_url = url.rstrip("/")
         self._bot_username = bot_username
         self._logged_in = False
         self._bot_id_cached: str = ""
@@ -532,7 +537,54 @@ class MattermostChat(ChatPort):
             timestamp=ts,
             thread_root_id=root,
             trusted=trusted,
+            files=self._extract_files(raw),
         )
+
+    def _extract_files(self, raw: dict[str, Any]) -> list[ChatFile]:
+        """Pull file attachments out of a Mattermost post.
+
+        Mattermost's posts API returns files as
+        ``post.metadata.files: [{id, name, extension, size, mime_type, ...}]``
+        when the post has any (an empty list otherwise). We turn each
+        entry into a ``ChatFile`` with the ready-to-fetch download URL
+        — that's ``<MM_URL>/api/v4/files/<id>``, which the generic
+        ``download_url_bytes`` will hit with the bot's MATTERMOST_TOKEN
+        as Bearer (host-aware auth dispatch in ``_helpers.py``).
+
+        Falls back to ``post.file_ids`` (just the id list, no metadata)
+        if ``metadata.files`` is absent — older MM versions or
+        edge-case post shapes. Name/mime/size will be empty in that
+        case but the URL is still usable.
+        """
+        files: list[ChatFile] = []
+        metadata = raw.get("metadata") or {}
+        seen: set[str] = set()
+        for file_info in metadata.get("files") or []:
+            if not isinstance(file_info, dict):
+                continue
+            fid = str(file_info.get("id") or "")
+            if not fid or fid in seen:
+                continue
+            seen.add(fid)
+            files.append(ChatFile(
+                id=fid,
+                name=str(file_info.get("name") or ""),
+                url=f"{self._base_url.rstrip('/')}/api/v4/files/{fid}",
+                mime_type=str(file_info.get("mime_type") or ""),
+                extension=str(file_info.get("extension") or ""),
+                size=int(file_info.get("size") or 0),
+            ))
+        for fid in raw.get("file_ids") or []:
+            fid_s = str(fid)
+            if not fid_s or fid_s in seen:
+                continue
+            seen.add(fid_s)
+            files.append(ChatFile(
+                id=fid_s,
+                name="",
+                url=f"{self._base_url.rstrip('/')}/api/v4/files/{fid_s}",
+            ))
+        return files
 
     def _user_from_raw(self, raw: Any) -> ChatUser | None:
         if not isinstance(raw, dict):

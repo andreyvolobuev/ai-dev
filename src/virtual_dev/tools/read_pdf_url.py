@@ -1,9 +1,16 @@
-"""Download a PDF attached to a Jira ticket and return its text.
+"""Download a PDF from any URL and return its extracted text.
 
-The Jira description in the ticket usually links the attachment as
-``https://jira.2gis.ru/secure/attachment/<id>/<filename>.pdf`` — pass
-that URL verbatim. The tool authenticates with the same Jira PAT
-configured in ``.env``.
+Works for Jira attachments, Mattermost file attachments, Confluence
+attachments, and public URLs. Auth is host-aware (delegated to
+``_helpers.download_url_bytes``):
+
+* host == ``JIRA_URL`` → Bearer ``JIRA_TOKEN``
+* host == ``MATTERMOST_URL`` → Bearer ``MATTERMOST_TOKEN``
+* host == ``CONFLUENCE_URL`` → Basic ``CONFLUENCE_USER:CONFLUENCE_TOKEN``
+* anything else → unauthenticated
+
+Pass the full URL exactly as it appears in the surrounding context
+(ticket attachments block, MM thread file attachment, plan link).
 """
 
 from __future__ import annotations
@@ -17,12 +24,7 @@ from loguru import logger
 from pypdf import PdfReader
 
 from virtual_dev.tools import ToolContext
-from virtual_dev.tools._helpers import (
-    error_text,
-    fetch_jira_attachment_content,
-    parse_jira_attachment_id,
-    text_result,
-)
+from virtual_dev.tools._helpers import download_url_bytes, error_text, text_result
 
 TOOL_GROUP = "shared"
 
@@ -38,14 +40,15 @@ def build(ctx: ToolContext):
     settings = ctx.settings
 
     @tool(
-        "read_jira_attachment_pdf",
-        "Download a PDF attached to a Jira ticket and return its "
-        "extracted text. Pass the full URL exactly as it appears in "
-        "the ticket description (typically `<JIRA_URL>/secure/"
-        "attachment/<id>/<filename>.pdf`). Authenticated with the "
-        "Jira PAT from the bot's environment. Output is wrapped as "
-        "untrusted content. Truncates at max_chars (default 30000) — "
-        "raise it explicitly if you need more.",
+        "read_pdf_url",
+        "Download a PDF from any URL and return its extracted text. "
+        "Works for Jira attachments, Mattermost file attachments, "
+        "Confluence attachments, and public URLs — auth is picked "
+        "automatically based on the host (Jira/MM Bearer, Confluence "
+        "Basic, others unauthenticated). Pass the full URL exactly as "
+        "it appears in the ticket / thread / plan context. Output is "
+        "wrapped as untrusted content. Truncates at max_chars "
+        "(default 30000) — raise it explicitly if you need more.",
         {
             "type": "object",
             "properties": {
@@ -66,23 +69,11 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
     max_chars = int(args.get("max_chars") or _DEFAULT_MAX_CHARS)
     if not url:
         return error_text("Empty URL")
-    if not settings.jira_url or not settings.jira_token:
-        return error_text("Jira credentials are not configured (JIRA_URL / JIRA_TOKEN)")
-    if parse_jira_attachment_id(url) is None:
-        return error_text(
-            f"Couldn't extract an attachment id from {url!r}. Expected "
-            f"either a /secure/attachment/<id>/<filename> URL or a bare "
-            f"numeric id."
-        )
+
     try:
-        body = await asyncio.to_thread(
-            fetch_jira_attachment_content,
-            jira_url=settings.jira_url,
-            jira_token=settings.jira_token,
-            url_or_id=url,
-        )
+        body = await asyncio.to_thread(download_url_bytes, url, settings)
     except Exception as exc:
-        logger.exception("read_jira_attachment_pdf: download failed")
+        logger.exception("read_pdf_url: download failed for {}", url)
         return error_text(f"Download failed: {exc}")
 
     try:
@@ -92,7 +83,7 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
             for page in reader.pages
         ]
     except Exception as exc:
-        logger.exception("read_jira_attachment_pdf: PDF parse failed")
+        logger.exception("read_pdf_url: PDF parse failed for {}", url)
         return error_text(f"PDF parse failed: {exc}")
 
     full = "\n\n--- page break ---\n\n".join(page_texts)
@@ -103,13 +94,10 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
     header = f"# PDF: {url}\n({len(reader.pages)} page(s)" + (
         ", truncated" if truncated else ""
     ) + ")\n\n"
-    return text_result(_wrap_untrusted(header + full, source=f"jira:pdf:{url}"))
+    return text_result(_wrap_untrusted(header + full, source=f"pdf:{url}"))
 
 
 def _wrap_untrusted(text: str, *, source: str) -> str:
-    """Wrap text in <untrusted_content> manually since this tool
-    doesn't have an InjectionFilter on hand. Matches the shape the
-    analyst's prompt already knows how to read."""
     return (
         f"<untrusted_content source={source!r}>\n"
         f"{text}\n"

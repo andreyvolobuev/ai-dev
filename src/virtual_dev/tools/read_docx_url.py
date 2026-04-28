@@ -1,4 +1,8 @@
-"""Download a DOCX attached to a Jira ticket and return its text."""
+"""Download a DOCX from any URL and return its extracted text.
+
+Same host-aware auth dispatch as ``read_pdf_url`` — works for
+attachments hosted in Jira, Mattermost, Confluence, or public URLs.
+"""
 
 from __future__ import annotations
 
@@ -11,13 +15,8 @@ from docx import Document
 from loguru import logger
 
 from virtual_dev.tools import ToolContext
-from virtual_dev.tools._helpers import (
-    error_text,
-    fetch_jira_attachment_content,
-    parse_jira_attachment_id,
-    text_result,
-)
-from virtual_dev.tools.read_jira_attachment_pdf import _wrap_untrusted
+from virtual_dev.tools._helpers import download_url_bytes, error_text, text_result
+from virtual_dev.tools.read_pdf_url import _wrap_untrusted
 
 TOOL_GROUP = "shared"
 
@@ -30,13 +29,13 @@ def build(ctx: ToolContext):
     settings = ctx.settings
 
     @tool(
-        "read_jira_attachment_docx",
-        "Download a DOCX attached to a Jira ticket and return its "
-        "extracted text (paragraphs joined; tables flattened to "
-        "tab-separated rows). Pass the full URL as it appears in the "
-        "ticket description. Authenticated with the Jira PAT. Output "
-        "is wrapped as untrusted content. Truncates at max_chars "
-        "(default 30000).",
+        "read_docx_url",
+        "Download a DOCX from any URL and return its extracted text "
+        "(paragraphs joined; tables flattened to tab-separated rows). "
+        "Works for Jira / Mattermost / Confluence attachments and "
+        "public URLs — auth is host-aware. Pass the full URL exactly. "
+        "Output is wrapped as untrusted content. Truncates at "
+        "max_chars (default 30000).",
         {
             "type": "object",
             "properties": {
@@ -57,23 +56,11 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
     max_chars = int(args.get("max_chars") or _DEFAULT_MAX_CHARS)
     if not url:
         return error_text("Empty URL")
-    if not settings.jira_url or not settings.jira_token:
-        return error_text("Jira credentials are not configured (JIRA_URL / JIRA_TOKEN)")
-    if parse_jira_attachment_id(url) is None:
-        return error_text(
-            f"Couldn't extract an attachment id from {url!r}. Expected "
-            f"either a /secure/attachment/<id>/<filename> URL or a bare "
-            f"numeric id."
-        )
+
     try:
-        body = await asyncio.to_thread(
-            fetch_jira_attachment_content,
-            jira_url=settings.jira_url,
-            jira_token=settings.jira_token,
-            url_or_id=url,
-        )
+        body = await asyncio.to_thread(download_url_bytes, url, settings)
     except Exception as exc:
-        logger.exception("read_jira_attachment_docx: download failed")
+        logger.exception("read_docx_url: download failed for {}", url)
         return error_text(f"Download failed: {exc}")
 
     try:
@@ -88,7 +75,7 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
                 cells = [(c.text or "").strip() for c in row.cells]
                 parts.append("\t".join(cells))
     except Exception as exc:
-        logger.exception("read_jira_attachment_docx: DOCX parse failed")
+        logger.exception("read_docx_url: DOCX parse failed for {}", url)
         return error_text(f"DOCX parse failed: {exc}")
 
     full = "\n".join(parts)
@@ -97,4 +84,4 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
         full = full[:max_chars] + f"\n... [truncated, {len(full)} chars total]"
         truncated = True
     header = f"# DOCX: {url}" + (" (truncated)" if truncated else "") + "\n\n"
-    return text_result(_wrap_untrusted(header + full, source=f"jira:docx:{url}"))
+    return text_result(_wrap_untrusted(header + full, source=f"docx:{url}"))

@@ -49,7 +49,7 @@ A few pieces of behaviour the per-tool descriptions can't enforce:
   They are NOT interchangeable.
 * **`fetch_url` is the right default for ticket-supplied URLs** —
   Confluence briefs, team wikis, public docs. The dedicated
-  `read_jira_attachment_*` and `read_mattermost_thread` tools handle
+  `read_<format>_url` (PDF/DOCX/XLSX/image) and `read_mattermost_thread` tools handle
   the structured cases; `fetch_url` is everything else.
 
 ## Hard rules

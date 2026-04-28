@@ -225,9 +225,11 @@ def _extract_links(fields: dict[str, Any], *, browse_base_url: str = "") -> list
                 status=str(related_status.get("name") or "") or None,
             ))
     # Attachments: Jira returns each as {id, filename, content (URL),
-    # mimeType, size}. We surface id + name so read_jira_attachment_*
-    # tools can use the real id instead of guessing from the
-    # description's ``[^filename]`` shorthand.
+    # mimeType, size}. We surface name + URL so the right
+    # ``read_<format>_url`` tool can fetch (host-aware auth picks the
+    # Jira PAT automatically). Without this block the analyst would
+    # have to guess at the attachment URL from the description's
+    # ``[^filename]`` shorthand and would hallucinate one.
     for att in fields.get("attachment") or []:
         if not isinstance(att, dict):
             continue

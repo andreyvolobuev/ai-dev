@@ -15,7 +15,7 @@ from loguru import logger
 
 from virtual_dev.tools import ToolContext
 from virtual_dev.tools._helpers import error_text, parse_mm_post_id, text_result
-from virtual_dev.tools.read_jira_attachment_pdf import _wrap_untrusted
+from virtual_dev.tools.read_pdf_url import _wrap_untrusted
 
 TOOL_GROUP = "shared"
 
@@ -33,14 +33,15 @@ def build(ctx: ToolContext):
         "`https://mm.example.com/team/pl/<post_id>`) and return its "
         "messages chronologically with author + timestamp + text. "
         "Output is wrapped as untrusted content. \n\n"
-        "**Recursion is your call**: the result will list any links "
-        "(other MM threads, Jira tickets, Confluence pages) found in "
-        "the thread under a `links` section. Decide whether each one "
-        "is worth opening — if yes, call the matching tool "
-        "(`read_mattermost_thread`, `fetch_url`, "
-        "`read_jira_attachment_*`). Don't blindly recurse — only "
-        "follow links that look load-bearing for the ticket. "
-        "Truncates at max_chars (default 30000).",
+        "**Recursion is your call**: the result lists any URLs "
+        "found in message bodies under a `links` section, and any "
+        "file attachments under an `attachments` section (with the "
+        "ready-to-fetch download URL). Decide whether each one is "
+        "worth opening — if yes, call the matching tool "
+        "(`read_mattermost_thread`, `fetch_url`, `read_pdf_url`, "
+        "`read_docx_url`, `read_xlsx_url`, `read_image_url`). Don't "
+        "blindly recurse — only follow links that look load-bearing "
+        "for the ticket. Truncates at max_chars (default 30000).",
         {
             "type": "object",
             "properties": {
@@ -82,17 +83,42 @@ async def run(chat, args: dict[str, Any]) -> dict[str, Any]:
 
     lines: list[str] = [f"# MM thread: {url}", f"(post_id={post_id})", ""]
     found_links: set[str] = set()
+    found_files: list[Any] = []
+    seen_file_ids: set[str] = set()
     for msg in messages:
         ts = msg.timestamp.isoformat() if msg.timestamp else "?"
         author = msg.author_id or "?"
         text = (msg.text or "").strip()
         lines.append(f"## {author} @ {ts}")
         lines.append(text)
+        files = getattr(msg, "files", None) or []
+        for f in files:
+            if not f.id or f.id in seen_file_ids:
+                continue
+            seen_file_ids.add(f.id)
+            found_files.append(f)
+            label = f.name or f.id
+            lines.append(f"  📎 attached: {label} → {f.url}")
         lines.append("")
         for marker in _extract_links(text):
             found_links.add(marker)
 
+    if found_files:
+        lines.append("## attachments")
+        for f in found_files:
+            tool_hint = _tool_hint_for(f)
+            label = f.name or f.id
+            size_part = f", {f.size} bytes" if f.size else ""
+            mime_part = f", {f.mime_type}" if f.mime_type else ""
+            lines.append(
+                f"* `{label}` ({f.extension or 'unknown'}{mime_part}"
+                f"{size_part})\n"
+                f"  {f.url}\n"
+                f"  → call {tool_hint}"
+            )
+
     if found_links:
+        lines.append("")
         lines.append("## links found in thread")
         for link in sorted(found_links):
             lines.append(f"* {link}")
@@ -117,3 +143,24 @@ def _extract_links(text: str) -> list[str]:
     agent gets to judge which are worth following."""
     import re
     return re.findall(r"https?://[^\s<>()\"']+", text)
+
+
+def _tool_hint_for(file: Any) -> str:
+    """Recommend the right ``read_<format>_url`` tool for this file.
+
+    Falls back to ``fetch_url`` for unknown formats — it'll at least
+    return raw bytes / try to decode as text, which is enough for
+    ``.txt`` / ``.md`` / ``.csv`` / etc. without us having to ship a
+    parser per extension.
+    """
+    ext = (file.extension or "").lower()
+    mime = (file.mime_type or "").lower()
+    if ext in ("pdf",) or "pdf" in mime:
+        return f'`read_pdf_url(url="{file.url}")`'
+    if ext in ("docx",) or "wordprocessingml" in mime:
+        return f'`read_docx_url(url="{file.url}")`'
+    if ext in ("xlsx", "xls") or "spreadsheetml" in mime or "ms-excel" in mime:
+        return f'`read_xlsx_url(url="{file.url}")`'
+    if ext in ("png", "jpg", "jpeg", "gif", "webp") or mime.startswith("image/"):
+        return f'`read_image_url(url="{file.url}")`'
+    return f'`fetch_url(url="{file.url}")`'

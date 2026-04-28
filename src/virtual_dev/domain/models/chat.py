@@ -38,6 +38,24 @@ class ChatChannel:
 
 
 @dataclass
+class ChatFile:
+    """Файл, прикреплённый к сообщению чата.
+
+    ``url`` — прямой download-эндпоинт (Mattermost: ``<MM>/api/v4/files/<id>``).
+    Качается через generic ``download_url_bytes`` (host-aware auth), так что
+    тот же ``read_pdf_url`` / ``read_image_url`` / ... работает для MM
+    attachments так же, как для Jira / Confluence.
+    """
+
+    id: str
+    name: str
+    url: str
+    mime_type: str = ""
+    extension: str = ""
+    size: int = 0
+
+
+@dataclass
 class ChatMessage:
     """Сообщение в чате. Trusted=True только если автор — бот сам или наш orchestrator.
 
@@ -54,3 +72,4 @@ class ChatMessage:
     trusted: bool = False              # True только для наших собственных сообщений
     reactions: list[str] = field(default_factory=list)  # emoji names кем-то проставленные
     bot_reactions: list[str] = field(default_factory=list)  # emoji, которые поставил именно наш бот
+    files: list[ChatFile] = field(default_factory=list)  # вложения; пустой список если их нет

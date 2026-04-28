@@ -279,8 +279,10 @@ class AnalystAgent:
         # tracker. Jira renders attachments in the description as
         # ``[^filename]`` shorthand (no id, no URL) — without this
         # block the analyst would have to guess attachment ids and
-        # would hallucinate them. We list each with the REAL id so
-        # ``read_jira_attachment_*(url=<id>)`` works on the first try.
+        # would hallucinate them. We list each with the REAL id and
+        # an explicit URL so the right ``read_<format>_url`` tool
+        # (host-aware auth, picks the Jira PAT automatically) works
+        # on the first try.
         attachments: list[dict[str, Any]] = [
             link for link in (task_row.links_json or [])
             if isinstance(link, dict) and link.get("kind") == "jira_attachment"
@@ -291,10 +293,10 @@ class AnalystAgent:
                 name = att.get("name") or "(unnamed)"
                 ext_id = att.get("external_id") or "?"
                 url = att.get("url") or ""
+                tool_hint = _attachment_tool_hint(name)
                 parts.append(
-                    f"* `{name}` — id=`{ext_id}` — pass either the id "
-                    f"or this URL to `read_jira_attachment_*` tools: "
-                    f"{url}"
+                    f"* `{name}` — id=`{ext_id}` — call "
+                    f"{tool_hint}(url=\"{url}\")"
                 )
             parts.append("")
 
@@ -611,6 +613,25 @@ def _strip_tz(dt: Any) -> Any:
     if hasattr(dt, "tzinfo") and getattr(dt, "tzinfo", None) is not None:
         return dt.replace(tzinfo=None)
     return dt
+
+
+def _attachment_tool_hint(filename: str) -> str:
+    """Pick the right ``read_<format>_url`` tool for a Jira attachment.
+
+    Falls back to ``fetch_url`` for unknown extensions — works for
+    plain-text formats (``.txt`` / ``.md`` / ``.csv`` / ...) without
+    us shipping a parser per extension.
+    """
+    ext = (filename.rsplit(".", 1)[-1] if "." in filename else "").lower()
+    if ext == "pdf":
+        return "`read_pdf_url`"
+    if ext == "docx":
+        return "`read_docx_url`"
+    if ext in ("xlsx", "xls"):
+        return "`read_xlsx_url`"
+    if ext in ("png", "jpg", "jpeg", "gif", "webp"):
+        return "`read_image_url`"
+    return "`fetch_url`"
 
 
 def _analyst_max_turns(config: AppConfig) -> int | None:

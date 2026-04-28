@@ -81,7 +81,8 @@ def test_extract_links_issuelinks_inward_uses_inward_label() -> None:
 
 def test_extract_links_attachments_unchanged() -> None:
     """Pre-existing behaviour: attachments still surface with id + name
-    so the read_jira_attachment_* tools can use the real id."""
+    + URL so the right ``read_<format>_url`` tool can fetch them
+    (host-aware auth picks the Jira PAT automatically for jira.* hosts)."""
     fields = {
         "attachment": [{
             "id": "12345",
