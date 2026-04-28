@@ -103,27 +103,76 @@ async def test_writes_go_to_writes_chat() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reads_go_to_reads_chat() -> None:
+async def test_message_reads_go_to_reads_chat() -> None:
+    """Thread / post / channel-history reads always go to ``reads`` —
+    they're per-message and the in-memory writes side has no history
+    of the live workspace."""
     reads = _SpyChat("R")
     writes = _SpyChat("W")
     hc = HybridChat(reads=reads, writes=writes)
 
     await hc.read_thread("post-42")
-    await hc.find_user_by_username("v.kura")
-    await hc.find_user_by_email("v@example.com")
-    await hc.search_users_by_name("Курочкин", limit=5)
     await hc.get_post("post-42")
     await hc.read_channel_since("ch-1", datetime.now(timezone.utc))
 
     assert writes.calls == []
     assert reads.calls == [
         "read_thread:post-42",
-        "find_user_by_username:v.kura",
-        "find_user_by_email:v@example.com",
-        "search_users_by_name:Курочкин:5",
         "get_post:post-42",
         "read_channel_since:ch-1",
     ]
+
+
+@pytest.mark.asyncio
+async def test_user_lookups_check_writes_first_then_reads() -> None:
+    """User-directory lookups (find_user_by_*, search_users_by_name)
+    consult the in-memory ``writes`` directory first so test-only users
+    seeded via ``InMemoryChat.register_user`` (e.g. the operator "you"
+    in the test-analyst session) win over the live MM directory; if
+    the writes side has nothing, we fall back to ``reads`` so real
+    teammates are still found by surname."""
+    reads = _SpyChat("R")
+    writes = _SpyChat("W")
+    hc = HybridChat(reads=reads, writes=writes)
+
+    await hc.find_user_by_username("v.kura")
+    await hc.find_user_by_email("v@example.com")
+    await hc.search_users_by_name("Курочкин", limit=5)
+
+    # Both sides got asked. Order: writes first, reads as fallback.
+    assert writes.calls == [
+        "find_user_by_username:v.kura",
+        "find_user_by_email:v@example.com",
+        "search_users_by_name:Курочкин:5",
+    ]
+    assert reads.calls == [
+        "find_user_by_username:v.kura",
+        "find_user_by_email:v@example.com",
+        "search_users_by_name:Курочкин:5",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_user_lookup_skips_reads_when_writes_has_match() -> None:
+    """If the local ``writes`` directory already has the user, we don't
+    bother HTTPing the real MM directory — saves a round-trip and lets
+    test-only users override real ones with the same handle."""
+
+    class _LocalHit(_SpyChat):
+        async def find_user_by_username(
+            self, username: str,
+        ) -> ChatUser | None:
+            self.calls.append(f"find_user_by_username:{username}")
+            return ChatUser(id=f"uid-{username}", username=username)
+
+    reads = _SpyChat("R")
+    writes = _LocalHit("W")
+    hc = HybridChat(reads=reads, writes=writes)
+
+    found = await hc.find_user_by_username("you")
+    assert found is not None and found.id == "uid-you"
+    assert writes.calls == ["find_user_by_username:you"]
+    assert reads.calls == []  # never consulted
 
 
 @pytest.mark.asyncio

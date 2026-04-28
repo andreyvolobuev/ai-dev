@@ -26,8 +26,14 @@ from virtual_dev.domain.ports.chat import ChatPort
 class HybridChat(ChatPort):
     """Routes ChatPort calls between a read-source and a write-source.
 
-    * Reads (``read_thread``, ``find_user_*``, ``search_users_by_name``,
-      ``get_post``, ``read_channel_since``) → ``reads``.
+    * Reads (``read_thread``, ``get_post``, ``read_channel_since``)
+      → ``reads``.
+    * User-directory lookups (``find_user_*``, ``search_users_by_name``)
+      → ``writes`` first, ``reads`` as fallback. This lets test-only
+      users registered via ``InMemoryChat.register_user`` (e.g. the
+      operator "you" who plays the lead in the test-analyst session)
+      win over the real MM directory, while everyone else is still
+      resolved against the live workspace.
     * Writes (``send_direct``, ``send_to_channel``, ``add_reaction``)
       → ``writes``.
     * ``subscribe`` → ``writes`` (UI-driven incoming, see module
@@ -60,15 +66,30 @@ class HybridChat(ChatPort):
         return await self._reads.read_thread(thread_root_id)
 
     async def find_user_by_email(self, email: str) -> ChatUser | None:
+        local = await self._writes.find_user_by_email(email)
+        if local is not None:
+            return local
         return await self._reads.find_user_by_email(email)
 
     async def find_user_by_username(self, username: str) -> ChatUser | None:
+        local = await self._writes.find_user_by_username(username)
+        if local is not None:
+            return local
         return await self._reads.find_user_by_username(username)
 
     async def search_users_by_name(
         self, query: str, *, limit: int = 25,
     ) -> Sequence[ChatUser]:
-        return await self._reads.search_users_by_name(query, limit=limit)
+        local = list(
+            await self._writes.search_users_by_name(query, limit=limit)
+        )
+        if len(local) >= limit:
+            return local[:limit]
+        seen = {u.id for u in local}
+        remote = await self._reads.search_users_by_name(
+            query, limit=limit - len(local),
+        )
+        return local + [u for u in remote if u.id not in seen]
 
     async def get_post(self, post_id: str) -> ChatMessage | None:
         return await self._reads.get_post(post_id)

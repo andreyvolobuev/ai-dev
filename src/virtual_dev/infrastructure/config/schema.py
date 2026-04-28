@@ -62,6 +62,7 @@ class JiraTransitionsCfg(_StrictModel):
     to_review: str = "Review"
     to_testing: str = "Testing"
     to_done: str = "Done"
+    to_pending: str = "Waiting For Response"
 
 
 class WorkingHoursCfg(_StrictModel):
@@ -123,17 +124,21 @@ class MmTemplatesCfg(_StrictModel):
     # Used when the review feedback came in a GitLab MR comment instead
     # of a Mattermost thread — bot answers in the same medium.
     gitlab_reply_iteration_done: str = ""
-    # Phase 3.9 — goal-driven clarification. Planner composes the
-    # bodies of all DMs itself, so the only template still kept here
-    # is the lead-escalation DM (which has structured placeholders the
-    # operator may want to customise).
-    clarifier_escalation_to_lead: str = ""
+    # Lead-escalation DMs. Two flavours:
+    # * stuck — agent ran out of angles and asks the lead for help
+    #   (ticket stays in "In Progress").
+    # * blocked — agent decided the ticket is blocked / unworkable;
+    #   ticket has just been transitioned to "Waiting For Response" and
+    #   commented in Jira; the lead is told what happened.
+    stuck_escalation_to_lead: str = ""
+    blocked_escalation_to_lead: str = ""
 
 
 class JiraTemplatesCfg(_StrictModel):
     plan_comment: str = ""
     mr_link_comment: str = ""
     failure_comment: str = ""
+    blocked_comment: str = ""
 
 
 class MrTemplatesCfg(_StrictModel):

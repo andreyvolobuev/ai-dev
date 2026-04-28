@@ -5,7 +5,7 @@ Single driver for the analyst's per-ticket session. Responsibilities:
 * Subscribe to ``task.discovered`` from the message bus and run the
   analyst on each new ticket.
 * Persist the analyst's effects (ASK dispatch installs awaiting state
-  on TaskRow; submit_plan finalises; escalate / abandon close).
+  on TaskRow; submit_plan finalises; stuck / blocked close).
 * On a coalesced human reply (driven by AnswerCoalescerWorker) re-run
   the analyst with the conversation history rendered into the prompt.
 * Sweep deadlines.
@@ -99,7 +99,7 @@ class AnalystInboxStats:
     plans_finalised: int = 0
     asks_dispatched: int = 0
     escalations: int = 0
-    abandonments: int = 0
+    blocked_count: int = 0
     fragments_appended: int = 0
     deadlines_swept: int = 0
 
@@ -233,9 +233,8 @@ class AnalystInbox:
         for task_row in overdue:
             await self._terminate(
                 task_row,
-                kind="escalate",
+                kind="stuck",
                 reason="deadline_exceeded",
-                escalate=True,
             )
             swept += 1
             self.stats.deadlines_swept += 1
@@ -288,8 +287,8 @@ class AnalystInbox:
                 task_row.id, max_iter,
             )
             await self._terminate(
-                task_row, kind="escalate",
-                reason="max_iterations_reached", escalate=True,
+                task_row, kind="stuck",
+                reason="max_iterations_reached",
             )
             return
 
@@ -362,29 +361,26 @@ class AnalystInbox:
             if e.kind == "plan_submitted":
                 await self._on_plan(task_row, run, e)
                 return
-            if e.kind == "escalate":
+            if e.kind == "stuck":
                 await self._terminate(
-                    task_row, kind="escalate",
-                    reason=e.payload.get("reason", "agent_escalate"),
-                    escalate=True,
+                    task_row, kind="stuck",
+                    reason=e.payload.get("reason", "agent_stuck"),
                 )
                 return
-            if e.kind == "abandon":
+            if e.kind == "blocked":
                 await self._terminate(
-                    task_row, kind="abandon",
-                    reason=e.payload.get("reason", "agent_abandon"),
-                    escalate=False,
+                    task_row, kind="blocked",
+                    reason=e.payload.get("reason", "agent_blocked"),
                 )
                 return
-        # Silent run — escalate so we don't dead-air.
+        # Silent run — page the lead so we don't dead-air.
         logger.warning(
             "AnalystInbox: task {} run ended without effect (stop={})",
             task_row.id, run.stopped_reason,
         )
         await self._terminate(
-            task_row, kind="escalate",
+            task_row, kind="stuck",
             reason=f"agent_no_action:{run.stopped_reason}",
-            escalate=True,
         )
 
     async def _on_ask(
@@ -432,8 +428,8 @@ class AnalystInbox:
                 task_row.id,
             )
             await self._terminate(
-                task_row, kind="escalate",
-                reason="plan_submitted_but_unparseable", escalate=True,
+                task_row, kind="stuck",
+                reason="plan_submitted_but_unparseable",
             )
             return
 
@@ -501,23 +497,34 @@ class AnalystInbox:
         *,
         kind: str,
         reason: str,
-        escalate: bool,
     ) -> None:
+        """Close the analyst session for this ticket.
+
+        Two flavours, both DM the team-lead with the chain:
+
+        * ``stuck`` — agent ran out of angles, lead help needed. Jira
+          stays In Progress.
+        * ``blocked`` — ticket is blocked / unworkable. Orchestrator
+          transitions Jira to "Waiting For Response", posts a comment
+          explaining why, then DMs the lead.
+        """
         await self._set_internal_status(task_row.id, TaskStatus.FAILED)
         await self._sessions.clear_awaiting(task_row.id)
         await self._sessions.clear_started_at(task_row.id)
         await self._sessions.append_step(
             task_id=task_row.id,
             kind=ConversationStepKind.NOTE,
-            text=f"Task {kind}d: {reason}",
+            text=f"Task {kind}: {reason}",
             metadata={"reason": reason, "kind": kind},
         )
-        if kind == "escalate":
-            self.stats.escalations += 1
+        if kind == "blocked":
+            self.stats.blocked_count += 1
+            await self._jira_blocked_actions(task_row, reason=reason)
         else:
-            self.stats.abandonments += 1
-        if escalate:
-            await self._send_lead_escalation(task_row, reason=reason)
+            self.stats.escalations += 1
+        await self._send_lead_escalation(
+            task_row, reason=reason, kind=kind,
+        )
         await emit_if(self._trace, AgentTraceEvent(
             type="task_event", agent_key="analyst",
             payload={
@@ -527,8 +534,89 @@ class AnalystInbox:
             },
         ))
 
-    async def _send_lead_escalation(
+    async def _jira_blocked_actions(
         self, task_row: TaskRow, *, reason: str,
+    ) -> None:
+        """Transition Jira to Pending + post explanatory comment.
+
+        Both sub-actions are best-effort — if Jira is unreachable or the
+        workflow has no matching transition, we still want to DM the
+        lead so the block doesn't go silent. A trace event is always
+        emitted so the operator can see the intent even when dispatch
+        is disabled (e.g. the test-analyst session wires the inbox
+        with ``post_to_tracker=False`` to avoid touching real Jira).
+        """
+        external_id = task_row.external_id
+        to_pending = self._config.agents.jira_transitions.to_pending
+        comment_template = (
+            self._config.notifications.jira.blocked_comment
+            or
+            "*[virtual-dev] Задача переведена в \"{status}\".*\n\n"
+            "**Причина:** {reason}"
+        )
+        try:
+            comment_body = comment_template.format(
+                external_id=external_id,
+                task_url=task_row.url or "",
+                reason=reason,
+                status=to_pending,
+            )
+        except (KeyError, IndexError) as exc:
+            logger.warning(
+                "AnalystInbox: blocked_comment template format failed: {}",
+                exc,
+            )
+            comment_body = comment_template
+
+        if not self._post_to_tracker or self._task_tracker is None:
+            await emit_if(self._trace, AgentTraceEvent(
+                type="task_event", agent_key="analyst",
+                payload={
+                    "task_id": task_row.id,
+                    "action": "blocked_jira_actions_skipped",
+                    "external_id": external_id,
+                    "intended_transition": to_pending,
+                    "intended_comment": comment_body,
+                    "skip_reason": "post_to_tracker_disabled",
+                },
+            ))
+            return
+
+        transitioned = False
+        try:
+            await self._task_tracker.transition(external_id, to_pending)
+            transitioned = True
+        except Exception:
+            logger.exception(
+                "AnalystInbox: failed to transition {} to {} on block",
+                external_id, to_pending,
+            )
+
+        commented = False
+        try:
+            await self._task_tracker.comment(external_id, comment_body)
+            commented = True
+        except Exception:
+            logger.exception(
+                "AnalystInbox: failed to post blocked comment on {}",
+                external_id,
+            )
+
+        await emit_if(self._trace, AgentTraceEvent(
+            type="task_event", agent_key="analyst",
+            payload={
+                "task_id": task_row.id,
+                "action": "blocked_jira_actions",
+                "external_id": external_id,
+                "to_status": to_pending,
+                "transitioned": transitioned,
+                "commented": commented,
+                "comment_body": comment_body,
+            },
+        ))
+
+    async def _send_lead_escalation(
+        self, task_row: TaskRow, *, reason: str, kind: str,
     ) -> None:
         lead = await self._lead_user_id()
         steps = await self._sessions.list_steps(task_row.id)
@@ -536,13 +624,23 @@ class AnalystInbox:
             f"- [{s.seq}] {s.kind.value}: «{(s.text or '').splitlines()[0][:160] if s.text else ''}»"
             for s in steps
         ) or "(no steps)"
-        body_template = (
-            self._config.notifications.mattermost.clarifier_escalation_to_lead
-            or
-            "Застрял с уточнением по тикету [{external_id}]({task_url}).\n\n"
-            "**Причина:** {reason}\n\n**Цель:** {original_question}\n\n"
-            "**Цепочка:**\n{chain_summary}"
-        )
+        mm = self._config.notifications.mattermost
+        if kind == "blocked":
+            body_template = (
+                mm.blocked_escalation_to_lead
+                or
+                "Перевел в Pending задачу [{external_id}]({task_url})\n\n"
+                "**Причина:** {reason}\n\n"
+                "**Цепочка шагов:**\n{chain_summary}"
+            )
+        else:
+            body_template = (
+                mm.stuck_escalation_to_lead
+                or
+                "Застрял с уточнением по тикету [{external_id}]({task_url}).\n\n"
+                "**Причина:** {reason}\n\n**Цель:** {original_question}\n\n"
+                "**Цепочка:**\n{chain_summary}"
+            )
         body = body_template.format(
             tracker=task_row.tracker,
             external_id=task_row.external_id,
@@ -552,15 +650,21 @@ class AnalystInbox:
             reason=reason,
         )
         if lead is None:
+            handle = (self._config.agents.escalation.mattermost_user or "").strip()
+            if not handle or handle == "your.name":
+                note = "No team-lead handle configured."
+            else:
+                note = (
+                    f"Configured handle {handle!r} did not resolve to a "
+                    f"chat user — check ESCALATION_USER / chat directory."
+                )
             await emit_if(self._trace, AgentTraceEvent(
                 type="escalation_dropped", agent_key="analyst",
                 payload={
-                    "task_id": task_row.id, "reason": reason,
-                    "configured_handle": (
-                        self._config.agents.escalation.mattermost_user or ""
-                    ),
+                    "task_id": task_row.id, "reason": reason, "kind": kind,
+                    "configured_handle": handle,
                     "body": body,
-                    "note": "No team-lead handle configured.",
+                    "note": note,
                 },
             ))
             return
@@ -569,7 +673,7 @@ class AnalystInbox:
             type="escalation_sent" if outcome.sent else "escalation_dropped",
             agent_key="analyst",
             payload={
-                "task_id": task_row.id, "reason": reason,
+                "task_id": task_row.id, "reason": reason, "kind": kind,
                 "lead_user_id": lead,
                 "sent": outcome.sent,
                 "skip_reason": outcome.skip_reason,

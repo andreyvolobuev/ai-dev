@@ -20,7 +20,7 @@ from typing import Any
 class AnalystEffect:
     """One side-effect a tool produced during the analyst run."""
 
-    kind: str   # "ask_dispatched" | "plan_submitted" | "escalate" | "abandon"
+    kind: str   # "ask_dispatched" | "plan_submitted" | "stuck" | "blocked"
     payload: dict[str, Any]
 
 

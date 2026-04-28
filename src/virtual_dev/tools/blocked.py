@@ -1,4 +1,8 @@
-"""Terminal — give up and DM the team-lead with the chain."""
+"""Terminal — ticket is blocked / unworkable.
+
+Triggers a Jira transition to "Waiting For Response", a comment
+explaining why, and a DM to the team-lead.
+"""
 
 from __future__ import annotations
 
@@ -19,16 +23,21 @@ def build(ctx: ToolContext):
     run_state = ctx.run_state
 
     @tool(
-        "escalate_to_lead",
-        "Give up and DM the team-lead with the chain. Use when "
-        "you're truly stuck after multiple angles.",
+        "blocked",
+        "Mark the ticket BLOCKED / unworkable. The bot will: "
+        "(1) transition Jira to \"Waiting For Response\", "
+        "(2) post an explanatory comment on the ticket, "
+        "(3) DM the team-lead with the conversation chain. "
+        "Use when the ticket self-contradicts, depends on missing "
+        "external info that nobody can provide right now, or has been "
+        "cancelled. NOT for \"I'm just stuck\" — call `stuck` for that.",
         {
             "type": "object",
             "properties": {"reason": {"type": "string"}},
             "required": ["reason"],
         },
     )
-    async def _escalate(args: dict[str, Any]) -> dict[str, Any]:
+    async def _blocked(args: dict[str, Any]) -> dict[str, Any]:
         if run_state.get("ask_dispatched"):
             return wrap_text({
                 "recorded": False, "reason": "ask_pending",
@@ -38,9 +47,9 @@ def build(ctx: ToolContext):
             return wrap_text({"recorded": False, "reason": "already_terminal"})
         reason = str(args.get("reason") or "").strip() or "no_reason"
         effects.append(AnalystEffect(
-            kind="escalate", payload={"reason": reason},
+            kind="blocked", payload={"reason": reason},
         ))
         run_state["terminal"] = True
-        return wrap_text({"recorded": True, "instruction": "Escalation queued. End your turn."})
+        return wrap_text({"recorded": True, "instruction": "Blocked. End your turn."})
 
-    return _escalate
+    return _blocked

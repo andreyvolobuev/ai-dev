@@ -80,7 +80,7 @@ class AnalystRunResult:
 
     @property
     def has_terminal(self) -> bool:
-        return any(e.kind in ("plan_submitted", "escalate", "abandon") for e in self.effects)
+        return any(e.kind in ("plan_submitted", "stuck", "blocked") for e in self.effects)
 
     @property
     def has_async_dispatch(self) -> bool:
@@ -304,12 +304,13 @@ class AnalystAgent:
             "loop continue."
         )
         parts.append(
-            "- `escalate_to_lead` — you're truly stuck; team-lead will "
-            "be DM'd."
+            "- `stuck` — you've tried multiple angles and can't make "
+            "progress; team-lead will be DM'd. Ticket stays In Progress."
         )
         parts.append(
-            "- `abandon` — ticket self-contradicts or is otherwise no "
-            "longer doable."
+            "- `blocked` — ticket is BLOCKED / unworkable (missing "
+            "spec, contradictions, cancelled). Bot transitions Jira to "
+            "\"Waiting For Response\", comments why, and DMs the lead."
         )
         parts.append("")
         parts.append(

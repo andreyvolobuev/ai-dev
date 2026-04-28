@@ -53,21 +53,36 @@ mattermost:
   # по смыслу, но без MM-форматирования.
   gitlab_reply_iteration_done: "✅ Внёс правки, CI зелёный — коммит `{commit_sha_short}` на `{branch}`. Можно смотреть."
 
-  # --- Clarification flow (Phase 3.9, goal-driven) ---
-  # The planner agent composes the body of every DM itself, so we no
-  # longer have a `clarifier_question` template — the planner sees
-  # the goal description, decides what to ask, and writes a message
-  # for that specific recipient.
+  # --- Lead-escalation DMs ---
+  # The analyst agent composes the body of every per-recipient DM
+  # itself, so we no longer template the clarifying questions. The two
+  # templates below are for the *terminal* DMs the orchestrator sends
+  # to the team-lead when the analyst gives up:
   #
-  # The only template still used is the lead-escalation DM. Available
-  # placeholders: {tracker}, {external_id}, {task_url},
+  # * `stuck_escalation_to_lead` — analyst is stuck after multiple
+  #   angles; ticket stays "In Progress".
+  # * `blocked_escalation_to_lead` — analyst decided the ticket is
+  #   blocked / unworkable; orchestrator has just transitioned it to
+  #   "Waiting For Response" and posted an explanatory Jira comment.
+  #
+  # Placeholders for both: {tracker}, {external_id}, {task_url},
   # {original_question}, {chain_summary}, {reason}.
-  clarifier_escalation_to_lead: |
+  stuck_escalation_to_lead: |
     Застрял с уточнением по тикету [{external_id}]({task_url}).
 
     **Причина:** {reason}
 
     **Цель:** {original_question}
+
+    **Цепочка шагов:**
+    {chain_summary}
+
+    Помоги, пожалуйста, разобраться или подскажи, кому переадресовать.
+
+  blocked_escalation_to_lead: |
+    Перевел в Pending задачу [{external_id}]({task_url})
+
+    **Причина:** {reason}
 
     **Цепочка шагов:**
     {chain_summary}
@@ -110,6 +125,17 @@ jira:
     {notes_block}
 
     _Task kept in FAILED state; a human can take it from here._
+
+  # Posted when the analyst calls `blocked` — we move the ticket to
+  # "Waiting For Response" and explain why in this comment, then DM
+  # the lead with `blocked_escalation_to_lead`.
+  # Available placeholders: {external_id}, {task_url}, {reason}.
+  blocked_comment: |
+    *[virtual-dev] Задача переведена в "Waiting For Response".*
+
+    **Причина:** {reason}
+
+    _Бот уведомил тимлида и больше не работает над тикетом до указаний._
 
 # --- GitLab MR (то, что бот сам пишет в title / description / commit) ---
 # {key} — ticket external id, {title} — модель-сабмит, {url} — ticket URL,

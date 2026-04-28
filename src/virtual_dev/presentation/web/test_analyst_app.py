@@ -124,7 +124,7 @@ async def _build_state(
     # don't want to wait that long after each reply.
     config.agents.clarification.coalesce_window_seconds = coalesce_window_seconds
     # Auto-route escalation DMs to the operator (they ARE the lead in
-    # the test-analyst session). Without this an `escalate_to_lead`
+    # the test-analyst session). Without this a `stuck` / `blocked`
     # decision silently drops the DM and the activity feed shows
     # nothing — the operator can't tell the bot gave up. We always
     # override here, even if ESCALATION_USER points at a real lead —
