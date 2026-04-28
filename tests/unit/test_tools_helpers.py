@@ -164,6 +164,52 @@ def test_auth_headers_for_confluence_skipped_when_creds_incomplete() -> None:
     assert auth_headers_for("https://confluence.example/x", s) == {}
 
 
+def test_extract_attachment_links_filters_to_real_files() -> None:
+    """Confluence ``viewpage.action`` HTML carries 4 ``<img>`` tags but
+    only one is the real attachment — the other three (site logo,
+    project icon, user avatar) are decorative and have no file
+    extension. The extractor must drop them so the agent doesn't
+    waste a vision round-trip on a 24×24 logo PNG."""
+    from virtual_dev.tools.fetch_url import _extract_attachment_links
+
+    html = """
+    <html><body>
+      <img src="/download/attachments/8388609/atl.site.logo?api=v2" />
+      <img src="/download/attachments/367985671/DM?api=v2" />
+      <img src="/download/attachments/603326725/Screenshot.png?api=v2" />
+      <img src="/download/attachments/556128334/user-avatar" />
+      <a href="/download/attachments/603326725/brief.pdf">brief</a>
+      <a href="https://other.example/doc.docx">cross-domain</a>
+    </body></html>
+    """
+    links = _extract_attachment_links(
+        html, "https://confluence.example/pages/viewpage.action?pageId=603326725",
+    )
+    urls = [u for u, _ in links]
+    tools = [t for _, t in links]
+    # PNG attachment + relative PDF + cross-domain DOCX kept; the three
+    # extension-less decorative images dropped.
+    assert any(u.endswith("Screenshot.png?api=v2") for u in urls)
+    assert any(u.endswith("brief.pdf") for u in urls)
+    assert "https://other.example/doc.docx" in urls
+    assert not any("atl.site.logo" in u for u in urls)
+    assert not any("user-avatar" in u for u in urls)
+    # Tools mapped from extension.
+    assert "read_image_url" in tools
+    assert "read_pdf_url" in tools
+    assert "read_docx_url" in tools
+
+
+def test_extract_attachment_links_resolves_relative_to_base() -> None:
+    """``<img src="/foo.png">`` on a Confluence page should become an
+    absolute URL on the same host, ready for ``read_image_url``."""
+    from virtual_dev.tools.fetch_url import _extract_attachment_links
+
+    html = '<img src="/foo.png">'
+    links = _extract_attachment_links(html, "https://confluence.example/x")
+    assert links == [("https://confluence.example/foo.png", "read_image_url")]
+
+
 def test_is_trusted_internal_host_matches_configured_services() -> None:
     """The SSRF guard exempts hosts the operator put a PAT in for —
     corporate Jira / Confluence / MM routinely resolve to RFC1918

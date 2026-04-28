@@ -92,13 +92,28 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
     # ``download_url_bytes`` doesn't return headers. Sniff from the
     # body: HTML starts with ``<`` (after optional BOM/whitespace);
     # everything else gets passed through verbatim.
-    text = body.decode("utf-8", errors="replace")
-    if text.lstrip().startswith("<"):
-        text = _strip_html(text)
+    raw = body.decode("utf-8", errors="replace")
+    is_html = raw.lstrip().startswith("<")
+    text = _strip_html(raw) if is_html else raw
     truncated = False
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n... [truncated, {len(text)} chars total]"
         truncated = True
+
+    # Confluence pages and similar carry attachments / embedded images
+    # as ``<img src=…>`` / ``<a href=…>`` referencing file URLs that
+    # ``BeautifulSoup.get_text()`` discards. Surface them in a
+    # dedicated block so the agent can call the right
+    # ``read_<format>_url`` tool on each — otherwise it'll think the
+    # page is "empty" when the real content lived in a screenshot.
+    attachments_block = ""
+    if is_html:
+        attachments = _extract_attachment_links(raw, url)
+        if attachments:
+            lines = ["## Attachments and embedded media on this page"]
+            for absolute, tool_name in attachments:
+                lines.append(f"* {absolute} — call `{tool_name}`")
+            attachments_block = "\n\n" + "\n".join(lines)
 
     headers = auth_headers_for(url, settings)
     auth_used = "none"
@@ -110,7 +125,59 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
         + (", truncated" if truncated else "")
         + ")\n\n"
     )
-    return text_result(_wrap_untrusted(header + text, source=f"url:{url}"))
+    return text_result(_wrap_untrusted(
+        header + text + attachments_block,
+        source=f"url:{url}",
+    ))
+
+
+_EXT_TO_TOOL: dict[str, str] = {
+    ".png": "read_image_url", ".jpg": "read_image_url",
+    ".jpeg": "read_image_url", ".gif": "read_image_url",
+    ".webp": "read_image_url",
+    ".pdf": "read_pdf_url",
+    ".docx": "read_docx_url",
+    ".xlsx": "read_xlsx_url", ".xls": "read_xlsx_url",
+}
+
+
+def _extract_attachment_links(html: str, base_url: str) -> list[tuple[str, str]]:
+    """Pull ``<img src>`` and ``<a href>`` URLs that point at files.
+
+    Returns ``[(absolute_url, suggested_tool_name), ...]``. Only entries
+    whose path ends with a recognised file extension are included —
+    that filters out decorative images (Confluence's site logo /
+    avatars / project icons typically don't have a real file
+    extension), so the resulting list is what the agent actually
+    wants to read. Relative URLs are resolved against ``base_url``.
+    """
+    from urllib.parse import unquote, urljoin, urlparse
+
+    try:
+        from bs4 import BeautifulSoup  # type: ignore[import-not-found]
+    except ImportError:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for tag_name, attr in (("img", "src"), ("a", "href")):
+        for el in soup.find_all(tag_name):
+            raw_url = el.get(attr) or ""
+            if not raw_url or raw_url.startswith(("data:", "javascript:", "mailto:")):
+                continue
+            absolute = urljoin(base_url, raw_url)
+            path = unquote(urlparse(absolute).path).lower()
+            tool_name = ""
+            for ext, suggested in _EXT_TO_TOOL.items():
+                if path.endswith(ext):
+                    tool_name = suggested
+                    break
+            if not tool_name or absolute in seen:
+                continue
+            seen.add(absolute)
+            out.append((absolute, tool_name))
+    return out
 
 
 def _strip_html(body: str) -> str:
