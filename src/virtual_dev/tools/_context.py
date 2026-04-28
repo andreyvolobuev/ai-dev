@@ -27,10 +27,18 @@ class ToolContext:
     * **Long-lived** services (``communicator``, ``researcher``,
       ``chat``, ``settings``) are shared across the process; tools may
       keep them as plain attributes.
-    * **Per-run** buckets (``effects``, ``plan_capture``, ``run_state``)
-      are mutated by tools to record their side-effects. They're
-      ``None`` outside an agent run; tools that need them must
+    * **Per-run** buckets (``effects``, ``submit_capture``,
+      ``run_state``) are mutated by tools to record their side-effects.
+      They're ``None`` outside an agent run; tools that need them must
       return ``None`` from ``build()`` when missing.
+
+    ``submit_capture`` is shared across the terminal-submit tools of
+    every agent (``submit_plan`` for analyst, ``submit_mr`` for dev,
+    ``submit_response`` for responder). Each agent only ever exposes
+    its own group, so there's no in-run collision — and the agent
+    reads the captured args back after ``code_agent.run_task``
+    returns. Was previously named ``plan_capture``; renamed when the
+    other agents were folded into ``tools/`` for symmetry.
     """
 
     communicator: CommunicatorService | None = None
@@ -43,6 +51,6 @@ class ToolContext:
     # raw HTTP (e.g. attachment downloads need ``settings.jira_token``).
     settings: Settings | None = None
     effects: list[AnalystEffect] | None = None
-    plan_capture: dict[str, Any] | None = None
+    submit_capture: dict[str, Any] | None = None
     run_state: dict[str, Any] | None = None
     extras: dict[str, Any] = field(default_factory=dict)

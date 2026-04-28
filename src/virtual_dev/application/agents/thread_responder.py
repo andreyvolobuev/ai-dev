@@ -33,8 +33,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from claude_agent_sdk import create_sdk_mcp_server, tool
-from claude_agent_sdk.types import McpSdkServerConfig  # type: ignore[attr-defined]
 from loguru import logger
 
 from virtual_dev.application.services.injection_filter import (
@@ -69,18 +67,6 @@ _FALLBACK_PROMPT = (
     "and call submit_response.\n\n"
     "{untrusted_warning}"
 )
-
-
-_SUBMIT_RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "action": {"type": "string", "enum": ["reply", "iterate", "ignore"]},
-        "reply_text": {"type": "string"},
-        "iteration_feedback": {"type": "string"},
-        "reasoning": {"type": "string"},
-    },
-    "required": ["action", "reasoning"],
-}
 
 
 class ThreadResponderAgent:
@@ -151,26 +137,19 @@ class ThreadResponderAgent:
     async def _call_model(
         self, prompt: str, workspace: str | None,
     ) -> tuple[dict[str, Any], Any]:
+        from virtual_dev.tools import ToolContext, build_tool_servers
+
+        # ``submit_response`` lives in ``tools/submit_response.py``
+        # (group "responder"); auto-discovery wires it in. The
+        # responder doesn't need analyst / dev / researcher tools.
         captured: dict[str, Any] = {}
-
-        @tool(
-            "submit_response",
-            "Submit your decision. Call exactly once at the end.",
-            _SUBMIT_RESPONSE_SCHEMA,
+        ctx = ToolContext(submit_capture=captured)
+        mcp_servers, allowed, _ = build_tool_servers(
+            ctx, only_groups={"responder"},
         )
-        async def _submit(args: dict[str, Any]) -> dict[str, Any]:
-            captured.clear()
-            captured.update(args)
-            return {"content": [{"type": "text", "text": "Recorded."}]}
-
-        server = create_sdk_mcp_server(
-            name="virtual_dev_responder", version="0.1.0", tools=[_submit],
-        )
-        mcp_servers: dict[str, McpSdkServerConfig] = {"virtual_dev_responder": server}
-        allowed = [
-            "mcp__virtual_dev_responder__submit_response",
-            "Read", "Glob", "Grep",
-        ]
+        # Filesystem builtins for reading the repo if the model wants
+        # context — same surface as before.
+        allowed.extend(["Read", "Glob", "Grep"])
 
         request = CodeAgentRequest(
             agent_key=self.agent_key,

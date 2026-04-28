@@ -80,6 +80,7 @@ def build_tool_servers(
     *,
     package_name: str = _DEFAULT_PACKAGE,
     mcp_name_prefix: str = _DEFAULT_PREFIX,
+    only_groups: set[str] | None = None,
 ) -> tuple[dict[str, McpSdkServerConfig], list[str], dict[str, list[Any]]]:
     """Build one MCP server per group and the SDK allow-list of names.
 
@@ -93,23 +94,37 @@ def build_tool_servers(
       ``.description`` to render a catalogue (e.g. into a system
       prompt) without re-running ``discover_tools`` (which would
       execute every tool's ``build()`` a second time).
+
+    ``only_groups`` filters the result to the named groups so each
+    agent gets only its own surface — analyst doesn't see
+    ``submit_mr`` / ``submit_response``, dev doesn't see ``dm_user``,
+    etc. ``None`` (default) means "every group". Discovery still runs
+    over the whole package so a tool that returns ``None`` from
+    ``build()`` (optional dep missing) still has its side effects;
+    only the routing into MCP servers + allow-list is filtered.
     """
     groups = discover_tools(ctx, package_name=package_name)
     servers: dict[str, McpSdkServerConfig] = {}
     allowed: list[str] = []
-    for group, tool_list in groups.items():
+    selected = {
+        g: tools for g, tools in groups.items()
+        if only_groups is None or g in only_groups
+    }
+    for group, tool_list in selected.items():
         server_name = f"{mcp_name_prefix}{group}"
         servers[server_name] = create_sdk_mcp_server(
             name=server_name, version="0.1.0", tools=tool_list,
         )
         for t in tool_list:
             allowed.append(f"mcp__{server_name}__{t.name}")
-    return servers, allowed, groups
+    return servers, allowed, selected
 
 
 _GROUP_HEADERS: dict[str, str] = {
     "researcher": "Researcher tools (read tickets / code / external docs)",
     "analyst": "Analyst tools (talk to humans, terminate the run)",
+    "dev": "Dev tools (terminate the implementation run)",
+    "responder": "Responder tools (terminate the review-reply decision)",
 }
 
 

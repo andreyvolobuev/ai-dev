@@ -52,10 +52,10 @@ _SUBMIT_PLAN_SCHEMA: dict[str, Any] = {
 
 
 def build(ctx: ToolContext):
-    if ctx.effects is None or ctx.plan_capture is None or ctx.run_state is None:
+    if ctx.effects is None or ctx.submit_capture is None or ctx.run_state is None:
         return None
     effects = ctx.effects
-    plan_capture = ctx.plan_capture
+    submit_capture = ctx.submit_capture
     run_state = ctx.run_state
 
     @tool(
@@ -82,8 +82,8 @@ def build(ctx: ToolContext):
             })
         if run_state.get("terminal"):
             return wrap_text({"recorded": False, "reason": "already_terminal"})
-        plan_capture.clear()
-        plan_capture.update(args)
+        submit_capture.clear()
+        submit_capture.update(args)
         effects.append(AnalystEffect(
             kind="plan_submitted",
             payload={

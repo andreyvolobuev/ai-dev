@@ -161,7 +161,7 @@ class AnalystAgent:
             task_row=inp.task_row, history=inp.history, target_repo=target_repo,
         )
         effects: list[AnalystEffect] = []
-        plan_capture: dict[str, Any] = {}
+        submit_capture: dict[str, Any] = {}
         # Run-scoped flags to enforce one-ASK-per-run (otherwise the
         # agent can stack asks + submit_plan in the same turn,
         # bypassing the "end your turn after ask" rule).
@@ -172,7 +172,7 @@ class AnalystAgent:
         # prompt — adding a new tool to the package is enough; no
         # prompt edit needed.
         mcp_servers, allowed, groups = self._build_mcp(
-            effects, plan_capture, run_state,
+            effects, submit_capture, run_state,
         )
         tools_catalog = render_tools_catalog(
             groups,
@@ -200,9 +200,9 @@ class AnalystAgent:
 
         result = await self._code_agent.run_task(request)
         plan: Plan | None = None
-        if plan_capture:
+        if submit_capture:
             plan = _plan_from_submission(
-                submission=plan_capture,
+                submission=submit_capture,
                 task_row=inp.task_row,
                 target_repo=target_repo,
                 cost_usd=result.cost_usd,
@@ -380,7 +380,7 @@ class AnalystAgent:
     def _build_mcp(
         self,
         effects: list[AnalystEffect],
-        plan_capture: dict[str, Any],
+        submit_capture: dict[str, Any],
         run_state: dict[str, Any],
     ) -> tuple[dict[str, McpSdkServerConfig], list[str], dict[str, list[Any]]]:
         ctx = ToolContext(
@@ -389,10 +389,16 @@ class AnalystAgent:
             chat=getattr(self._communicator, "_chat", None),
             settings=self._settings,
             effects=effects,
-            plan_capture=plan_capture,
+            submit_capture=submit_capture,
             run_state=run_state,
         )
-        servers, allowed, groups = build_tool_servers(ctx)
+        # Analyst only ever needs its own group (chat / submit_plan /
+        # stuck / blocked) plus the shared researcher group. Other
+        # agents' terminal tools (submit_mr, submit_response) live in
+        # ``tools/`` too but are filtered out here.
+        servers, allowed, groups = build_tool_servers(
+            ctx, only_groups={"analyst", "researcher"},
+        )
         # Filesystem builtins still come from the SDK, not from tools/.
         allowed.extend(["Read", "Glob", "Grep"])
         return servers, allowed, groups

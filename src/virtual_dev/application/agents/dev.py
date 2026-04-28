@@ -34,8 +34,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from claude_agent_sdk import create_sdk_mcp_server, tool
-from claude_agent_sdk.types import McpSdkServerConfig  # type: ignore[attr-defined]
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -406,46 +404,34 @@ class DevAgent:
     async def _call_model(
         self, request: CodeAgentRequest
     ) -> tuple[dict[str, Any], CodeAgentResult]:
+        from virtual_dev.tools import ToolContext, build_tool_servers
+
+        # ``submit_mr`` (the dev's terminal tool) lives in
+        # ``tools/submit_mr.py``; auto-discovery wires it in alongside
+        # the researcher group's ``search_mr_history``. The
+        # ``only_groups`` filter keeps the dev scoped — it must not
+        # see analyst-only tools like ``dm_user`` or ``submit_plan``.
         captured: dict[str, Any] = {}
-
-        @tool(
-            "submit_mr",
-            "Call this exactly once at the end. Provide the MR title "
-            "and a detailed description of what was done.",
-            _SUBMIT_MR_SCHEMA,
+        ctx = ToolContext(
+            researcher=self._researcher,
+            submit_capture=captured,
         )
-        async def _submit_mr(args: dict[str, Any]) -> dict[str, Any]:
-            captured.clear()
-            captured.update(args)
-            return {"content": [{"type": "text", "text": "MR submission recorded."}]}
-
-        mr_server = create_sdk_mcp_server(
-            name="virtual_dev_dev_submit", version="0.1.0", tools=[_submit_mr]
+        mcp_servers, allowed_tool_names, _ = build_tool_servers(
+            ctx, only_groups={"dev", "researcher"},
         )
-        mcp_servers: dict[str, McpSdkServerConfig] = {
-            "virtual_dev_dev_submit": mr_server,
-        }
+        # Restrict the researcher surface to just ``search_mr_history``
+        # — the dev shouldn't be poking at random Jira attachments
+        # mid-implementation. Strip everything else from that group.
         allowed_tool_names = [
-            "mcp__virtual_dev_dev_submit__submit_mr",
-            # Full Claude Code tool surface in the workspace.
-            "Read", "Glob", "Grep", "Edit", "Write", "Bash",
+            name for name in allowed_tool_names
+            if not name.startswith("mcp__virtual_dev_researcher__")
+            or name == "mcp__virtual_dev_researcher__search_mr_history"
         ]
-        # MR-history search is the one piece the Dev doesn't get from
-        # built-in tools: let it peek at how similar changes were done before.
-        # Use the tools/ loader so this stays in sync with what the
-        # analyst sees — the SDK allow-list still keeps Dev scoped to
-        # just search_mr_history out of the researcher group.
-        if self._researcher is not None:
-            from virtual_dev.tools import ToolContext, build_tool_servers
-            researcher_servers, _all_researcher_tools, _ = build_tool_servers(
-                ToolContext(researcher=self._researcher),
-            )
-            researcher_server = researcher_servers.get("virtual_dev_researcher")
-            if researcher_server is not None:
-                mcp_servers["virtual_dev_researcher"] = researcher_server
-                allowed_tool_names.append(
-                    "mcp__virtual_dev_researcher__search_mr_history",
-                )
+        # Full Claude Code tool surface in the workspace (filesystem +
+        # bash) comes from the SDK builtins, not from ``tools/``.
+        allowed_tool_names.extend(
+            ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
+        )
         request.extras["mcp_servers"] = mcp_servers
         request.extras["allowed_tool_names"] = allowed_tool_names
 
@@ -658,18 +644,6 @@ class DevAgent:
 
 
 # --- helpers ---
-
-
-_SUBMIT_MR_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "title": {"type": "string"},
-        "description": {"type": "string"},
-        "status": {"type": "string", "enum": ["success", "failed"]},
-        "notes": {"type": "string"},
-    },
-    "required": ["title", "description", "status"],
-}
 
 
 def _slugify(text: str) -> str:
