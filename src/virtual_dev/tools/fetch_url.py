@@ -101,9 +101,13 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
         body, content_type = await asyncio.to_thread(_get, url, headers)
     except httpx.HTTPStatusError as exc:
         body_preview = (exc.response.text or "")[:200]
+        hint = ""
+        if exc.response.status_code in (401, 403):
+            hint = _auth_hint(url, settings)
         return error_text(
-            f"HTTP {exc.response.status_code} from {url} "
-            f"(body preview: {body_preview!r})"
+            f"HTTP {exc.response.status_code} from {url}"
+            + (f" — {hint}" if hint else "")
+            + f" (body preview: {body_preview!r})"
         )
     except Exception as exc:
         logger.exception("fetch_url: GET failed for {}", url)
@@ -165,6 +169,41 @@ def _to_plain_text(body: str, content_type: str) -> str:
 
         return re.sub(r"<[^>]+>", "", body)
     return BeautifulSoup(body, "html.parser").get_text("\n").strip()
+
+
+def _auth_hint(url: str, settings) -> str:
+    """Human-friendly hint when an internal host rejects our request.
+
+    Distinguishes "creds aren't configured" from "the configured creds
+    look like the .env.example placeholders" — both common in test
+    sessions. Returns ``""`` for any host we don't try to auth.
+    """
+    confluence_url = (getattr(settings, "confluence_url", "") or "").strip()
+    if confluence_url and url_is_on_host(url, confluence_url):
+        user = (getattr(settings, "confluence_user", "") or "").strip()
+        token = (getattr(settings, "confluence_token", "") or "").strip()
+        if not user or not token:
+            return (
+                "Confluence creds not set — fill CONFLUENCE_USER and "
+                "CONFLUENCE_TOKEN in .env (token can be a real PAT or "
+                "your account password; Basic-auth doesn't care)."
+            )
+        if user == "your.name@2gis.ru" or token in ("...", "<PAT или пароль>"):
+            return (
+                "Confluence creds look like .env.example placeholders. "
+                "Set CONFLUENCE_USER to your real email and "
+                "CONFLUENCE_TOKEN to a real PAT or password."
+            )
+        return (
+            "Confluence rejected the configured CONFLUENCE_USER / "
+            "CONFLUENCE_TOKEN — verify they still work in a browser."
+        )
+    jira_url = (getattr(settings, "jira_url", "") or "").strip()
+    if jira_url and url_is_on_host(url, jira_url):
+        if not (getattr(settings, "jira_token", "") or "").strip():
+            return "JIRA_TOKEN not set in .env."
+        return "Jira rejected the configured JIRA_TOKEN — try regenerating it."
+    return ""
 
 
 def _is_trusted_internal(url: str, settings) -> bool:
