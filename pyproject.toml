@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Virtual AI developer for the DataMining team (2GIS)"
 readme = "README.md"
 requires-python = ">=3.13"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 authors = [{ name = "DataMining Team, 2GIS" }]
 
 dependencies = [
