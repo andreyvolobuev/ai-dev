@@ -36,17 +36,35 @@ class TaskPriority(str, Enum):
 
 @dataclass
 class TaskLink:
-    """Внешняя ссылка из описания задачи (на Confluence, Mattermost-тред, etc)."""
+    """Внешняя ссылка из описания задачи (на Confluence, Mattermost-тред, etc).
+
+    ``kind`` values currently in use:
+    * ``jira_attachment`` — file attached to the ticket; ``name`` and
+      ``external_id`` are populated.
+    * ``jira_issue`` — another Jira ticket linked via ``issuelinks``.
+      ``external_id`` is the linked key (e.g. ``DM-3215``);
+      ``relationship`` is the link type from the linker's POV ("is
+      linked with", "blocks", "is blocked by", "duplicates", ...);
+      ``summary`` / ``status`` are the linked ticket's title and
+      Jira-status, taken from the inline issuelink payload.
+    * ``remote_link`` — ``object.url`` of a Jira remote link; used for
+      Confluence "mentioned in" back-references and similar. ``url``
+      points off-Jira (Confluence page etc.); ``relationship`` carries
+      the Jira label ("mentioned in", "Wiki Page", ...); ``summary``
+      is the remote-link title (often a generic "Page" — Jira doesn't
+      preserve the real Confluence page title here, fetch the URL to
+      get the real content).
+    """
 
     url: str
-    kind: str  # "confluence" | "mattermost_thread" | "mattermost_message" | "gitlab_mr" | "jira_attachment" | "other"
-    # Optional metadata. Filled for ``jira_attachment`` entries so the
-    # analyst can call read_jira_attachment_* with the real id (which
-    # is NOT in the ticket description — Jira renders it as ``[^name]``
-    # without the URL or id, and the bot would otherwise hallucinate
-    # one).
+    kind: str
+    # Optional metadata. Different kinds use different subsets — each
+    # field is documented above.
     name: str | None = None
     external_id: str | None = None
+    relationship: str | None = None
+    summary: str | None = None
+    status: str | None = None
 
 
 @dataclass

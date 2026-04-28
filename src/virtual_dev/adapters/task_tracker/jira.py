@@ -83,7 +83,23 @@ class JiraTaskTracker(TaskTrackerPort):
             return cast(dict[str, Any], result)
 
         issue = await asyncio.to_thread(_fetch)
-        return self._issue_to_task(issue)
+        task = self._issue_to_task(issue)
+        # Single-ticket path also enriches with remote links (Confluence
+        # "mentioned in" etc.). Skipped in the batch ``fetch_tasks``
+        # path because the per-issue REST round-trip would multiply
+        # discovery cost. Failures degrade gracefully — we still
+        # return the task, just without remote-link metadata.
+        try:
+            remote_links = await asyncio.to_thread(
+                _fetch_remote_links, self._client, external_id,
+            )
+            task.links.extend(remote_links)
+        except Exception:
+            logger.exception(
+                "Jira.get_task({}): remote-link fetch failed; continuing "
+                "without remote_link entries", external_id,
+            )
+        return task
 
     async def transition(self, external_id: str, to_status: str) -> None:
         """Transition an issue to the given target status.
@@ -163,7 +179,7 @@ class JiraTaskTracker(TaskTrackerPort):
             reporter_id=reporter_id,
             components=components,
             labels=labels,
-            links=_extract_links(fields),
+            links=_extract_links(fields, browse_base_url=self._browse_base_url),
             priority=priority,
             external_status=status_name,
             created_at=_parse_jira_datetime(fields.get("created")),
@@ -172,16 +188,42 @@ class JiraTaskTracker(TaskTrackerPort):
         )
 
 
-def _extract_links(fields: dict[str, Any]) -> list[TaskLink]:
-    """Best-effort: pull remote links Jira ships in issue fields."""
+def _extract_links(fields: dict[str, Any], *, browse_base_url: str = "") -> list[TaskLink]:
+    """Best-effort: pull links Jira ships inside the issue payload.
+
+    Two kinds emitted here, both from data inline in the issue JSON
+    (no extra REST round-trips): ``jira_issue`` (issuelinks) and
+    ``jira_attachment``. Remote links (Jira ⇄ Confluence
+    back-references) live on a separate endpoint and are added by
+    :func:`_fetch_remote_links` from ``get_task``.
+    """
     links: list[TaskLink] = []
     for link in fields.get("issuelinks") or []:
         if not isinstance(link, dict):
             continue
-        for side in ("outwardIssue", "inwardIssue"):
+        link_type = link.get("type") or {}
+        for side, label_key in (
+            ("outwardIssue", "outward"), ("inwardIssue", "inward"),
+        ):
             related = link.get(side)
-            if isinstance(related, dict) and related.get("key"):
-                links.append(TaskLink(url=str(related.get("self", "")), kind="jira_issue"))
+            if not isinstance(related, dict) or not related.get("key"):
+                continue
+            related_fields = related.get("fields") or {}
+            related_status = related_fields.get("status") or {}
+            key = str(related["key"])
+            url = (
+                f"{browse_base_url}/browse/{key}"
+                if browse_base_url
+                else str(related.get("self", ""))
+            )
+            links.append(TaskLink(
+                url=url,
+                kind="jira_issue",
+                external_id=key,
+                relationship=str(link_type.get(label_key) or "linked"),
+                summary=str(related_fields.get("summary") or "") or None,
+                status=str(related_status.get("name") or "") or None,
+            ))
     # Attachments: Jira returns each as {id, filename, content (URL),
     # mimeType, size}. We surface id + name so read_jira_attachment_*
     # tools can use the real id instead of guessing from the
@@ -199,3 +241,46 @@ def _extract_links(fields: dict[str, Any]) -> list[TaskLink]:
             external_id=str(att_id),
         ))
     return links
+
+
+def _fetch_remote_links(client: Jira, key: str) -> list[TaskLink]:
+    """Hit ``/rest/api/2/issue/<key>/remotelink`` and turn the response
+    into ``TaskLink(kind="remote_link")`` entries.
+
+    Sync — wrap with ``asyncio.to_thread`` from the call site. Returns
+    an empty list if the endpoint is unavailable or empty; never
+    raises (the caller logs and continues).
+
+    A typical entry from Jira looks like::
+
+        {
+          "id": 435580,
+          "globalId": "appId=…&pageId=…",
+          "application": {"type": "com.atlassian.confluence", ...},
+          "relationship": "mentioned in",
+          "object": {"url": "https://confluence.…/pages/…",
+                     "title": "Page", ...},
+        }
+
+    ``object.title`` is often a generic "Page" — Jira doesn't snapshot
+    the real Confluence page title here. The agent should call
+    ``fetch_url`` on the URL to get the actual content.
+    """
+    raw = client.get_issue_remote_links(key) or []
+    if not isinstance(raw, list):
+        return []
+    out: list[TaskLink] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        obj = entry.get("object") or {}
+        url = str(obj.get("url") or "").strip()
+        if not url:
+            continue
+        out.append(TaskLink(
+            url=url,
+            kind="remote_link",
+            relationship=str(entry.get("relationship") or "") or None,
+            summary=str(obj.get("title") or "") or None,
+        ))
+    return out

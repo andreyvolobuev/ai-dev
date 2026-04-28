@@ -54,6 +54,7 @@ from virtual_dev.domain.ports.code_agent import (
     CodeAgentPort,
     CodeAgentRequest,
 )
+from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 from virtual_dev.infrastructure.config import AppConfig, Settings
 from virtual_dev.infrastructure.db import PlanRow, TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
@@ -121,6 +122,7 @@ class AnalystAgent:
         config: AppConfig,
         settings: Settings,
         prompts_loader: PromptsLoader,
+        task_tracker: TaskTrackerPort | None = None,
         confluence_host: str | None = None,
         mattermost_host: str | None = None,
         gitlab_host: str | None = None,
@@ -133,6 +135,11 @@ class AnalystAgent:
         self._config = config
         self._settings = settings
         self._prompts = prompts_loader
+        # Optional: when wired, the ``read_jira_ticket`` tool becomes
+        # available to the agent and can fetch any ticket by key.
+        # Without it the tool short-circuits in ``build()`` and the
+        # ``shared`` group simply doesn't expose it.
+        self._task_tracker = task_tracker
         self._confluence_host = confluence_host
         self._mattermost_host = mattermost_host
         self._gitlab_host = gitlab_host
@@ -291,6 +298,68 @@ class AnalystAgent:
                 )
             parts.append("")
 
+        # Linked tickets — Jira ``issuelinks``. The reporter often
+        # files a sparse ticket and lets a "Linked With" / "blocks"
+        # / "duplicates" link carry the actual context. Surfacing the
+        # block here (BEFORE the agent decides anything) is what makes
+        # rule #2.5 ("inspect linked tickets first") enforceable.
+        linked_issues: list[dict[str, Any]] = [
+            link for link in (task_row.links_json or [])
+            if isinstance(link, dict) and link.get("kind") == "jira_issue"
+        ]
+        if linked_issues:
+            parts.append(
+                "## Linked Jira tickets (information may be missing "
+                "from THIS ticket's description but present in the "
+                "linked ones — fetch their full content via "
+                "`read_jira_ticket` BEFORE concluding the reporter "
+                "has to clarify)"
+            )
+            for link in linked_issues:
+                key = link.get("external_id") or "?"
+                rel = link.get("relationship") or "linked"
+                summary = link.get("summary") or "(no summary)"
+                status = link.get("status")
+                status_suffix = f" ({status})" if status else ""
+                url = link.get("url") or ""
+                parts.append(
+                    f"* `{key}` — {rel} — {summary}{status_suffix}"
+                )
+                if url:
+                    parts.append(f"  {url}")
+                parts.append(
+                    f"  → call `read_jira_ticket(key=\"{key}\")` "
+                    f"for full description"
+                )
+            parts.append("")
+
+        # Remote links — Jira ⇄ Confluence (and similar) back-references.
+        # Jira's ``object.title`` is usually generic ("Page") so we
+        # only have URLs to offer; the agent fetches the actual content
+        # via the shared ``fetch_url`` tool.
+        remote_links: list[dict[str, Any]] = [
+            link for link in (task_row.links_json or [])
+            if isinstance(link, dict) and link.get("kind") == "remote_link"
+        ]
+        if remote_links:
+            parts.append(
+                "## External pages mentioned in this ticket"
+            )
+            parts.append(
+                "(Confluence / web links auto-back-referenced from "
+                "external systems — the actual content lives off-Jira; "
+                "call `fetch_url` to read each.)"
+            )
+            for link in remote_links:
+                rel = link.get("relationship") or "linked"
+                title = link.get("summary") or "(no title)"
+                url = link.get("url") or ""
+                parts.append(
+                    f"* {url}\n"
+                    f"  ({rel} — {title} — call `fetch_url` to read)"
+                )
+            parts.append("")
+
         # Re-render the conversation log so the analyst has continuity.
         if history:
             parts.append("## Everything you've done on this ticket so far")
@@ -388,6 +457,7 @@ class AnalystAgent:
             researcher=self._researcher,
             chat=getattr(self._communicator, "_chat", None),
             settings=self._settings,
+            task_tracker=self._task_tracker,
             effects=effects,
             submit_capture=submit_capture,
             run_state=run_state,

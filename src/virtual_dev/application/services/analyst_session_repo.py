@@ -202,6 +202,25 @@ class AnalystSessionRepository:
                 return
             row.last_analyst_started_at = None
 
+    async def update_links(
+        self, task_id: int, links_json: list[dict[str, Any]],
+    ) -> None:
+        """Persist a fresh ``links_json`` snapshot.
+
+        Used by the analyst inbox right before each ``_run_step`` to
+        refresh the linked-ticket / remote-link metadata via the live
+        Jira tracker — old stale entries are discarded so the prompt
+        the analyst sees always reflects the current state of the
+        ticket. No-op if the row is gone.
+        """
+        async with session_scope(self._session_factory) as session:
+            row = (await session.execute(
+                select(TaskRow).where(TaskRow.id == task_id)
+            )).scalar_one_or_none()
+            if row is None:
+                return
+            row.links_json = links_json
+
     # ---------------------------------------------------------------- steps
     async def append_step(
         self,

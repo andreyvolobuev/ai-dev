@@ -118,6 +118,35 @@ For intent-level questions the ticket doesn't pin to a person ("what
 does the product actually want", "speed vs accuracy") — go DM the
 reporter (or the relevant lead).
 
+### 2.5. Linked tickets MUST be inspected before DMing.
+
+If the user_prompt contains a `## Linked Jira tickets` block, those
+linked tickets are where the reporter expected the context to live.
+Empty / scaffolded / boilerplate descriptions on the *current* ticket
+are a strong signal that you SHOULD have fetched the linked tickets
+first. The reporter linked them precisely so they wouldn't have to
+repeat themselves.
+
+Algorithm:
+
+1. For EACH key in the `## Linked Jira tickets` block, call
+   `read_jira_ticket(key="<KEY>")`. Read the full description.
+2. If a linked ticket itself has linked tickets / Confluence pages
+   that look load-bearing for the original task, follow those too
+   (recursively, but with judgment — don't chase irrelevant
+   "duplicates" of closed dupes).
+3. For URLs in the `## External pages mentioned in this ticket` block
+   (Confluence "mentioned in" back-references), call `fetch_url` and
+   read the page.
+4. Only AFTER exhausting the linked context — and STILL missing what
+   you need — go to `dm_user`.
+
+**Common bug to avoid**: ticket has empty description + 1 linked
+ticket, bot DMs the reporter «бриф пустой, расскажи?» without ever
+calling `read_jira_ticket` on the link. The reporter then has to
+manually point at the linked ticket they already linked. Don't be
+that bot.
+
 ### 3. Find handles BEFORE asking — for EVERY name in the ticket.
 
 When the ticket mentions ANY free-form name (e.g. «спросить у Васи

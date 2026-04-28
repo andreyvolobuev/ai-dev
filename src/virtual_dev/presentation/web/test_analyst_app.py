@@ -206,6 +206,12 @@ async def _build_state(
         config=config,
         settings=settings,
         prompts_loader=prompts_loader,
+        # Reuse the same Jira tracker the UI's "Fetch from Jira" button
+        # uses, so the ``read_jira_ticket`` tool can pull other tickets
+        # by key inside the analyst's run. ``task_tracker`` may still
+        # be None here (no Jira creds in .env) — the tool short-circuits
+        # gracefully in that case.
+        task_tracker=task_tracker,
     )
 
     analyst_session_repo = AnalystSessionRepository(session_factory)
@@ -213,7 +219,13 @@ async def _build_state(
         analyst=analyst,
         session_repo=analyst_session_repo,
         communicator=communicator,
-        task_tracker=None,
+        # Pass the Jira tracker so the inbox can refresh ``links_json``
+        # before each run (Confluence "mentioned in" remote-link
+        # back-references are only on the per-issue endpoint, not in
+        # the discovery sweep). ``post_to_tracker=False`` keeps the
+        # bot from actually transitioning / commenting on real tickets
+        # during a debug session — only reads are performed.
+        task_tracker=task_tracker,
         config=config,
         message_bus=None,
         post_to_tracker=False,

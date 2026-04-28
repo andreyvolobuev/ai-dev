@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     )
     from virtual_dev.application.services.agent_effects import AnalystEffect
     from virtual_dev.domain.ports.chat import ChatPort
+    from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
     from virtual_dev.infrastructure.config import Settings
 
 
@@ -50,6 +51,10 @@ class ToolContext:
     # Env-driven knobs for tools that talk to external systems via
     # raw HTTP (e.g. attachment downloads need ``settings.jira_token``).
     settings: Settings | None = None
+    # Tracker handle for tools that need to fetch other tickets by key
+    # (``read_jira_ticket``). Optional — tools that need it short-circuit
+    # by returning ``None`` from ``build()`` when it's missing.
+    task_tracker: TaskTrackerPort | None = None
     effects: list[AnalystEffect] | None = None
     submit_capture: dict[str, Any] | None = None
     run_state: dict[str, Any] | None = None

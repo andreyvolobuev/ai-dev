@@ -65,6 +65,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         config=container.config,
         settings=container.settings,
         prompts_loader=container.prompts_loader,
+        task_tracker=container.task_tracker,
         confluence_host=container.confluence_host,
         mattermost_host=container.mattermost_host,
         gitlab_host=container.gitlab_host,

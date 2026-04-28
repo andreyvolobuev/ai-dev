@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -304,6 +304,29 @@ class AnalystInbox:
             deadline_at=deadline_at,
             coalesce_window_seconds=coalesce_window,
         )
+        # Refresh ``links_json`` from Jira before every analyst run.
+        # ``fetch_tasks(jql)`` (the discovery sweep) only populates the
+        # cheap inline links — remote links (Confluence "mentioned in"
+        # back-references) come from a per-ticket REST endpoint and
+        # aren't in that batch. Doing the refresh here means the prompt
+        # the analyst sees always has the full link set, without making
+        # discovery slower. Failure-tolerant: on a Jira hiccup we keep
+        # whatever ``links_json`` is in the DB and log.
+        if self._task_tracker is not None:
+            try:
+                fresh = await self._task_tracker.get_task(
+                    task_row.external_id,
+                )
+                await self._sessions.update_links(
+                    task_row.id,
+                    [asdict(link) for link in fresh.links],
+                )
+            except Exception:
+                logger.exception(
+                    "AnalystInbox: link refresh failed for {}; "
+                    "continuing with stale links_json",
+                    task_row.external_id,
+                )
         refreshed = await self._sessions.get_task(task_row.id)
         if refreshed is None:
             return
