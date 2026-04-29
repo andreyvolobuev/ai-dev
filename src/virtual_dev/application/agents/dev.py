@@ -146,8 +146,9 @@ class DevAgent:
 
     async def handle_plan(self, tracker: str, external_id: str) -> DevResult:
         task_row, plan_row = await self._load(tracker, external_id)
+        existing_mr_iid = await self._existing_open_mr_iid(external_id)
 
-        skip = self._precheck(task_row, plan_row)
+        skip = self._precheck(task_row, plan_row, existing_mr_iid)
         if skip is not None:
             logger.info(
                 "Dev[{}] skipping {}: {}", self._agent_key, external_id, skip.value
@@ -573,16 +574,23 @@ class DevAgent:
         return task_row, plan_row
 
     def _precheck(
-        self, task_row: TaskRow | None, plan_row: PlanRow | None
+        self,
+        task_row: TaskRow | None,
+        plan_row: PlanRow | None,
+        existing_mr_iid: int | None,
     ) -> DevSkipReason | None:
         """Entry gates for the Dev-agent.
 
-        Three checks in order:
+        Four checks in order:
             1. Task exists in our DB (orchestrator must have seen it).
             2. A READY plan exists (Analyst judged the ticket actionable;
                CLARIFYING plans wait for a human to answer open questions).
             3. The plan's target_repo_key matches this Dev-agent's repo —
                otherwise another Dev-agent will pick it up.
+            4. No open/draft MR already exists for this ticket — guards
+               against a re-published plan.ready (manual ``dev-task`` CLI
+               while the inbox is live, retry doubles, ...) opening a
+               second branch + MR for work already in flight.
 
         The human gate is at a higher level: a ticket only reaches the
         orchestrator if it has the configured Jira label (`ai-dev` by
@@ -595,7 +603,25 @@ class DevAgent:
         target = plan_row.target_repo_key or task_row.target_repo_key
         if target != self._repo_key:
             return DevSkipReason.NO_TARGET_REPO
+        if existing_mr_iid is not None:
+            return DevSkipReason.ALREADY_HAS_MR
         return None
+
+    async def _existing_open_mr_iid(self, external_id: str) -> int | None:
+        """iid of an open/draft MR for this ticket on this repo, if any."""
+        async with self._session_factory() as session:
+            row = (await session.execute(
+                select(MergeRequestRow)
+                .where(
+                    MergeRequestRow.task_external_id == external_id,
+                    MergeRequestRow.repo_key == self._repo_key,
+                    MergeRequestRow.status.in_(
+                        [MRStatus.OPEN.value, MRStatus.DRAFT.value]
+                    ),
+                )
+                .limit(1)
+            )).scalar_one_or_none()
+        return row.iid if row is not None else None
 
     async def _persist_mr(
         self, *, task_row: TaskRow, mr: MergeRequest, branch: str

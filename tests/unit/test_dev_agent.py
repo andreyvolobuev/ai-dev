@@ -347,6 +347,42 @@ async def test_dev_skips_without_ready_plan(
 
 
 @pytest.mark.asyncio
+async def test_dev_skips_when_open_mr_already_exists(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """A re-published plan.ready (manual `dev-task` while inbox is live,
+    or a duplicate delivery) must not open a second MR for work already
+    in flight."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    async with session_scope(session_factory) as session:
+        session.add(MergeRequestRow(
+            repo_key="bellingshausen", iid=99,
+            external_id="999", task_external_id="DM-7",
+            title="prior MR", description="", source_branch="ai-dev/dm-7",
+            target_branch="main", author_username="bot",
+            web_url="https://gl/mr/999",
+            status=MRStatus.DRAFT.value,
+            approvals_count=0, approvals_required=1,
+            pipeline_status=PipelineStatus.UNKNOWN.value, pipeline_url="",
+        ))
+
+    vcs = _FakeVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=0, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(session_factory, vcs=vcs, code_agent=code_agent, preset_submission=None)
+    result = await dev.handle_plan("jira", "DM-7")
+
+    assert result.outcome is DevOutcome.SKIPPED
+    assert result.skip_reason is DevSkipReason.ALREADY_HAS_MR
+    # No VCS side effects.
+    assert vcs.calls == []
+
+
+@pytest.mark.asyncio
 async def test_dev_fails_when_no_submission(
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path: Path,
