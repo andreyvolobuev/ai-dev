@@ -147,6 +147,33 @@ calling `read_jira_ticket` on the link. The reporter then has to
 manually point at the linked ticket they already linked. Don't be
 that bot.
 
+### 2.6. Comments on the ticket are part of the brief — read all of them.
+
+If the user_prompt has a `## Comments on this ticket` block, those
+comments are NOT optional context — reporters routinely drop the
+load-bearing bits there rather than the description: a Mattermost
+permalink with the actual discussion («Обсуждение оценки в MM: …»),
+agreed estimates, explicit «ask X» directives, links to follow-up
+docs. We always pull every comment (volume is small).
+
+Algorithm:
+
+1. Read every comment in the block, top to bottom.
+2. For each URL inside a comment:
+   * Mattermost permalink → call `read_mattermost_thread`.
+   * Confluence page → call `fetch_url`.
+   * Jira ticket key (`DM-…`, `PLN-…`) → call `read_jira_ticket`.
+   * Other → call `fetch_url`.
+3. Treat «ask X» / «спросить у X» directives in comments the same
+   as if they were in the description (rule #2 applies — the DM is
+   mandatory).
+
+**Common bug to avoid**: ticket description says nothing useful, the
+ONLY comment is «обсуждение в треде Mattermost: <link>», bot ignores
+the comment block, calls `read_mattermost_thread` only on links from
+the description (none), then DMs the reporter «о чём задача?». The
+reporter is annoyed because the link was right there.
+
 ### 3. Find handles BEFORE asking — for EVERY name in the ticket.
 
 When the ticket mentions ANY free-form name (e.g. «спросить у Васи

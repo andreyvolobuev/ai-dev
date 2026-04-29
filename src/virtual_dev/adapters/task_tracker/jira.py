@@ -14,7 +14,13 @@ from typing import Any, cast
 from atlassian import Jira
 from loguru import logger
 
-from virtual_dev.domain.models.task import Task, TaskLink, TaskPriority, TaskStatus
+from virtual_dev.domain.models.task import (
+    Task,
+    TaskComment,
+    TaskLink,
+    TaskPriority,
+    TaskStatus,
+)
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 
 _PRIORITY_MAP: dict[str, TaskPriority] = {
@@ -85,10 +91,12 @@ class JiraTaskTracker(TaskTrackerPort):
         issue = await asyncio.to_thread(_fetch)
         task = self._issue_to_task(issue)
         # Single-ticket path also enriches with remote links (Confluence
-        # "mentioned in" etc.). Skipped in the batch ``fetch_tasks``
-        # path because the per-issue REST round-trip would multiply
-        # discovery cost. Failures degrade gracefully — we still
-        # return the task, just without remote-link metadata.
+        # "mentioned in" etc.) and comments (often carry the MM-thread
+        # link / brief / explicit "ask X" directives the reporter
+        # didn't fit in the description). Skipped in the batch
+        # ``fetch_tasks`` path — the per-issue REST round-trips would
+        # multiply discovery cost. Failures degrade gracefully — we
+        # still return the task, just without that enrichment.
         try:
             remote_links = await asyncio.to_thread(
                 _fetch_remote_links, self._client, external_id,
@@ -98,6 +106,15 @@ class JiraTaskTracker(TaskTrackerPort):
             logger.exception(
                 "Jira.get_task({}): remote-link fetch failed; continuing "
                 "without remote_link entries", external_id,
+            )
+        try:
+            task.comments = await asyncio.to_thread(
+                _fetch_comments, self._client, external_id,
+            )
+        except Exception:
+            logger.exception(
+                "Jira.get_task({}): comment fetch failed; continuing "
+                "without comments", external_id,
             )
         return task
 
@@ -284,5 +301,51 @@ def _fetch_remote_links(client: Jira, key: str) -> list[TaskLink]:
             kind="remote_link",
             relationship=str(entry.get("relationship") or "") or None,
             summary=str(obj.get("title") or "") or None,
+        ))
+    return out
+
+
+def _fetch_comments(client: Jira, key: str) -> list[TaskComment]:
+    """Pull every comment on the ticket via ``/rest/api/2/issue/<key>/comment``.
+
+    Sync — wrap with ``asyncio.to_thread`` from the call site. The
+    inline ``fields.comment`` block on the basic ``/issue/<key>``
+    response is server-capped (commonly to 1 entry on self-hosted
+    Jira), so we use the dedicated endpoint which defaults to
+    ``maxResults=1048576`` — effectively all comments. Returns an
+    empty list on any error; the caller logs and continues without
+    comments.
+
+    Each Jira comment looks like::
+
+        {
+          "id": "12345",
+          "author": {"displayName": "...", "name": "...", "emailAddress": "..."},
+          "body": "raw text — including markdown / wiki-syntax / URLs",
+          "created": "2026-04-28T14:25:02.237+0700",
+          "updated": "...",
+        }
+    """
+    raw = client.issue_get_comments(key) or {}
+    if not isinstance(raw, dict):
+        return []
+    out: list[TaskComment] = []
+    for entry in raw.get("comments") or []:
+        if not isinstance(entry, dict):
+            continue
+        author_obj = entry.get("author") or {}
+        author = (
+            str(author_obj.get("displayName") or "")
+            or str(author_obj.get("name") or "")
+            or "(unknown)"
+        )
+        body = str(entry.get("body") or "").strip()
+        if not body:
+            continue
+        out.append(TaskComment(
+            author=author,
+            body=body,
+            created_at=_parse_jira_datetime(entry.get("created")),
+            external_id=str(entry.get("id") or "") or None,
         ))
     return out

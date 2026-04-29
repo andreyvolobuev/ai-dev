@@ -22,6 +22,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 from sqlalchemy import select
@@ -312,6 +313,7 @@ class AnalystInbox:
         # the analyst sees always has the full link set, without making
         # discovery slower. Failure-tolerant: on a Jira hiccup we keep
         # whatever ``links_json`` is in the DB and log.
+        fresh_comments: list[Any] = []
         if self._task_tracker is not None:
             try:
                 fresh = await self._task_tracker.get_task(
@@ -321,10 +323,16 @@ class AnalystInbox:
                     task_row.id,
                     [asdict(link) for link in fresh.links],
                 )
+                # Comments aren't persisted on the row (no schema column
+                # — keeping the migration-free design we already have for
+                # the rest of the analyst's read-only enrichment). We
+                # carry them through ``AnalystRunInput`` instead, so the
+                # analyst's prompt always reflects the current set.
+                fresh_comments = list(fresh.comments)
             except Exception:
                 logger.exception(
-                    "AnalystInbox: link refresh failed for {}; "
-                    "continuing with stale links_json",
+                    "AnalystInbox: link/comment refresh failed for {}; "
+                    "continuing with stale links_json and no comments",
                     task_row.external_id,
                 )
         refreshed = await self._sessions.get_task(task_row.id)
@@ -340,6 +348,7 @@ class AnalystInbox:
                 task_row=refreshed, history=history,
                 target_repo=target_repo,
                 repo_workspace=repo_workspace,
+                task_comments=fresh_comments,
             ))
         except Exception:
             logger.exception(

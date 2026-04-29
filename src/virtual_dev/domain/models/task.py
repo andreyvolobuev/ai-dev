@@ -68,6 +68,24 @@ class TaskLink:
 
 
 @dataclass
+class TaskComment:
+    """One comment on a tracker ticket.
+
+    Comments routinely carry the load-bearing context that didn't
+    fit in the description: a Mattermost permalink to the discussion,
+    the agreed estimate, an "ask X" directive ("бриф тут ...").
+    The analyst inbox refetches them on every run (cheap — single
+    REST call returns all of them) and surfaces them verbatim in the
+    user_prompt so the LLM sees the same data the reporter left.
+    """
+
+    author: str
+    body: str
+    created_at: datetime | None = None
+    external_id: str | None = None  # tracker-side id, kept for dedup / linking
+
+
+@dataclass
 class Task:
     """Задача (тикет), которую бот должен выполнить.
 
@@ -87,6 +105,7 @@ class Task:
     components: list[str] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     links: list[TaskLink] = field(default_factory=list)
+    comments: list[TaskComment] = field(default_factory=list)
 
     # Метаданные
     priority: TaskPriority = TaskPriority.MEDIUM

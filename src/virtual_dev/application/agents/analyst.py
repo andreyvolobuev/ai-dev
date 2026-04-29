@@ -50,6 +50,7 @@ from virtual_dev.domain.models.analyst_conversation import (
     ConversationStepKind,
 )
 from virtual_dev.domain.models.plan import OpenQuestion, Plan, PlanStatus, PlanStep
+from virtual_dev.domain.models.task import TaskComment
 from virtual_dev.domain.ports.code_agent import (
     CodeAgentPort,
     CodeAgentRequest,
@@ -98,6 +99,11 @@ class AnalystRunInput:
     history: Sequence[ConversationStep]
     target_repo: str | None
     repo_workspace: Path | None
+    # Fresh comments fetched from the tracker right before the run —
+    # not persisted in TaskRow because we always refetch (Jira's
+    # comment endpoint returns all of them in one call). Empty list
+    # if the refresh failed or there are none.
+    task_comments: Sequence[TaskComment] = ()
 
 
 @dataclass
@@ -166,6 +172,7 @@ class AnalystAgent:
 
         prompt = self._render_prompt(
             task_row=inp.task_row, history=inp.history, target_repo=target_repo,
+            task_comments=inp.task_comments,
         )
         effects: list[AnalystEffect] = []
         submit_capture: dict[str, Any] = {}
@@ -233,6 +240,7 @@ class AnalystAgent:
         task_row: TaskRow,
         history: Sequence[ConversationStep],
         target_repo: str | None,
+        task_comments: Sequence[TaskComment] = (),
     ) -> str:
         # Untrusted ticket description gets wrapped.
         desc_filter = InjectionFilter()
@@ -361,6 +369,34 @@ class AnalystAgent:
                     f"  ({rel} — {title} — call `fetch_url` to read)"
                 )
             parts.append("")
+
+        # Comments on the ticket. Reporters routinely drop the
+        # load-bearing context here rather than the description: a
+        # Mattermost permalink with the actual discussion, an "ask X"
+        # directive, an estimate the team agreed on. We always
+        # refetch (cheap, single REST call) and surface ALL of them
+        # — comment volume on our tickets is small. Each is wrapped
+        # individually so the agent can quote / treat them as data.
+        if task_comments:
+            parts.append(
+                "## Comments on this ticket "
+                "(reporters often put the real context here — "
+                "Mattermost thread links, agreed estimates, "
+                "explicit \"ask X\" directives. READ THESE before "
+                "DMing anyone.)"
+            )
+            for c in task_comments:
+                ts = c.created_at.isoformat() if c.created_at else "?"
+                wrapped = desc_filter.wrap(
+                    c.body,
+                    source=(
+                        f"{task_row.tracker}:{task_row.external_id}:"
+                        f"comment:{c.external_id or '?'}"
+                    ),
+                )
+                parts.append(f"### {c.author} @ {ts}")
+                parts.append(wrapped.wrapped_text)
+                parts.append("")
 
         # Re-render the conversation log so the analyst has continuity.
         if history:

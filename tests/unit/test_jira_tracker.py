@@ -14,6 +14,7 @@ from typing import Any
 
 from virtual_dev.adapters.task_tracker.jira import (
     _extract_links,
+    _fetch_comments,
     _fetch_remote_links,
 )
 
@@ -130,6 +131,60 @@ def test_fetch_remote_links_parses_confluence_back_references() -> None:
     assert link.url == "https://confluence.example/pages/viewpage.action?pageId=539899447"
     assert link.relationship == "mentioned in"
     assert link.summary == "Page"
+
+
+def test_fetch_comments_parses_all_fields() -> None:
+    """Comments often carry the load-bearing context (MM permalinks,
+    estimates, "ask X" directives). The parser pulls author /
+    body / created / id from each entry; empty-body comments are
+    dropped (whitespace-only "edited" markers Jira sometimes emits)."""
+
+    class _StubClient:
+        def issue_get_comments(self, key: str) -> dict[str, Any]:
+            assert key == "DM-3342"
+            return {
+                "total": 2,
+                "maxResults": 1048576,
+                "comments": [
+                    {
+                        "id": "12345",
+                        "author": {
+                            "displayName": "Андрей Волобуев",
+                            "name": "an.volobuev",
+                        },
+                        "body": "Обсуждение в Mattermost: https://mm/pl/abc",
+                        "created": "2026-04-28T14:25:02.237+0700",
+                    },
+                    {
+                        "id": "12346",
+                        "author": {"displayName": "Bob"},
+                        "body": "   ",  # whitespace-only — drop
+                        "created": "2026-04-28T15:00:00.000+0700",
+                    },
+                ],
+            }
+
+    out = _fetch_comments(_StubClient(), "DM-3342")  # type: ignore[arg-type]
+    assert len(out) == 1
+    c = out[0]
+    assert c.author == "Андрей Волобуев"
+    assert c.external_id == "12345"
+    assert "Mattermost" in c.body
+    assert c.created_at is not None
+    assert c.created_at.year == 2026
+
+
+def test_fetch_comments_handles_unexpected_response() -> None:
+    """A Jira hiccup or non-dict response shouldn't crash get_task —
+    return an empty list and let the caller log + continue without
+    comments."""
+
+    class _StubClient:
+        def issue_get_comments(self, key: str) -> Any:
+            return None
+
+    out = _fetch_comments(_StubClient(), "X-1")  # type: ignore[arg-type]
+    assert out == []
 
 
 def test_fetch_remote_links_skips_entries_without_url() -> None:
