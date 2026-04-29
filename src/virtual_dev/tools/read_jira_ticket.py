@@ -21,6 +21,7 @@ from typing import Any
 from claude_agent_sdk import tool
 
 from virtual_dev.tools import ToolContext, wrap_text
+from virtual_dev.tools._helpers import text_result
 
 TOOL_GROUP = "shared"
 
@@ -64,7 +65,7 @@ def build(ctx: ToolContext):
             })
 
         body = _format_task(task)
-        return wrap_text(_wrap_untrusted(body, source=f"jira:{key}"))
+        return text_result(_wrap_untrusted(body, source=f"jira:{key}"))
 
     return _read
 
