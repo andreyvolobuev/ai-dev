@@ -12,6 +12,7 @@ session.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -29,6 +30,11 @@ from virtual_dev.infrastructure.db import (
     TaskRow,
 )
 from virtual_dev.infrastructure.db.base import session_scope
+
+# Generous enough to absorb a real fan-out (n parallel appenders) on
+# the same task; small enough that a *real* schema bug surfaces quickly
+# instead of looping forever.
+_APPEND_STEP_MAX_RETRIES = 8
 
 
 def _row_to_step(row: AnalystConversationStepRow) -> ConversationStep:
@@ -60,6 +66,14 @@ class AnalystSessionRepository:
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+        # Per-task asyncio lock around append_step. SQLite WAL gives every
+        # transaction a consistent snapshot, so concurrent MAX(seq)+1
+        # readers all compute the same next_seq and lose at INSERT-commit
+        # time on UNIQUE(task_id, seq). Serialising the appenders inside
+        # the process avoids a tight retry-storm; the IntegrityError
+        # retry below is the last-resort belt against multi-process /
+        # leftover races.
+        self._step_locks: dict[int, asyncio.Lock] = {}
 
     # ---------------------------------------------------------------- read
     async def get_task(self, task_id: int) -> TaskRow | None:
@@ -230,22 +244,38 @@ class AnalystSessionRepository:
         text: str,
         metadata: dict[str, Any] | None = None,
     ) -> ConversationStep:
-        async with session_scope(self._session_factory) as session:
-            current_max = (await session.execute(
-                select(func.max(AnalystConversationStepRow.seq))
-                .where(AnalystConversationStepRow.task_id == task_id)
-            )).scalar()
-            next_seq = (current_max or 0) + 1
-            row = AnalystConversationStepRow(
-                task_id=task_id,
-                seq=next_seq,
-                kind=kind.value,
-                text=text,
-                metadata_json=metadata or {},
-            )
-            session.add(row)
-            await session.flush()
-            return _row_to_step(row)
+        # MAX(seq)+1 + INSERT is racy: under WAL each concurrent
+        # appender's snapshot pre-dates the others' commits, so they all
+        # compute the same next_seq and lose at INSERT on
+        # UNIQUE(task_id, seq). Serialise appenders for one task with an
+        # in-process lock; keep an IntegrityError retry as a last-resort
+        # belt against multi-process / restart leftovers.
+        lock = self._step_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            last_exc: Exception | None = None
+            for _ in range(_APPEND_STEP_MAX_RETRIES):
+                try:
+                    async with session_scope(self._session_factory) as session:
+                        current_max = (await session.execute(
+                            select(func.max(AnalystConversationStepRow.seq))
+                            .where(AnalystConversationStepRow.task_id == task_id)
+                        )).scalar()
+                        next_seq = (current_max or 0) + 1
+                        row = AnalystConversationStepRow(
+                            task_id=task_id,
+                            seq=next_seq,
+                            kind=kind.value,
+                            text=text,
+                            metadata_json=metadata or {},
+                        )
+                        session.add(row)
+                        await session.flush()
+                        return _row_to_step(row)
+                except IntegrityError as exc:
+                    last_exc = exc
+                    continue
+            assert last_exc is not None
+            raise last_exc
 
     async def list_steps(self, task_id: int) -> list[ConversationStep]:
         async with self._session_factory() as session:
