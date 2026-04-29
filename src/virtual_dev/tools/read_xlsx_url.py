@@ -21,6 +21,10 @@ from virtual_dev.tools.read_pdf_url import _wrap_untrusted
 TOOL_GROUP = "shared"
 
 _DEFAULT_MAX_CHARS = 30_000
+# XLSX is a zip; openpyxl with read_only=True still has to inflate the
+# archive index. Refuse anything beyond a sane size before parsing —
+# zip-bomb defence + protection against a tens-of-MB sheet eating RAM.
+MAX_XLSX_BYTES = 20 * 1024 * 1024
 
 
 def build(ctx: ToolContext):
@@ -63,6 +67,12 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         logger.exception("read_xlsx_url: download failed for {}", url)
         return error_text(f"Download failed: {exc}")
+
+    if len(body) > MAX_XLSX_BYTES:
+        return error_text(
+            f"XLSX too large: {len(body)} bytes exceeds limit of "
+            f"{MAX_XLSX_BYTES}. Ask for a CSV export instead."
+        )
 
     try:
         parts = await asyncio.to_thread(_xlsx_to_text, body)

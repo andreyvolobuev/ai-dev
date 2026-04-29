@@ -140,6 +140,12 @@ _EXT_TO_TOOL: dict[str, str] = {
     ".xlsx": "read_xlsx_url", ".xls": "read_xlsx_url",
 }
 
+# A page with thousands of <img>/<a> tags pointing at attachments can
+# bloat the prompt past the agent's budget. Cap aggressively — the
+# first 50 are nearly always what the human meant for the agent to
+# look at.
+MAX_ATTACHMENT_LINKS = 50
+
 
 def _extract_attachment_links(html: str, base_url: str) -> list[tuple[str, str]]:
     """Pull ``<img src>`` and ``<a href>`` URLs that point at files.
@@ -177,6 +183,8 @@ def _extract_attachment_links(html: str, base_url: str) -> list[tuple[str, str]]
                 continue
             seen.add(absolute)
             out.append((absolute, tool_name))
+            if len(out) >= MAX_ATTACHMENT_LINKS:
+                return out
     return out
 
 

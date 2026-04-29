@@ -32,6 +32,10 @@ TOOL_GROUP = "shared"
 # prompt. The agent can re-call with a different ``max_chars`` if it
 # needs more.
 _DEFAULT_MAX_CHARS = 30_000
+# Refuse PDFs above this page count outright — extracting text from
+# tens of thousands of pages burns minutes and RAM even before
+# truncation, and surfaces as a hung run.
+MAX_PAGES = 200
 
 
 def build(ctx: ToolContext):
@@ -78,6 +82,18 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
 
     try:
         reader = await asyncio.to_thread(PdfReader, io.BytesIO(body))
+    except Exception as exc:
+        logger.exception("read_pdf_url: PDF parse failed for {}", url)
+        return error_text(f"PDF parse failed: {exc}")
+
+    n_pages = len(reader.pages)
+    if n_pages > MAX_PAGES:
+        return error_text(
+            f"PDF too large: {n_pages} pages exceeds limit of {MAX_PAGES}. "
+            f"Ask a human to split / share an excerpt."
+        )
+
+    try:
         page_texts = [
             (page.extract_text() or "").strip()
             for page in reader.pages
