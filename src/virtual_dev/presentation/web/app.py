@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from loguru import logger
@@ -332,7 +332,30 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             request, "mrs.html", {"mrs": rows, "task_lookup": task_lookup},
         )
 
-    @app.post("/kill")
+    def _require_admin(request: Request) -> None:
+        """Guard destructive endpoints. Bearer token if configured, else
+        loopback-only."""
+        admin_token = (container.settings.admin_token or "").strip()
+        if admin_token:
+            header = request.headers.get("authorization", "")
+            expected = f"Bearer {admin_token}"
+            if header != expected:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="missing or invalid admin token",
+                )
+            return
+        client_host = request.client.host if request.client else ""
+        if client_host not in ("127.0.0.1", "::1", "localhost"):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=(
+                    "admin endpoints require ADMIN_TOKEN when bound off "
+                    "loopback"
+                ),
+            )
+
+    @app.post("/kill", dependencies=[Depends(_require_admin)])
     async def kill() -> dict[str, str]:
         await orchestrator.stop()
         await analyst_runner.stop()

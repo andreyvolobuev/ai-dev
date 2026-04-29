@@ -70,6 +70,12 @@ class Settings(BaseSettings):
 
     web_host: str = "127.0.0.1"
     web_port: int = 8080
+    # Bearer token required for destructive dashboard endpoints (currently
+    # POST /kill). When empty, those endpoints are allowed only from
+    # loopback — so the default localhost setup keeps working without any
+    # config, but the moment WEB_HOST is set to 0.0.0.0 / a routable IP,
+    # ADMIN_TOKEN must be set or the kill-switch refuses.
+    admin_token: str = ""
 
     log_level: str = Field(default="INFO")
 
