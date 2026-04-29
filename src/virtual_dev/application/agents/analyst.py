@@ -33,7 +33,7 @@ from typing import Any
 
 from claude_agent_sdk.types import McpSdkServerConfig  # type: ignore[attr-defined]
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.services import (
@@ -640,6 +640,20 @@ class AnalystAgent:
 
     async def save_plan(self, plan: Plan) -> None:
         async with session_scope(self._session_factory) as session:
+            # Supersede any prior active plan for this task before
+            # appending the new one. The plans table is intentionally
+            # append-only (audit trail), so we don't delete; we mark
+            # older rows so the "active plan" query can use a single
+            # status filter instead of relying on ordering.
+            await session.execute(
+                update(PlanRow)
+                .where(
+                    PlanRow.tracker == plan.tracker,
+                    PlanRow.task_external_id == plan.task_external_id,
+                    PlanRow.status != PlanStatus.SUPERSEDED.value,
+                )
+                .values(status=PlanStatus.SUPERSEDED.value)
+            )
             session.add(plan_to_row(plan))
 
 

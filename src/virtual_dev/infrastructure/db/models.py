@@ -204,6 +204,15 @@ class PlanRow(Base):
     """Persistent projection of :class:`virtual_dev.domain.models.plan.Plan`."""
 
     __tablename__ = "plans"
+    __table_args__ = (
+        # Hot query: "active plan for (tracker, task_external_id)" —
+        # filtered by ``status != SUPERSEDED``. Compound index lets
+        # SQLite skip superseded rows for the lookup directly.
+        Index(
+            "ix_plans_tracker_task_status",
+            "tracker", "task_external_id", "status",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
 
