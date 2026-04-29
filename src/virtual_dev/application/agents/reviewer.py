@@ -27,6 +27,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from typing import Literal
 
 from loguru import logger
 from sqlalchemy import select
@@ -287,9 +288,9 @@ class ReviewerAgent:
             touched = True
 
         # Escalation policy: fire only when no human activity this tick.
-        escalated_this_tick = False
+        action: Literal["ping", "escalation"] | None = None
         if not touched:
-            escalated_this_tick = await self._maybe_escalate(row, now, stats)
+            action = await self._maybe_escalate(row, now, stats)
 
         # Persist state.
         await self._persist_tick_state(
@@ -301,7 +302,8 @@ class ReviewerAgent:
             approvals_required=approvals_required,
             review_ping_sent=review_ping_sent,
             touched=touched,
-            escalated_this_tick=escalated_this_tick,
+            escalated_this_tick=action == "escalation",
+            pinged_this_tick=action == "ping",
             clear_iteration_pending=clear_iteration_pending,
             now=now,
         )
@@ -554,7 +556,7 @@ class ReviewerAgent:
 
     async def _maybe_escalate(
         self, row: MergeRequestRow, now: datetime, stats: ReviewerTickStats,
-    ) -> bool:
+    ) -> Literal["ping", "escalation"] | None:
         policy = self._config.agents.review_policy
         last_activity = row.last_activity_at or row.created_at
         idle = now - _aware(last_activity)
@@ -587,8 +589,8 @@ class ReviewerAgent:
                                 "idle_hours": idle.total_seconds() / 3600,
                             },
                         ))
-                return True
-            return False
+                return "escalation"
+            return None
 
         if idle >= timedelta(hours=policy.ping_reviewers_after_hours):
             if row.ping_reviewers_at is None:
@@ -602,9 +604,9 @@ class ReviewerAgent:
                 if channel_id:
                     await self._communicator.send_channel(channel_id, text)
                     stats.pings_sent += 1
-                return True
+                    return "ping"
 
-        return False
+        return None
 
     def _render_template(self, template: str, **kwargs: object) -> str:
         """Format a notifications template, swallowing missing keys.
@@ -712,6 +714,7 @@ class ReviewerAgent:
         review_ping_sent: bool,
         touched: bool,
         escalated_this_tick: bool,
+        pinged_this_tick: bool,
         clear_iteration_pending: bool,
         now: datetime,
     ) -> None:
@@ -735,6 +738,8 @@ class ReviewerAgent:
                 row.last_escalation_at = None
             if escalated_this_tick:
                 row.last_escalation_at = now
+            if pinged_this_tick:
+                row.ping_reviewers_at = now
             if clear_iteration_pending:
                 row.iteration_pending_ci_sha = None
                 row.iteration_ack_target = None
