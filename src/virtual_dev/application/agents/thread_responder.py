@@ -201,8 +201,15 @@ class ThreadResponderAgent:
             parts.append("")
         if mr_diff.strip():
             parts.append("## MR diff (the actual change under review)")
+            # The diff is human-authored content (file contents, commit
+            # messages, anyone with push access can shape it) — must
+            # round-trip through the injection filter like description
+            # and thread, otherwise it's a hole in our LLM-input policy.
+            wrapped_diff = self._filter.wrap(
+                mr_diff[:50_000], source="gitlab:mr:diff",
+            )
             parts.append("```diff")
-            parts.append(mr_diff[:50_000])
+            parts.append(wrapped_diff.wrapped_text)
             parts.append("```")
             parts.append("")
         parts.append("## Thread so far (oldest first)")
