@@ -59,7 +59,7 @@ class AgentRunner:
         self._running = True
         logger.info("AgentRunner[{}] subscribing to bus", self._agent_key)
         try:
-            subscription = self._bus.subscribe(self._agent_key)
+            subscription = await self._bus.subscribe(self._agent_key)
             pending = asyncio.create_task(_anext(subscription))
             stopper = asyncio.create_task(self._stop_event.wait())
             try:
@@ -75,7 +75,8 @@ class AgentRunner:
                             message = pending.result()
                         except StopAsyncIteration:
                             break
-                        await self._dispatch(message)
+                        if await self._dispatch(message):
+                            await self._bus.ack(message)
                         pending = asyncio.create_task(_anext(subscription))
             finally:
                 for task in (pending, stopper):
@@ -87,23 +88,30 @@ class AgentRunner:
             self._running = False
             logger.info("AgentRunner[{}] stopped", self._agent_key)
 
-    async def _dispatch(self, message: AgentMessage) -> None:
+    async def _dispatch(self, message: AgentMessage) -> bool:
+        """Run the registered handler. Returns True iff the handler ran
+        to completion successfully — caller acks only on True so a
+        crashed handler's lease expires and the bus redelivers."""
         handler = self._handlers.get(message.topic)
         if handler is None:
+            # No handler == nothing to retry. Treat as "handled" so the
+            # bus doesn't keep redelivering a topic we don't care about.
             logger.debug(
                 "AgentRunner[{}] ignoring topic {!r} (no handler)",
                 self._agent_key, message.topic,
             )
-            return
+            return True
         try:
             await handler(message)
             self.stats.processed += 1
+            return True
         except Exception:
             self.stats.failed += 1
             logger.exception(
                 "AgentRunner[{}] handler for {!r} raised",
                 self._agent_key, message.topic,
             )
+            return False
 
 
 async def _anext(iterator: Any) -> AgentMessage:

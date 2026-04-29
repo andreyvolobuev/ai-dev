@@ -146,9 +146,27 @@ class MergeRequestRow(Base):
 
 
 class AgentMessageRow(Base):
-    """Persistent inter-agent message (SQLite-backed message bus)."""
+    """Persistent inter-agent message (SQLite-backed message bus).
+
+    Lifecycle: ``consumed_at IS NULL AND claimed_until IS NULL`` → free.
+    A ``_claim_next`` call sets ``claimed_until = now + lease`` (lease
+    reservation, not consumption). Successful handler → ``ack()`` sets
+    ``consumed_at``. Crashed handler / process kill → lease expires,
+    next poll's reaper resets ``claimed_until = NULL`` and the row
+    becomes free again. At-least-once delivery; handlers must be
+    idempotent (already true via the UNIQUE constraints on TaskRow,
+    MergeRequestRow, AnalystConversationFragmentRow)."""
 
     __tablename__ = "agent_messages"
+    __table_args__ = (
+        # Hot path is "next free message for this consumer" — composite
+        # index lets SQLite skip rows that are leased / consumed without
+        # scanning the whole inbox.
+        Index(
+            "ix_agent_messages_to_agent_consumed_claimed",
+            "to_agent", "consumed_at", "claimed_until",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     external_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
@@ -159,6 +177,27 @@ class AgentMessageRow(Base):
     correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Lease deadline. NULL = unclaimed; future = in flight; past = lease
+    # expired (reaper resets to NULL on next poll).
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class BusSubscriptionRow(Base):
+    """Durable list of agent_keys that have ever subscribed to the bus.
+
+    Survives process restart: a broadcast (``to_agent="*"``) fans out to
+    everyone in this table, so an orchestrator can publish before the
+    consumer process has come up and the message still lands in the
+    right inbox. Re-registered idempotently by every ``subscribe()``
+    call. Pruning of long-stale subscribers is operator territory."""
+
+    __tablename__ = "bus_subscriptions"
+
+    agent_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    registered_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, onupdate=_utcnow,
+    )
 
 
 class PlanRow(Base):

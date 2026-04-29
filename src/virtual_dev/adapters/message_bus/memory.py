@@ -1,8 +1,10 @@
-"""In-memory message bus for Phase 0.
+"""In-memory message bus — used by tests and small CLIs.
 
-A single ``asyncio.Queue`` per subscriber. Good enough while there's only one
-agent and we want zero external dependencies. Will be replaced by a
-SQLite-backed bus once multiple agents start exchanging messages.
+One ``asyncio.Queue`` per subscriber. ``ack`` is a no-op (the queue
+already implements at-most-once via ``get``); the method exists to
+satisfy the port. Targeted messages to an unknown agent_key are queued
+under that key so a later ``subscribe`` still receives them, matching
+the durable behaviour of the SQLite adapter.
 """
 
 from __future__ import annotations
@@ -23,15 +25,17 @@ class InMemoryMessageBus(MessageBusPort):
         return self._queues[agent_key]
 
     async def publish(self, message: AgentMessage) -> None:
-        targets: list[str]
         if message.to_agent == "*":
+            # Mirror the SQLite adapter: broadcast lands in every known
+            # inbox, where "known" means anyone who's ever subscribed.
+            # Tests may depend on the order being deterministic.
             targets = list(self._queues.keys())
         else:
             targets = [message.to_agent]
         for target in targets:
             await self._queue_for(target).put(message)
 
-    def subscribe(self, agent_key: str) -> AsyncIterator[AgentMessage]:
+    async def subscribe(self, agent_key: str) -> AsyncIterator[AgentMessage]:
         queue = self._queue_for(agent_key)
 
         async def _iter() -> AsyncIterator[AgentMessage]:
@@ -39,3 +43,7 @@ class InMemoryMessageBus(MessageBusPort):
                 yield await queue.get()
 
         return _iter()
+
+    async def ack(self, message: AgentMessage) -> None:
+        # No-op: the queue's get() already removes the item.
+        return None

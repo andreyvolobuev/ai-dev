@@ -47,8 +47,11 @@ class _SpyBus(MessageBusPort):
     async def publish(self, message: AgentMessage) -> None:
         self.published.append(message)
 
-    def subscribe(self, agent_key: str) -> AsyncIterator[AgentMessage]:  # pragma: no cover
+    async def subscribe(self, agent_key: str) -> AsyncIterator[AgentMessage]:  # pragma: no cover
         raise NotImplementedError
+
+    async def ack(self, message: AgentMessage) -> None:  # pragma: no cover
+        return None
 
 
 def _cfg() -> AppConfig:

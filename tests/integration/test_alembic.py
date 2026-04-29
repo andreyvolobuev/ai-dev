@@ -27,6 +27,7 @@ _EXPECTED_TABLES = {
     "tasks",
     "merge_requests",
     "agent_messages",
+    "bus_subscriptions",
     "plans",
     "mr_history",
     "analyst_conversation_steps",

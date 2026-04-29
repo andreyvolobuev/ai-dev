@@ -95,3 +95,92 @@ async def test_handler_exception_is_logged_not_fatal(
 
     assert runner.stats.failed == 1
     assert runner.is_running is False
+
+
+# --- ack-after-success protocol -----------------------------------------
+
+
+class _RecordingBus:
+    """Minimal MessageBusPort substitute that records ack() calls and
+    yields a single fixed message on subscribe. Sufficient for testing
+    the runner's ack contract without booting SQLite."""
+
+    def __init__(self, messages: list[AgentMessage]) -> None:
+        self._messages = list(messages)
+        self.acked: list[AgentMessage] = []
+
+    async def publish(self, message: AgentMessage) -> None:  # pragma: no cover
+        self._messages.append(message)
+
+    async def subscribe(self, agent_key: str):  # type: ignore[no-untyped-def]
+        async def _gen():
+            for m in self._messages:
+                yield m
+            # Block forever after the queued messages are drained — same
+            # shape as the real bus, lets the runner sit idle until stop.
+            while True:
+                await asyncio.sleep(60)
+
+        return _gen()
+
+    async def ack(self, message: AgentMessage) -> None:
+        self.acked.append(message)
+
+
+@pytest.mark.asyncio
+async def test_runner_acks_after_successful_handler() -> None:
+    msg = AgentMessage(
+        id="m1", from_agent="orchestrator", to_agent="analyst",
+        topic="task.discovered", payload={"task_id": "DM-77"},
+    )
+    bus = _RecordingBus([msg])
+
+    async def handler(_msg: AgentMessage) -> None:
+        return
+
+    runner = AgentRunner(
+        agent_key="analyst", message_bus=bus,  # type: ignore[arg-type]
+        handlers={"task.discovered": handler},
+    )
+    task = asyncio.create_task(runner.run_forever())
+    try:
+        for _ in range(40):
+            if bus.acked:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        await runner.stop()
+        await asyncio.wait_for(task, timeout=2)
+
+    assert [a.id for a in bus.acked] == ["m1"]
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_ack_when_handler_raises() -> None:
+    """A failed handler must NOT ack — the lease will then expire and
+    the bus redelivers, preserving at-least-once semantics."""
+    msg = AgentMessage(
+        id="m1", from_agent="orchestrator", to_agent="analyst",
+        topic="task.discovered", payload={},
+    )
+    bus = _RecordingBus([msg])
+
+    async def handler(_msg: AgentMessage) -> None:
+        raise RuntimeError("boom")
+
+    runner = AgentRunner(
+        agent_key="analyst", message_bus=bus,  # type: ignore[arg-type]
+        handlers={"task.discovered": handler},
+    )
+    task = asyncio.create_task(runner.run_forever())
+    try:
+        for _ in range(40):
+            if runner.stats.failed:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        await runner.stop()
+        await asyncio.wait_for(task, timeout=2)
+
+    assert runner.stats.failed == 1
+    assert bus.acked == []
