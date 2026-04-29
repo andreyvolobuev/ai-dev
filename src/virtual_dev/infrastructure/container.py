@@ -55,7 +55,8 @@ from virtual_dev.infrastructure.config import (
     apply_settings_overrides,
     load_config,
 )
-from virtual_dev.infrastructure.db import Base, make_engine, make_session_factory
+from virtual_dev.infrastructure.db import make_engine, make_session_factory
+from virtual_dev.infrastructure.db.migrations import upgrade_to_head
 
 
 @dataclass
@@ -99,10 +100,16 @@ class Container:
     trace: AgentTrace
 
     async def init_db(self) -> None:
-        """Create all tables. Used by ``virtual-dev db init``."""
-        async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        logger.info("DB initialised at {}", self.settings.db_url)
+        """Apply Alembic migrations to head. Used by ``virtual-dev db init``.
+
+        Idempotent on an already-migrated DB. Alembic is sync; we run it
+        in a worker thread so we don't block the event loop. Migrations
+        manage their own connections, so we don't share ``self.engine``.
+        """
+        import asyncio
+
+        await asyncio.to_thread(upgrade_to_head, self.settings.db_url)
+        logger.info("DB migrated to head at {}", self.settings.db_url)
 
     async def dispose(self) -> None:
         await self.engine.dispose()

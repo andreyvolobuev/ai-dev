@@ -30,7 +30,7 @@ def _bootstrap() -> None:
 
 @db_app.command("init")
 def db_init() -> None:
-    """Create SQLite tables."""
+    """Apply Alembic migrations to head. Idempotent on an up-to-date DB."""
     _bootstrap()
     container = build_container()
 
@@ -39,7 +39,7 @@ def db_init() -> None:
         await container.dispose()
 
     asyncio.run(_run())
-    console.print("[green]DB initialised[/green]")
+    console.print("[green]DB migrated to head[/green]")
 
 
 @app.command("run")
