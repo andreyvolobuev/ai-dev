@@ -32,9 +32,10 @@ _SUBMIT_RESPONSE_SCHEMA: dict[str, Any] = {
 
 
 def build(ctx: ToolContext):
-    if ctx.submit_capture is None:
+    if ctx.submit_capture is None or ctx.run_state is None:
         return None
     submit_capture = ctx.submit_capture
+    run_state = ctx.run_state
 
     @tool(
         "submit_response",
@@ -46,8 +47,11 @@ def build(ctx: ToolContext):
         _SUBMIT_RESPONSE_SCHEMA,
     )
     async def _submit(args: dict[str, Any]) -> dict[str, Any]:
+        if run_state.get("terminal"):
+            return wrap_text({"recorded": False, "reason": "already_terminal"})
         submit_capture.clear()
         submit_capture.update(args)
+        run_state["terminal"] = True
         return wrap_text({"recorded": True, "instruction": "Decision recorded."})
 
     return _submit

@@ -33,9 +33,10 @@ _SUBMIT_MR_SCHEMA: dict[str, Any] = {
 
 
 def build(ctx: ToolContext):
-    if ctx.submit_capture is None:
+    if ctx.submit_capture is None or ctx.run_state is None:
         return None
     submit_capture = ctx.submit_capture
+    run_state = ctx.run_state
 
     @tool(
         "submit_mr",
@@ -47,8 +48,14 @@ def build(ctx: ToolContext):
         _SUBMIT_MR_SCHEMA,
     )
     async def _submit_mr(args: dict[str, Any]) -> dict[str, Any]:
+        # Guard against double-call. A hallucinating model that calls
+        # submit_mr twice would otherwise silently overwrite the first
+        # capture; we treat the first as authoritative.
+        if run_state.get("terminal"):
+            return wrap_text({"recorded": False, "reason": "already_terminal"})
         submit_capture.clear()
         submit_capture.update(args)
+        run_state["terminal"] = True
         return wrap_text({"recorded": True, "instruction": "MR submission recorded."})
 
     return _submit_mr
