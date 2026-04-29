@@ -22,24 +22,23 @@ Merging is manual — this agent never calls ``vcs.merge``.
 
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Literal
+from typing import Literal, Protocol
 
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from virtual_dev.application.agents.devops import _collapse_status
 from virtual_dev.application.agents.orchestrator import (
     TOPIC_MR_APPROVED,
     TOPIC_MR_COMMENT,
     TOPIC_MR_STUCK,
 )
 from virtual_dev.application.services.communicator import CommunicatorService
-from virtual_dev.application.agents.devops import _collapse_status
 from virtual_dev.domain.models.merge_request import MRStatus, ReviewComment
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
 from virtual_dev.domain.ports.vcs import VcsPort
@@ -55,29 +54,18 @@ class CommentClass(str, Enum):
     CHATTER = "chatter"
 
 
-_APPROVAL_KEYWORDS = re.compile(
-    r"(?i)(\blgtm\b|\bapproved?\b|\+1\b|\bship\s?it\b|ready to merge)",
-)
-_CHANGE_REQUEST_KEYWORDS = re.compile(
-    r"\b(change|fix|please\s+(update|change|fix|rename|remove|add)|"
-    r"needs? change|rework|wrong|rewrite|should (not )?be|don't|do not)\b",
-    re.IGNORECASE,
-)
+class CommentClassifier(Protocol):
+    """Classifies a single review-comment body.
 
+    The production implementation lives in
+    ``application/services/review_comment_classifier.py`` and goes
+    through a Haiku call (project rule: classify human text via LLM,
+    never regex). The Protocol exists so tests can pass a deterministic
+    stub without instantiating the real LLM-backed classifier.
+    """
 
-def classify_comment(body: str) -> CommentClass:
-    """Classify a single comment body. Used for logs; agent does not act
-    on the class in Phase 3 (comments are not relayed to Mattermost)."""
-    stripped = body.strip()
-    if not stripped:
-        return CommentClass.CHATTER
-    if _APPROVAL_KEYWORDS.search(stripped):
-        return CommentClass.APPROVAL_HINT
-    if stripped.endswith("?"):
-        return CommentClass.QUESTION
-    if _CHANGE_REQUEST_KEYWORDS.search(stripped):
-        return CommentClass.CHANGE_REQUEST
-    return CommentClass.CHATTER
+    async def classify(self, body: str) -> CommentClass:
+        ...
 
 
 @dataclass
@@ -106,6 +94,7 @@ class ReviewerAgent:
         communicator: CommunicatorService,
         session_factory: async_sessionmaker[AsyncSession],
         config: AppConfig,
+        comment_classifier: CommentClassifier,
         message_bus: MessageBusPort | None = None,
         bot_username: str | None = None,
         # Phase 4: routing of actionable GitLab MR comments through the
@@ -119,6 +108,7 @@ class ReviewerAgent:
         self._communicator = communicator
         self._session_factory = session_factory
         self._config = config
+        self._comment_classifier = comment_classifier
         self._message_bus = message_bus
         self._bot_username = (bot_username or "").strip() or None
         self._responder = responder
@@ -181,7 +171,7 @@ class ReviewerAgent:
         # endpoint; chatter ("nice work") needs no reply.
         actionable_comments: list[ReviewComment] = []
         for comment in new_comments:
-            klass = classify_comment(comment.body)
+            klass = await self._comment_classifier.classify(comment.body)
             logger.info(
                 "Reviewer: new comment on {}!{} from @{} [{}]: {!r}",
                 row.repo_key, row.iid, comment.author_username,
@@ -365,7 +355,8 @@ class ReviewerAgent:
         # Build a "thread" of prior non-system, non-bot comments as
         # context. Convert to ChatMessage shape so ThreadResponder is
         # medium-agnostic.
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
 
         from virtual_dev.application.agents.thread_responder import ResponderAction
         from virtual_dev.domain.models.chat import ChatMessage
@@ -762,4 +753,9 @@ def _aware(dt: datetime | None) -> datetime:
     return dt
 
 
-__all__ = ["ReviewerAgent", "ReviewerTickStats", "CommentClass", "classify_comment"]
+__all__ = [
+    "CommentClass",
+    "CommentClassifier",
+    "ReviewerAgent",
+    "ReviewerTickStats",
+]

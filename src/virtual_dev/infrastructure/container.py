@@ -35,6 +35,9 @@ from virtual_dev.application.services import (
     ResearcherToolkit,
     RulesLoader,
 )
+from virtual_dev.application.services.review_comment_classifier import (
+    ReviewCommentClassifier,
+)
 from virtual_dev.application.services.agent_trace import AgentTrace
 from virtual_dev.application.services.analyst_session_repo import (
     AnalystSessionRepository,
@@ -282,11 +285,16 @@ def build_container(config_dir: Path | str = "config") -> Container:
     # Phase 4: Reviewer also routes actionable GitLab MR comments through
     # the ThreadResponder (and Dev for iterations) so feedback in GitLab
     # gets a response in GitLab, mirroring the MM-thread flow.
+    review_comment_classifier = ReviewCommentClassifier(
+        llm=llm,
+        model=config.agents.models.lightweight,
+    )
     reviewer = ReviewerAgent(
         vcs=vcs,
         communicator=communicator,
         session_factory=session_factory,
         config=config,
+        comment_classifier=review_comment_classifier,
         message_bus=message_bus,
         bot_username=gitlab_bot_username,
         responder=thread_responder,

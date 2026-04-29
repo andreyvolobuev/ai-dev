@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from virtual_dev.application.agents.reviewer import (
     CommentClass,
     ReviewerAgent,
-    classify_comment,
 )
 from virtual_dev.application.services import CommunicatorService, InjectionFilter
 from virtual_dev.domain.models.chat import ChatMessage, ChatUser
@@ -255,6 +254,38 @@ async def _insert_mr(
         return row.id
 
 
+class _StubClassifier:
+    """Deterministic classifier used by the Reviewer-tick tests.
+
+    Mirrors the previous regex semantics closely enough that the
+    existing assertions about which comments become "actionable" still
+    hold. The actual LLM-backed classifier has its own dedicated tests
+    in ``test_review_comment_classifier.py``.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def classify(self, body: str) -> CommentClass:
+        self.calls.append(body)
+        s = body.lower().strip()
+        if not s:
+            return CommentClass.CHATTER
+        approval = ("lgtm", "approved", "approve", "+1", "ship it", "ready to merge")
+        if any(k in s for k in approval):
+            return CommentClass.APPROVAL_HINT
+        change = (
+            "rename", "fix", "please change", "rework", "wrong",
+            "rewrite", "remove ", "should ", "don't", "do not",
+            "исправь", "поправь",
+        )
+        if any(k in s for k in change):
+            return CommentClass.CHANGE_REQUEST
+        if s.endswith("?"):
+            return CommentClass.QUESTION
+        return CommentClass.CHATTER
+
+
 def _agent(
     vcs: VcsPort,
     communicator: CommunicatorService,
@@ -266,30 +297,41 @@ def _agent(
         communicator=communicator,
         session_factory=session_factory,
         config=config,
+        comment_classifier=_StubClassifier(),
         bot_username="virtual-dev",
     )
 
 
-# --- classify_comment ---------------------------------------------------
+@pytest.mark.asyncio
+async def test_reviewer_routes_classification_through_injected_classifier(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The agent must call its injected classifier for every new comment
+    — proves the regex helper is gone and there's no direct fallback."""
+    await _insert_mr(session_factory, last_activity_at=datetime.now(timezone.utc))
+    comments = [
+        ReviewComment(id="c-1", mr_id="42", author_username="virtual-dev", body="MR opened"),
+        ReviewComment(id="c-2", mr_id="42", author_username="alice", body="please rename foo"),
+        ReviewComment(id="c-3", mr_id="42", author_username="bob", body="LGTM"),
+    ]
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    classifier = _StubClassifier()
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        comment_classifier=classifier,
+        bot_username="virtual-dev",
+    )
+    await agent.tick()
 
-
-def test_classify_approval_variants() -> None:
-    for body in ("LGTM", "lgtm!", "approved", "+1", "approve", "Ship it"):
-        assert classify_comment(body) == CommentClass.APPROVAL_HINT, body
-
-
-def test_classify_change_request() -> None:
-    assert classify_comment("please change the name of this func") == CommentClass.CHANGE_REQUEST
-    assert classify_comment("wrong return type here") == CommentClass.CHANGE_REQUEST
-
-
-def test_classify_question() -> None:
-    assert classify_comment("why are we doing it this way?") == CommentClass.QUESTION
-
-
-def test_classify_chatter() -> None:
-    assert classify_comment("nice work!") == CommentClass.CHATTER
-    assert classify_comment("") == CommentClass.CHATTER
+    # virtual-dev's own comment is filtered before classification; the
+    # remaining two human comments must hit the classifier.
+    assert classifier.calls == ["please rename foo", "LGTM"]
 
 
 # --- ReviewerAgent.tick -------------------------------------------------
