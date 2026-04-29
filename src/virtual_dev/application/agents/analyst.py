@@ -179,7 +179,15 @@ class AnalystAgent:
         # Run-scoped flags to enforce one-ASK-per-run (otherwise the
         # agent can stack asks + submit_plan in the same turn,
         # bypassing the "end your turn after ask" rule).
-        run_state: dict[str, Any] = {"ask_dispatched": False, "terminal": False}
+        allowed_handles, allowed_emails = self._build_dm_whitelist(
+            inp.task_row, inp.history,
+        )
+        run_state: dict[str, Any] = {
+            "ask_dispatched": False,
+            "terminal": False,
+            "allowed_dm_handles": allowed_handles,
+            "allowed_dm_emails": allowed_emails,
+        }
 
         # Build tools first so the catalog (auto-discovered list of
         # ``tools/<file>.py`` modules) can be inlined into the system
@@ -481,6 +489,54 @@ class AnalystAgent:
         if len(body) > 3000:
             body = body[:3000] + "\n[truncated]"
         return head + "\n" + body
+
+    def _build_dm_whitelist(
+        self,
+        task_row: Any,
+        history: Sequence[ConversationStep],
+    ) -> tuple[set[str], set[str]]:
+        """Compute who the analyst is allowed to DM this run.
+
+        Sources:
+
+        * the ticket's reporter — typically a username, sometimes an
+          email; we feed both into their respective sets.
+        * the configured escalation contact (``escalation.mattermost_user``).
+        * every prior ``BOT_ASKED`` step's target — supports follow-up
+          DMs to people already pulled into this conversation.
+
+        The empty-result case is intentional: if the ticket has no
+        reporter and there's no escalation user, ``dm_user`` will
+        refuse, and the analyst has to escalate via ``stuck`` /
+        ``blocked`` instead.
+        """
+        handles: set[str] = set()
+        emails: set[str] = set()
+
+        reporter = (getattr(task_row, "reporter_id", None) or "").strip().lstrip("@")
+        if reporter:
+            if "@" in reporter:
+                emails.add(reporter.lower())
+                handles.add(reporter.split("@", 1)[0].lower())
+            else:
+                handles.add(reporter.lower())
+
+        esc = (self._config.agents.escalation.mattermost_user or "").strip().lstrip("@")
+        if esc and esc != "your.name":
+            handles.add(esc.lower())
+
+        for step in history:
+            if step.kind != ConversationStepKind.BOT_ASKED:
+                continue
+            meta = step.metadata or {}
+            target_handle = (meta.get("target_username") or "").strip().lstrip("@")
+            if target_handle:
+                handles.add(target_handle.lower())
+            target_email = (meta.get("target_email") or "").strip()
+            if target_email:
+                emails.add(target_email.lower())
+
+        return handles, emails
 
     # --- MCP server: tools/ auto-discovery + filesystem ---
 

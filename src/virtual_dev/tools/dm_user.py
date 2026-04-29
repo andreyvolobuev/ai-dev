@@ -68,6 +68,33 @@ def build(ctx: ToolContext):
             return wrap_text({"sent": False, "reason": "empty_message"})
         if not handle and not email:
             return wrap_text({"sent": False, "reason": "missing_target"})
+
+        # Destination whitelist. Defends against prompt-injection
+        # ("ask @ceo about priority") inside a ticket steering the
+        # analyst into DMing arbitrary people. Allowed: ticket
+        # reporter, configured escalation contact, anyone the analyst
+        # has DMed in this conversation already. Empty whitelist =
+        # refuse everything (safe default for misconfigured runs).
+        allowed_handles = {
+            h.lower() for h in (run_state.get("allowed_dm_handles") or set())
+        }
+        allowed_emails = {
+            e.lower() for e in (run_state.get("allowed_dm_emails") or set())
+        }
+        handle_ok = handle is not None and handle.lower() in allowed_handles
+        email_ok = email is not None and email.lower() in allowed_emails
+        if not (handle_ok or email_ok):
+            return wrap_text({
+                "sent": False,
+                "reason": "destination_not_allowed",
+                "hint": (
+                    "dm_user accepts only: the ticket reporter, the "
+                    "team's escalation contact, or someone you've "
+                    "already DMed in this conversation. Re-read the "
+                    "ticket for the reporter; do not guess."
+                ),
+            })
+
         uid = await communicator.resolve_user_id(username=handle, email=email)
         if uid is None:
             label = handle or email or ""
