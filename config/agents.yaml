@@ -43,20 +43,17 @@ working_hours:
   end_hour: 20
   weekdays_only: true
 
-# Настройки по отдельным агентам.
+# Настройки по отдельным агентам. Только те ключи, которые код реально
+# читает: `analyst`, `developer`, `communicator`, `reviewer`. Если
+# нужен override другого агента — сначала проплямбь его в Container,
+# потом добавляй сюда (иначе ключ будет тихо игнорироваться).
 agents:
-  orchestrator:
-    model: default
-
   analyst:
     model: default
     # Анализ — разведка в репе: grep → read_file → снова grep ... + финальный
     # submit_plan. На реальном репо уходит 20–30 turns. 15 было мало — CLI
     # валился с exit 1 на `stop=tool_use`, не дав дойти до submit_plan.
     max_iterations_per_task: 40
-
-  researcher:
-    model: default
 
   communicator:
     model: lightweight  # мелкие сообщения, Haiku справится
@@ -67,22 +64,10 @@ agents:
     max_iterations_per_task: 80    # coding + правки по тестам — turns быстро уходят
 
   reviewer:
-    model: default
-
-  qa:
-    model: default
-
-  devops:
-    model: default
-
-  # Phase 3.9 — goal-driven clarification.
-  # Один агент-планировщик решает каждый шаг: задать вопрос
-  # (с заново сформулированным текстом), достичь цели, эскалировать,
-  # сдаться, подождать. Имеет Read/Grep + Researcher MCP +
-  # lookup_chat_user — для self-research до DM-инга людей.
-  clarification_planner:
-    model: default
-    max_iterations_per_task: 20
+    # Reviewer классифицирует MR-комменты через Haiku (Stage 6) — этот
+    # ключ читается, в отличие от orchestrator/researcher/qa/devops,
+    # где модель не используется напрямую.
+    model: lightweight
 
 # Ревью-политика.
 review_policy:
@@ -100,21 +85,14 @@ pipeline_policy:
 escalation:
   mattermost_user: ""  # твой MM-хендл — переопредели в config/local.yaml (gitignored)
 
-# Параметры цикла уточнений (Phase 3.9, goal-driven).
+# Параметры цикла уточнений (clarification flow на стороне analyst).
 # coalesce_window_seconds: сколько ждать «тишины» перед вызовом
-#   планировщика на собранных фрагментах ответа. Человек пишет
-#   несколько сообщений подряд — мы дёргаем LLM один раз, не на каждом.
+#   аналиста на собранных фрагментах ответа. Человек пишет несколько
+#   сообщений подряд — мы дёргаем LLM один раз, не на каждом.
 # max_planner_calls_per_goal: circuit breaker — после N вызовов
-#   планировщика без успеха цели мы её эскалируем.
-# max_goal_age_hours: hard deadline (overrides всё остальное).
-# send_retry_max: сколько раз ретраить DM, который Communicator
-#   отказался отправлять (rate-limit / нерабочее время).
-# replanning_stuck_after_minutes: если goal сидит в REPLANNING дольше
-#   — sweep'ер реверсит обратно в READY_TO_REPLAN (планировщик упал).
+#   аналиста без READY-плана эскалируем тимлиду.
+# max_goal_age_hours: hard deadline для всей задачи.
 clarification:
   coalesce_window_seconds: 600
-  poll_interval_seconds: 60
   max_planner_calls_per_goal: 8
   max_goal_age_hours: 48
-  send_retry_max: 5
-  replanning_stuck_after_minutes: 10
