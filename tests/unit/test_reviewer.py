@@ -598,6 +598,112 @@ async def test_escalation_fires_when_mr_is_stale(
 
 
 @pytest.mark.asyncio
+async def test_suppressed_escalation_dm_does_not_lock_in_cooldown(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Outside-hours DM is dropped by Communicator. Reviewer used to
+    still stamp last_escalation_at, so the next escalate_after_hours
+    window blocked retries — escalations issued at 23:00 silently
+    vanished. The fix: only persist cooldown when sent==True."""
+    from virtual_dev.application.services.communicator import SendOutcome
+
+    stale = datetime.now(timezone.utc) - timedelta(hours=30)
+    mr_id = await _insert_mr(session_factory, last_activity_at=stale)
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+
+    class _SuppressingCommunicator:
+        def __init__(self) -> None:
+            self.dm_calls: list[tuple[str, str]] = []
+            self.channel_calls: list[tuple[str, str]] = []
+
+        async def send_dm(self, user_id: str, text: str) -> SendOutcome:
+            self.dm_calls.append((user_id, text))
+            return SendOutcome(sent=False, skip_reason="outside_working_hours")
+
+        async def send_channel(
+            self, channel_id: str, text: str, *,
+            thread_root_id: str | None = None,
+        ) -> SendOutcome:
+            self.channel_calls.append((channel_id, text))
+            return SendOutcome(sent=False, skip_reason="outside_working_hours")
+
+        async def resolve_user_id(self, *, username: str) -> str | None:
+            return f"uid-{username}"
+
+    communicator = _SuppressingCommunicator()
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator,  # type: ignore[arg-type]
+        session_factory=session_factory, config=_cfg(),
+        comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev",
+    )
+    await agent.tick()
+
+    # The DM attempt was made and suppressed.
+    assert len(communicator.dm_calls) == 1
+    # last_escalation_at must NOT have been stamped — otherwise the
+    # bot would silently sit out until escalate_after_hours pass again.
+    async with session_factory() as session:
+        row = (await session.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+    assert row.last_escalation_at is None
+
+
+@pytest.mark.asyncio
+async def test_suppressed_ping_does_not_set_ping_reviewers_at(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Same idea for the channel-ping path: a suppressed channel post
+    must not flip ping_reviewers_at, otherwise the next tick treats
+    the MR as already-pinged and stays silent until escalation."""
+    from virtual_dev.application.services.communicator import SendOutcome
+
+    idle = datetime.now(timezone.utc) - timedelta(hours=5)
+    mr_id = await _insert_mr(session_factory, last_activity_at=idle)
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+
+    class _SuppressingCommunicator:
+        def __init__(self) -> None:
+            self.channel_calls: list[tuple[str, str]] = []
+
+        async def send_dm(self, user_id: str, text: str) -> SendOutcome:
+            return SendOutcome(sent=True)
+
+        async def send_channel(
+            self, channel_id: str, text: str, *,
+            thread_root_id: str | None = None,
+        ) -> SendOutcome:
+            self.channel_calls.append((channel_id, text))
+            return SendOutcome(sent=False, skip_reason="rate_limited")
+
+        async def resolve_user_id(self, *, username: str) -> str | None:
+            return None
+
+    communicator = _SuppressingCommunicator()
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator,  # type: ignore[arg-type]
+        session_factory=session_factory, config=_cfg(),
+        comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev",
+    )
+    await agent.tick()
+
+    assert len(communicator.channel_calls) == 1
+    async with session_factory() as session:
+        row = (await session.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+    assert row.ping_reviewers_at is None
+
+
+@pytest.mark.asyncio
 async def test_ping_fires_before_escalation(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

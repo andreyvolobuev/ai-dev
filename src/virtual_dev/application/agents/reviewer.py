@@ -560,42 +560,55 @@ class ReviewerAgent:
                 >= timedelta(hours=policy.escalate_after_hours)
             ):
                 user = await self._resolve_escalation_user()
-                if user:
-                    text = self._render_template(
-                        self._config.notifications.mattermost.escalation_dm,
-                        repo_key=row.repo_key, iid=row.iid,
-                        title=row.title, web_url=row.web_url,
-                        idle_hours=int(idle.total_seconds() / 3600),
-                    )
-                    await self._communicator.send_dm(user, text)
-                    stats.escalations_sent += 1
-                    if self._message_bus is not None:
-                        await self._message_bus.publish(AgentMessage(
-                            id=uuid.uuid4().hex,
-                            from_agent=self.agent_key,
-                            to_agent=self.agent_key,
-                            topic=TOPIC_MR_STUCK,
-                            payload={
-                                "repo_key": row.repo_key, "iid": row.iid,
-                                "idle_hours": idle.total_seconds() / 3600,
-                            },
-                        ))
+                if not user:
+                    return None
+                text = self._render_template(
+                    self._config.notifications.mattermost.escalation_dm,
+                    repo_key=row.repo_key, iid=row.iid,
+                    title=row.title, web_url=row.web_url,
+                    idle_hours=int(idle.total_seconds() / 3600),
+                )
+                outcome = await self._communicator.send_dm(user, text)
+                # Outside-hours / rate-limit / send-error → don't claim
+                # the escalation slot. Caller skips persisting
+                # last_escalation_at, so the next tick can retry once
+                # the gate clears.
+                if not outcome.sent:
+                    return None
+                stats.escalations_sent += 1
+                if self._message_bus is not None:
+                    await self._message_bus.publish(AgentMessage(
+                        id=uuid.uuid4().hex,
+                        from_agent=self.agent_key,
+                        to_agent=self.agent_key,
+                        topic=TOPIC_MR_STUCK,
+                        payload={
+                            "repo_key": row.repo_key, "iid": row.iid,
+                            "idle_hours": idle.total_seconds() / 3600,
+                        },
+                    ))
                 return "escalation"
             return None
 
         if idle >= timedelta(hours=policy.ping_reviewers_after_hours):
             if row.ping_reviewers_at is None:
                 channel_id = self._team_channel_for(row.repo_key)
+                if not channel_id:
+                    return None
                 text = self._render_template(
                     self._config.notifications.mattermost.stale_ping,
                     repo_key=row.repo_key, iid=row.iid,
                     title=row.title, web_url=row.web_url,
                     idle_hours=int(idle.total_seconds() / 3600),
                 )
-                if channel_id:
-                    await self._communicator.send_channel(channel_id, text)
-                    stats.pings_sent += 1
-                    return "ping"
+                outcome = await self._communicator.send_channel(channel_id, text)
+                # Same idea as escalation: a suppressed channel post
+                # must not stamp ping_reviewers_at; otherwise the next
+                # tick sees the MR as already-pinged and stays silent.
+                if not outcome.sent:
+                    return None
+                stats.pings_sent += 1
+                return "ping"
 
         return None
 
