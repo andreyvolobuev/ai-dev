@@ -40,11 +40,24 @@ from virtual_dev.infrastructure.db.base import session_scope
 class _StubVcs(VcsPort):
     def __init__(self, jobs: dict[tuple[str, int], list[PipelineJob]]) -> None:
         self._jobs = jobs
+        self.log_calls: list[int] = []
 
     async def get_latest_pipeline_jobs(
         self, repo_key: str, iid: int, *, log_tail_lines: int = 80,
     ) -> list[PipelineJob]:
-        return list(self._jobs.get((repo_key, iid), []))
+        self.log_calls.append(log_tail_lines)
+        jobs = list(self._jobs.get((repo_key, iid), []))
+        # When the caller asked for "no logs", return jobs with logs
+        # stripped — mirrors what GitLab actually does (no extra fetch).
+        if log_tail_lines == 0:
+            return [
+                PipelineJob(
+                    id=j.id, name=j.name, stage=j.stage, status=j.status,
+                    web_url=j.web_url, log_excerpt="",
+                )
+                for j in jobs
+            ]
+        return jobs
 
     # everything else: not used
     async def ensure_clone(self, repo_key: str) -> str: raise NotImplementedError  # pragma: no cover
@@ -285,6 +298,55 @@ async def test_green_pipeline_resets_counter_and_escalation(
         assert row.pipeline_status == "success"
         assert row.pipeline_autofix_attempts == 0
         assert row.pipeline_autofix_escalated is False
+
+
+@pytest.mark.asyncio
+async def test_devops_skips_log_fetch_for_green_pipeline(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """For green / pending / running pipelines we don't need the
+    job logs — fetching them per tick on every open MR adds up to
+    megabytes of wasted traffic and RAM. Only the failure path needs
+    the full log for auto-fix feedback."""
+    await _insert_mr(session_factory)
+    vcs = _StubVcs({("bellingshausen", 42): [_job("tests", "success")]})
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = DevOpsAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        dev_agents={"bellingshausen": _ScriptedDev()},  # type: ignore[dict-item]
+    )
+
+    await agent.tick()
+
+    # Exactly one call, with log_tail_lines=0 (status-only).
+    assert vcs.log_calls == [0]
+
+
+@pytest.mark.asyncio
+async def test_devops_fetches_full_logs_only_on_failed_pipeline(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Failed pipeline → second fetch with log_tail_lines=-1 to feed
+    the autofix dev agent. Status-classification still goes through
+    the cheap log_tail_lines=0 call first."""
+    await _insert_mr(session_factory, pipeline_autofix_attempts=0)
+    vcs = _StubVcs({
+        ("bellingshausen", 42): [_job("tests", "failed", log="boom")],
+    })
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = DevOpsAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        dev_agents={"bellingshausen": _ScriptedDev()},  # type: ignore[dict-item]
+    )
+
+    await agent.tick()
+
+    # Two calls: cheap status fetch, then full-log fetch for autofix.
+    assert vcs.log_calls == [0, -1]
 
 
 @pytest.mark.asyncio

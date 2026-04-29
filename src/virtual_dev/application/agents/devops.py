@@ -96,11 +96,11 @@ class DevOpsAgent:
 
     async def _check_one(self, row: MergeRequestRow, stats: DevOpsTickStats) -> None:
         assert self._vcs is not None
-        # log_tail_lines=-1 → full untruncated log per failing job; auto-fix
-        # needs the whole traceback (not just trailing frames) to find the
-        # real cause. (=0 means "skip log fetch entirely" — used by Reviewer.)
+        # First pass: status only. Fetching full logs for every open
+        # MR every tick adds up to megabytes of GitLab traffic + RAM.
+        # We only need the full log on the auto-fix path below.
         jobs = list(await self._vcs.get_latest_pipeline_jobs(
-            row.repo_key, row.iid, log_tail_lines=-1,
+            row.repo_key, row.iid, log_tail_lines=0,
         ))
         pipeline_status = _collapse_status(jobs)
 
@@ -121,6 +121,11 @@ class DevOpsAgent:
 
         # --- pipeline is red ---
         stats.failures_detected += 1
+        # Now we actually need the logs — auto-fix feedback wants the
+        # full traceback. Re-fetch once with log_tail_lines=-1.
+        jobs = list(await self._vcs.get_latest_pipeline_jobs(
+            row.repo_key, row.iid, log_tail_lines=-1,
+        ))
         attempts = row.pipeline_autofix_attempts
         max_attempts = self._config.agents.pipeline_policy.max_autofix_attempts
 
