@@ -13,6 +13,7 @@ norm column so ranking does not need to re-normalise on every query. The
 
 from __future__ import annotations
 
+import asyncio
 import struct
 from collections.abc import Sequence
 
@@ -48,7 +49,10 @@ class LocalMrHistory(MrHistoryPort):
             return 0
 
         texts = [_render_mr_text(mr.title, mr.description) for mr in mrs]
-        embeddings = self._embedder.embed(texts)
+        # Embedder is synchronous and CPU-bound — for 500 MRs it
+        # blocks the event loop for seconds. Hand it off to a worker
+        # thread so concurrent agents keep ticking.
+        embeddings = await asyncio.to_thread(self._embedder.embed, texts)
         if len(embeddings) != len(mrs):
             raise RuntimeError(
                 f"Embedder returned {len(embeddings)} vectors for {len(mrs)} inputs"
@@ -76,15 +80,22 @@ class LocalMrHistory(MrHistoryPort):
                     delete(MrHistoryRow).where(MrHistoryRow.id.in_(stale_ids))
                 )
 
+            # Batch fetch every existing row for this corpus in one
+            # query — N+1 was a measurable cost for large repos
+            # (500 MRs = 500 round trips with the previous loop-SELECT).
+            iids = [mr.iid for mr in mrs]
+            existing_rows = (await session.execute(
+                select(MrHistoryRow).where(
+                    MrHistoryRow.repo_key == repo_key,
+                    MrHistoryRow.iid.in_(iids),
+                )
+            )).scalars().all()
+            existing_by_iid = {row.iid: row for row in existing_rows}
+
             written = 0
             for mr, vec in zip(mrs, embeddings, strict=True):
                 blob, norm = _pack_vector(vec)
-                existing = (await session.execute(
-                    select(MrHistoryRow).where(
-                        MrHistoryRow.repo_key == repo_key,
-                        MrHistoryRow.iid == mr.iid,
-                    )
-                )).scalar_one_or_none()
+                existing = existing_by_iid.get(mr.iid)
                 if existing is None:
                     session.add(MrHistoryRow(
                         repo_key=repo_key,
@@ -119,7 +130,7 @@ class LocalMrHistory(MrHistoryPort):
     ) -> Sequence[MrHistoryHit]:
         if not query.strip():
             return []
-        query_vec = self._embedder.embed([query])[0]
+        query_vec = (await asyncio.to_thread(self._embedder.embed, [query]))[0]
         model_name = self._embedder.model_name
 
         async with self._session_factory() as session:

@@ -171,6 +171,45 @@ async def test_refresh_is_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_refresh_existing_lookup_is_a_single_query(
+    session_factory: async_sessionmaker[AsyncSession],
+    engine,  # type: ignore[no-untyped-def]
+) -> None:
+    """N+1 guard. The previous refresh did one SELECT per MR to look up
+    the existing row, so 500 MRs = 500 round trips. Now there must be
+    exactly one IN-query against mr_history regardless of corpus size."""
+    from sqlalchemy import event
+
+    mrs = [_mr(i, f"MR-{i}") for i in range(1, 11)]
+    vcs = _FakeVcsWithMergedMrs(mrs)
+    idx = LocalMrHistory(session_factory=session_factory, vcs=vcs, embedder=_WordBagEmbedder())
+    # Seed once so the second refresh hits the "existing" branch.
+    await idx.refresh("demo")
+
+    statements: list[str] = []
+
+    @event.listens_for(engine.sync_engine, "before_cursor_execute")
+    def _record(_conn, _cur, statement, _params, _ctx, _emany):  # type: ignore[no-untyped-def]
+        statements.append(statement)
+
+    try:
+        await idx.refresh("demo")
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _record)
+
+    select_existing = [
+        s for s in statements
+        if "FROM mr_history" in s and "SELECT" in s and "WHERE" in s
+    ]
+    # One stale-rows SELECT + one batched existing-rows SELECT.
+    # The bug-form did N existing-row SELECTs (one per MR).
+    assert len(select_existing) <= 2, (
+        f"expected ≤2 SELECTs against mr_history, got {len(select_existing)}: "
+        f"{select_existing}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_refresh_drops_rows_from_old_model(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
