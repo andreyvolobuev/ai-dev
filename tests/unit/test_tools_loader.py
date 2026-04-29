@@ -188,3 +188,27 @@ def test_render_tools_catalog_groups_and_lists(
     assert "* `alpha` — Reads things from somewhere." in catalog
     assert "* `beta` — Writes things back." in catalog
     assert catalog.endswith("**Builtins**: foo, bar.")
+
+
+def test_one_broken_tool_does_not_tank_the_others(
+    fake_pkg: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A module that raises on import (or whose ``build()`` raises)
+    should be logged and skipped — the remaining tools still load."""
+    monkeypatch.setattr(
+        "virtual_dev.tools._loader._iter_module_names",
+        lambda pkg: ["broken_import", "broken_build", "ok"],
+    )
+
+    # Install a module that raises if anyone touches it. We can't
+    # actually raise on import via sys.modules, so route it through a
+    # build() that re-raises.
+    def boom_build(ctx: ToolContext):
+        raise RuntimeError("optional dep missing")
+
+    _install_module(fake_pkg, "broken_import", build=boom_build)
+    _install_module(fake_pkg, "broken_build", build=boom_build)
+    _install_module(fake_pkg, "ok", build=lambda ctx: _make_tool("survivor"))
+
+    groups = discover_tools(ToolContext(), package_name=fake_pkg)
+    assert [t.name for t in groups["analyst"]] == ["survivor"]

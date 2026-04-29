@@ -23,6 +23,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server
 from claude_agent_sdk.types import McpSdkServerConfig  # type: ignore[attr-defined]
+from loguru import logger
 
 from virtual_dev.tools._context import ToolContext
 
@@ -57,17 +58,31 @@ def discover_tools(
     package = importlib.import_module(package_name)
     groups: dict[str, list[Any]] = {}
     for mod_name in _iter_module_names(package):
-        full_name = f"{package_name}.{mod_name}"
         if mod_name.startswith("_"):
+            # Defense in depth: _iter_module_names already filters, but
+            # tests monkeypatch it and the docstring guarantees this.
             continue
+        full_name = f"{package_name}.{mod_name}"
         try:
             mod = importlib.import_module(full_name)
-        except Exception:  # pragma: no cover  — surface import errors loudly
-            raise
+        except Exception:
+            # One broken tool module shouldn't tank the whole agent. Log
+            # the failure prominently — operator will see it on startup —
+            # and keep loading the rest.
+            logger.exception(
+                "Tool loader: failed to import {!r}; skipping", full_name,
+            )
+            continue
         builder: Callable[[ToolContext], Any] | None = getattr(mod, "build", None)
         if builder is None:
             continue
-        tool_obj = builder(ctx)
+        try:
+            tool_obj = builder(ctx)
+        except Exception:
+            logger.exception(
+                "Tool loader: build() raised in {!r}; skipping", full_name,
+            )
+            continue
         if tool_obj is None:
             continue
         group = getattr(mod, "TOOL_GROUP", _DEFAULT_GROUP)
