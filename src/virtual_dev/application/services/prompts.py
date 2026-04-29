@@ -63,14 +63,30 @@ class PromptsLoader:
         """Like :meth:`load` but applies ``str.format`` with the given vars.
 
         Uses a tolerant formatter so unknown placeholders ({foo}) survive
-        as literal text instead of crashing.
+        as literal text instead of crashing — and so a stray ``{`` in
+        the prompt body (e.g. a JSON example) doesn't silently fall back
+        to RAW text with unsubstituted ``{untrusted_warning}``, which
+        would disable injection-warning text in the system prompt.
         """
         template = self.load(name, fallback=fallback)
         try:
-            return template.format(**kwargs)
-        except (KeyError, IndexError) as exc:
+            return template.format_map(_TolerantMap(kwargs))
+        except (ValueError, IndexError) as exc:
+            # ValueError covers malformed format-spec ({:!}); IndexError
+            # covers positional refs we can't resolve. Both are operator
+            # typos, not missing kwargs (which _TolerantMap absorbs).
             logger.warning(
                 "PromptsLoader: format failed for {!r}: {} — returning raw text",
                 name, exc,
             )
             return template
+
+
+class _TolerantMap(dict[str, str]):
+    """``format_map`` lookup that returns ``{key}`` unchanged for unknown
+    keys instead of raising KeyError. Lets a prompt file contain literal
+    ``{anything}`` (JSON examples, inline curly placeholders) without
+    crashing the format step or losing the substitutions we DO have."""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
