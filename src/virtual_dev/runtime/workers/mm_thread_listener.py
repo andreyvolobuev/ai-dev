@@ -201,8 +201,14 @@ class MmThreadListener:
                     task.cancel()
                     try:
                         await task
-                    except (asyncio.CancelledError, Exception):
+                    except asyncio.CancelledError:
                         pass
+                    except Exception:
+                        # Real bugs in subscribe()/cleanup must surface,
+                        # not vanish with the cancelled marker.
+                        logger.exception(
+                            "MmThreadListener: cleanup of inflight task raised",
+                        )
 
     # ----------------------------------------------------- catch-up tick
 

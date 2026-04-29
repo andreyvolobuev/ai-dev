@@ -285,3 +285,54 @@ async def test_green_pipeline_resets_counter_and_escalation(
         assert row.pipeline_status == "success"
         assert row.pipeline_autofix_attempts == 0
         assert row.pipeline_autofix_escalated is False
+
+
+@pytest.mark.asyncio
+async def test_inflight_autofix_task_is_tracked_and_released(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The autofix coroutine is fire-and-forget: previously the
+    asyncio.Task ref was discarded, so a long-running iteration could
+    be GC'd mid-flight (Python warns, behaviour is undefined). The
+    agent now keeps a strong ref in ``_inflight_tasks`` until the task
+    completes; an add_done_callback removes it."""
+    block = asyncio.Event()
+
+    class _BlockingDev:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def handle_iteration(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append(kwargs)
+            await block.wait()
+
+    await _insert_mr(session_factory, pipeline_autofix_attempts=0)
+    vcs = _StubVcs({("bellingshausen", 42): [_job("tests", "failed", log="oops")]})
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _BlockingDev()
+    agent = DevOpsAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        dev_agents={"bellingshausen": dev},  # type: ignore[dict-item]
+    )
+
+    await agent.tick()
+
+    # Give the loop a chance to start the autofix task — but it's
+    # blocked on the event, so it sits in inflight.
+    for _ in range(20):
+        if len(dev.calls) == 1:
+            break
+        await asyncio.sleep(0.01)
+    assert len(agent._inflight_tasks) == 1, (
+        f"expected one inflight autofix task, got {agent._inflight_tasks!r}"
+    )
+
+    # Release; the done-callback should drain.
+    block.set()
+    for _ in range(50):
+        if not agent._inflight_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert agent._inflight_tasks == set()

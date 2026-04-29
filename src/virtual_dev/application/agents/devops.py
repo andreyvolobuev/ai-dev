@@ -70,6 +70,11 @@ class DevOpsAgent:
         # the same iteration twice. Cleared by the background task once
         # it finishes (success or failure).
         self._inflight_autofix: set[tuple[str, int]] = set()
+        # Strong refs to the asyncio Tasks we spawn. Without these
+        # Python's GC can collect a fire-and-forget task while it's
+        # still running; the docs explicitly warn about this. The
+        # done-callback discards on completion so this stays bounded.
+        self._inflight_tasks: set[asyncio.Task[None]] = set()
 
     async def tick(self) -> DevOpsTickStats:
         stats = DevOpsTickStats()
@@ -161,10 +166,12 @@ class DevOpsAgent:
         # Fire-and-forget: a single iteration can take minutes; we don't
         # want the poller stalled. The task callback releases the inflight
         # marker and increments the attempts counter.
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._run_autofix(row, jobs),
             name=f"devops-autofix-{row.repo_key}-{row.iid}",
         )
+        self._inflight_tasks.add(task)
+        task.add_done_callback(self._inflight_tasks.discard)
         # Also persist that we observed a red status now (don't increment
         # yet — the task will, after dev finishes).
         await self._persist_pipeline_status(row.id, pipeline_status)
