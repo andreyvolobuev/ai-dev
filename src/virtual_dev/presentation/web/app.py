@@ -10,6 +10,7 @@ nothing is coding.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -45,6 +46,46 @@ from virtual_dev.runtime.workers import (
 )
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
+
+
+async def _drain_background_tasks(
+    tasks: list[asyncio.Task[None]], *, timeout: float = 10.0,
+) -> None:
+    """Drain ``tasks`` under a single overall timeout.
+
+    The previous shutdown serialised ``wait_for(task, timeout=5)`` per
+    task — N hung workers blocked deploy for N x 5s. We instead wait on
+    the whole batch: if it doesn't complete inside ``timeout``, cancel
+    survivors and gather again so cancellation actually drains
+    (otherwise asyncio leaks "Task exception was never retrieved"
+    warnings on Ctrl+C).
+
+    Returns once every task is ``done()``. Exceptions inside tasks are
+    swallowed — they're already logged by the worker itself, and the
+    shutdown path can't usefully react.
+    """
+    if not tasks:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=timeout,
+        )
+        return
+    except TimeoutError:
+        pass
+
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    # Second wait absorbs the cancellation flush. Bounded by the same
+    # window — any task ignoring cancel beyond this is wedged hard
+    # enough that we'd rather kill the process than block uvicorn.
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=timeout,
+        )
 
 
 def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI:
@@ -184,22 +225,23 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         try:
             yield
         finally:
-            await orchestrator.stop()
-            await analyst_runner.stop()
-            for runner in dev_runners:
-                await runner.stop()
-            await reviewer_poller.stop()
-            await devops_poller.stop()
-            await coalescer_poller.stop()
+            # Signal everyone to stop, then drain in parallel under a
+            # single timeout — the previous per-task wait_for serialised
+            # shutdown for 5s × N workers.
+            stop_signals = [
+                orchestrator.stop(),
+                analyst_runner.stop(),
+                *(r.stop() for r in dev_runners),
+                reviewer_poller.stop(),
+                devops_poller.stop(),
+                coalescer_poller.stop(),
+            ]
             if mm_listener is not None:
-                await mm_listener.stop()
+                stop_signals.append(mm_listener.stop())
             if mm_catchup_poller is not None:
-                await mm_catchup_poller.stop()
-            for task in background:
-                try:
-                    await asyncio.wait_for(task, timeout=5)
-                except asyncio.TimeoutError:
-                    task.cancel()
+                stop_signals.append(mm_catchup_poller.stop())
+            await asyncio.gather(*stop_signals, return_exceptions=True)
+            await _drain_background_tasks(background, timeout=10.0)
             await container.dispose()
 
     app = FastAPI(title="Virtual Dev", lifespan=lifespan)
