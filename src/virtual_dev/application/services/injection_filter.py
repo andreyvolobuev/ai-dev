@@ -64,6 +64,14 @@ _RED_FLAG_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 # Allowed attribute values on the wrapping tag (sanitised).
 _SAFE_SOURCE_RE = re.compile(r"[^A-Za-z0-9_\-:./ ]")
 
+# Tag-shaped substrings inside untrusted content that we rewrite to a
+# benign form before wrapping, so an attacker can't close the wrapper
+# from the inside (which would turn content back into instructions).
+# Case-insensitive: ``</UNTRUSTED_CONTENT>`` and mixed-case variants
+# must be neutralised too.
+_CLOSE_INNER_RE = re.compile(r"</untrusted_content\s*>", re.IGNORECASE)
+_OPEN_INNER_RE = re.compile(r"<untrusted_content\b", re.IGNORECASE)
+
 
 @dataclass
 class WrappedUntrusted:
@@ -92,9 +100,12 @@ class InjectionFilter:
         original_length = len(text or "")
 
         cleaned = _INVISIBLE_RE.sub("", text or "")
-        # Escape any attempt by the attacker to close the tag from within.
-        cleaned = cleaned.replace("</untrusted_content>", "</untrusted-content>")
-        cleaned = cleaned.replace("<untrusted_content", "<untrusted-content")
+        # Escape any attempt by the attacker to close the tag from
+        # within — case-insensitive, since ``</UNTRUSTED_CONTENT>`` /
+        # mixed-case variants close the tag in the LLM's view just as
+        # well as the lowercase form.
+        cleaned = _CLOSE_INNER_RE.sub("</untrusted-content>", cleaned)
+        cleaned = _OPEN_INNER_RE.sub("<untrusted-content", cleaned)
 
         flags: list[str] = []
         for label, pattern in _RED_FLAG_PATTERNS:

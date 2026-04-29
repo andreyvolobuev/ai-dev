@@ -7,6 +7,7 @@ orchestrator stays fully async.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, cast
@@ -37,17 +38,24 @@ _PRIORITY_MAP: dict[str, TaskPriority] = {
 def _parse_jira_datetime(raw: str | None) -> datetime | None:
     if not raw:
         return None
-    # Jira returns e.g. "2025-03-05T10:20:30.000+0300".
+    # Cloud / modern Jira (>=9): "2025-03-05T10:20:30.000+03:00" / "...Z".
+    # Python 3.11+ fromisoformat handles both directly.
     try:
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
-        # Fall back: strip timezone suffix without colon (2025-03-05T10:20:30.000+0300).
+        pass
+    # Self-hosted Jira < 9: "2025-03-05T10:20:30.000+0300" — same offset,
+    # no colon. Insert one so fromisoformat accepts it. Match the TZ
+    # suffix explicitly so we don't mangle other malformed inputs.
+    m = re.fullmatch(r"(.+?)([+-])(\d{2})(\d{2})", raw)
+    if m:
+        head, sign, hh, mm = m.groups()
         try:
-            head, tz = raw[:-5], raw[-5:]
-            return datetime.fromisoformat(f"{head}{tz[:3]}:{tz[3:]}")
+            return datetime.fromisoformat(f"{head}{sign}{hh}:{mm}")
         except ValueError:
-            logger.warning("could not parse jira datetime: {!r}", raw)
-            return None
+            pass
+    logger.warning("could not parse jira datetime: {!r}", raw)
+    return None
 
 
 class JiraTaskTracker(TaskTrackerPort):
