@@ -78,6 +78,13 @@ class Settings(BaseSettings):
     admin_token: str = ""
 
     log_level: str = Field(default="INFO")
+    # Rotated file sink alongside stderr. Empty disables file logging.
+    # Path is created on demand; rotation is by size, retained for a
+    # week — enough to debug the bot's recent decisions without filling
+    # the disk on a long-running deploy.
+    log_file: str = ""
+    log_file_rotation: str = "20 MB"
+    log_file_retention: str = "7 days"
 
     # --- Deploy-specific overrides (replaces config/local.yaml) ---
     # All deploy-specific values now live in the environment alongside

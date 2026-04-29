@@ -118,3 +118,30 @@ def test_redaction_does_not_mangle_normal_lines() -> None:
     assert "starting orchestrator" in out
     assert "MR !42 opened" in out
     assert "[REDACTED]" not in out  # nothing to redact
+
+
+def test_file_sink_writes_redacted_content(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """When ``log_file`` is configured, lines must be persisted to disk
+    AND go through the same redactor — otherwise the file becomes a
+    secret-leak channel that bypasses stderr filtering."""
+    fake_env = {"JIRA_TOKEN": "jira-FILE-secret-XYZ"}
+    with mock.patch.dict(os.environ, fake_env, clear=False):
+        settings = Settings()
+
+    log_path = tmp_path / "virtual_dev.log"
+    configure_logging(
+        "DEBUG",
+        settings=settings,
+        log_file=str(log_path),
+    )
+    try:
+        logger.info("auth failed: Bearer SHOULD-BE-REDACTED")
+        logger.info("plain token jira-FILE-secret-XYZ leaked")
+    finally:
+        _restore_default_logging()
+
+    text = log_path.read_text(encoding="utf-8")
+    assert "plain token" in text  # message survived
+    assert "SHOULD-BE-REDACTED" not in text
+    assert "jira-FILE-secret-XYZ" not in text
+    assert "[REDACTED]" in text
