@@ -25,7 +25,7 @@ def _bootstrap() -> None:
     from virtual_dev.infrastructure.config import Settings
 
     settings = Settings()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, settings=settings)
 
 
 @db_app.command("init")
