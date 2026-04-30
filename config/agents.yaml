@@ -33,6 +33,7 @@ jira_transitions:
   to_in_progress: "In Progress"
   to_review: "In Review"
   to_testing: "Testing"
+  to_pending: "Waiting For Response"
   to_done: "Closed"
 
 # Рабочие часы для общения в Mattermost (Московское время).
