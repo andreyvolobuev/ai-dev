@@ -35,6 +35,7 @@ from virtual_dev.application.services import (
     ResearcherToolkit,
     RulesLoader,
 )
+from virtual_dev.application.services.health_tracker import HealthTracker
 from virtual_dev.application.services.recovery_service import RecoveryService
 from virtual_dev.application.services.review_comment_classifier import (
     ReviewCommentClassifier,
@@ -105,6 +106,8 @@ class Container:
     # Periodic safety net for tasks stuck in CODING — re-publishes
     # plan.ready when bus redelivery / lease expiry didn't catch them.
     recovery_service: RecoveryService
+    # Per-subsystem last-success timestamps, surfaced via /healthz.
+    health: HealthTracker
 
     async def init_db(self) -> None:
         """Apply Alembic migrations to head. Used by ``virtual-dev db init``.
@@ -305,6 +308,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         llm=llm,
         model=reviewer_model,
     )
+    health = HealthTracker()
     reviewer = ReviewerAgent(
         vcs=vcs,
         communicator=communicator,
@@ -315,6 +319,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         bot_username=gitlab_bot_username,
         responder=thread_responder,
         dev_agents=dict(dev_agents),
+        health=health,
     )
 
     devops = DevOpsAgent(
@@ -358,6 +363,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         analyst_session_repo=analyst_session_repo,
         trace=trace,
         recovery_service=recovery_service,
+        health=health,
     )
 
 

@@ -26,7 +26,10 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
+
+if TYPE_CHECKING:
+    from virtual_dev.application.services.health_tracker import HealthTracker
 
 from loguru import logger
 from sqlalchemy import select
@@ -103,6 +106,7 @@ class ReviewerAgent:
         # back to the previous "observe-only" behaviour.
         responder: object | None = None,   # ThreadResponderAgent (avoid circular import)
         dev_agents: dict[str, object] | None = None,
+        health: "HealthTracker | None" = None,
     ) -> None:
         self._vcs = vcs
         self._communicator = communicator
@@ -113,6 +117,7 @@ class ReviewerAgent:
         self._bot_username = (bot_username or "").strip() or None
         self._responder = responder
         self._dev_agents = dev_agents or {}
+        self._health = health
 
     # --- Entry point (called by PollerWorker) ---
 
@@ -130,6 +135,12 @@ class ReviewerAgent:
             except Exception:
                 logger.exception("Reviewer: MR {}!{} check failed", row.repo_key, row.iid)
 
+        # Even with zero open MRs the loop completed without raising
+        # — that proves we reached the DB and could iterate. Mark
+        # GitLab as healthy: any per-MR call failure inside the loop
+        # is logged but doesn't disqualify the tick.
+        if self._health is not None:
+            self._health.mark_success("gitlab")
         return stats
 
     # --- Per-MR logic ---

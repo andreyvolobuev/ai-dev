@@ -96,6 +96,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         session_factory=container.session_factory,
         config=container.config,
         message_bus=container.message_bus,
+        health=container.health,
     )
 
     analyst = AnalystAgent(
@@ -426,6 +427,21 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
-        return {"status": "ok", **_status_block()}
+        # ``subsystems`` shows last-success per integration: when did
+        # we last fetch from Jira / talk to GitLab. Operator looks
+        # here to tell "alive but blind" from "fully healthy".
+        snap = container.health.snapshot()
+        subsystems = {
+            name: {
+                "last_success_at": s["last_success_at"].isoformat(),
+                "seconds_since": s["seconds_since"],
+            }
+            for name, s in snap.items()
+        }
+        return {
+            "status": "ok",
+            "subsystems": subsystems,
+            **_status_block(),
+        }
 
     return app

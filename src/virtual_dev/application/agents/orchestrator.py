@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from loguru import logger
 from sqlalchemy import select
@@ -19,6 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from virtual_dev.domain.models.task import Task
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
+
+if TYPE_CHECKING:
+    from virtual_dev.application.services.health_tracker import HealthTracker
 from virtual_dev.infrastructure.config import AppConfig
 from virtual_dev.infrastructure.db import TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
@@ -62,11 +66,13 @@ class Orchestrator:
         session_factory: async_sessionmaker[AsyncSession],
         config: AppConfig,
         message_bus: MessageBusPort | None = None,
+        health: "HealthTracker | None" = None,
     ) -> None:
         self._task_tracker = task_tracker
         self._session_factory = session_factory
         self._config = config
         self._message_bus = message_bus
+        self._health = health
         self._running = False
         self._stop_event = asyncio.Event()
 
@@ -111,6 +117,8 @@ class Orchestrator:
         tasks = await self._task_tracker.fetch_tasks(jql)
         stats.fetched = len(tasks)
         logger.info("Fetched {} tasks via JQL", stats.fetched)
+        if self._health is not None:
+            self._health.mark_success("jira_fetch")
 
         newly_created: list[Task] = []
         async with session_scope(self._session_factory) as session:
