@@ -127,3 +127,8 @@ class Settings(BaseSettings):
     # the WS reconnect cap so we close the gap within ~1 min even
     # when the WS is fully down.
     mm_catchup_poll_interval_seconds: int = 60
+    # Recovery sweep cadence — looks for tasks stuck in CODING longer
+    # than ~30 min and re-publishes plan.ready. Tight enough to recover
+    # within a coffee break, loose enough not to thrash on a long
+    # legitimate dev run.
+    recovery_sweep_interval_seconds: int = 600

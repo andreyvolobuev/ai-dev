@@ -35,6 +35,7 @@ from virtual_dev.application.services import (
     ResearcherToolkit,
     RulesLoader,
 )
+from virtual_dev.application.services.recovery_service import RecoveryService
 from virtual_dev.application.services.review_comment_classifier import (
     ReviewCommentClassifier,
 )
@@ -101,6 +102,9 @@ class Container:
     # Always-on event broadcaster. Subscribed by the log sink in the
     # web app's lifespan so DEBUG logs mirror the test-analyst UI feed.
     trace: AgentTrace
+    # Periodic safety net for tasks stuck in CODING — re-publishes
+    # plan.ready when bus redelivery / lease expiry didn't catch them.
+    recovery_service: RecoveryService
 
     async def init_db(self) -> None:
         """Apply Alembic migrations to head. Used by ``virtual-dev db init``.
@@ -322,6 +326,11 @@ def build_container(config_dir: Path | str = "config") -> Container:
         message_bus=message_bus,
     )
 
+    recovery_service = RecoveryService(
+        session_factory=session_factory,
+        message_bus=message_bus,
+    )
+
     return Container(
         settings=settings,
         config=config,
@@ -348,6 +357,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         thread_responder=thread_responder,
         analyst_session_repo=analyst_session_repo,
         trace=trace,
+        recovery_service=recovery_service,
     )
 
 

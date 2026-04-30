@@ -160,6 +160,16 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         interval_seconds=container.settings.answer_coalesce_poll_interval_seconds,
     )
 
+    # Wider safety net than the bus's lease/redelivery: catches tasks
+    # that got stuck in CODING after the bus message was already
+    # acked (process killed in the gap, manual ack during debug,
+    # FAILED outcome operator wants retried).
+    recovery_poller = PollerWorker(
+        name="recovery",
+        interval_seconds=container.settings.recovery_sweep_interval_seconds,
+        ticks={"sweep": container.recovery_service.sweep_stuck_tasks},
+    )
+
     mm_listener: MmThreadListener | None = None
     mm_catchup_poller: PollerWorker | None = None
     if container.chat is not None and container.vcs is not None:
@@ -209,6 +219,9 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             background.append(asyncio.create_task(
                 coalescer_poller.run_forever(), name="answer-coalescer-poller",
             ))
+            background.append(asyncio.create_task(
+                recovery_poller.run_forever(), name="recovery-poller",
+            ))
             if mm_listener is not None:
                 background.append(asyncio.create_task(
                     mm_listener.run_forever(), name="mm-thread-listener",
@@ -235,6 +248,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                 reviewer_poller.stop(),
                 devops_poller.stop(),
                 coalescer_poller.stop(),
+                recovery_poller.stop(),
             ]
             if mm_listener is not None:
                 stop_signals.append(mm_listener.stop())
