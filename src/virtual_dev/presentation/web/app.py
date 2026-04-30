@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from loguru import logger
@@ -26,7 +26,10 @@ from virtual_dev.application.agents.orchestrator import (
     TOPIC_PLAN_READY,
     TOPIC_TASK_DISCOVERED,
 )
-from virtual_dev.application.services.agent_trace import consume_trace_to_logs
+from virtual_dev.application.services.agent_trace import (
+    AgentTraceEvent,
+    consume_trace_to_logs,
+)
 from virtual_dev.infrastructure.container import Container
 from virtual_dev.infrastructure.db import (
     AnalystConversationStepRow,
@@ -46,6 +49,22 @@ from virtual_dev.runtime.workers import (
 )
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
+
+
+async def _forward_trace(
+    ws: WebSocket, subscription: AsyncIterator[AgentTraceEvent],
+) -> None:
+    """Forward AgentTrace events to a websocket as JSON. Stop quietly
+    on disconnect or cancellation — the route's finally-block cleans up
+    the subscriber slot."""
+    try:
+        async for event in subscription:
+            try:
+                await ws.send_json(event.to_json())
+            except Exception:
+                break
+    except asyncio.CancelledError:
+        pass
 
 
 async def _drain_background_tasks(
@@ -369,6 +388,38 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             request, "plans.html",
             {"plans": rows, "task_lookup": task_lookup},
         )
+
+    @app.get("/activity", response_class=HTMLResponse)
+    async def activity(request: Request) -> HTMLResponse:
+        """Live agent-trace feed (websocket-driven)."""
+        return templates.TemplateResponse(
+            request, "activity.html", {**_status_block()},
+        )
+
+    @app.websocket("/ws/activity")
+    async def ws_activity(ws: WebSocket) -> None:
+        """Stream the shared ``AgentTrace`` to one browser tab.
+
+        Reuses the same broadcaster that the test-analyst UI uses — new
+        subscribers get the last ~500 events from the ring buffer first
+        (so a refresh isn't blank), then live tool_use / llm_text /
+        orchestrator events as they happen.
+        """
+        await ws.accept()
+        sub = container.trace.subscribe()
+        forwarder = asyncio.create_task(_forward_trace(ws, sub))
+        try:
+            while True:
+                # Block on receive so disconnects are caught immediately;
+                # the browser doesn't send anything meaningful, but
+                # WebSocketDisconnect lands here.
+                await ws.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            forwarder.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await forwarder
 
     @app.get("/mrs", response_class=HTMLResponse)
     async def mrs_list(request: Request) -> HTMLResponse:

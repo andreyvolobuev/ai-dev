@@ -1,0 +1,285 @@
+{% extends "base.html" %}
+{% block title %}Активность — Virtual Dev{% endblock %}
+{% block content %}
+<style>
+  /* Same dark scheme as test-analyst — operators recognise it. */
+  body { background: #0e1116; color: #d4d4d4; font-family: 'SF Mono', Menlo, monospace; }
+  header { color: #d4d4d4; }
+  header nav a { color: #79c0ff; }
+  h1 { color: #c9d1d9; }
+  .toolbar {
+    display: flex; gap: 10px; align-items: center;
+    padding: 6px 8px; margin-bottom: 8px;
+    background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    font-size: 12px;
+  }
+  .toolbar input[type=text], .toolbar select {
+    background: #0d1117; border: 1px solid #30363d; color: #c9d1d9;
+    border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px;
+  }
+  .toolbar button {
+    background: #21262d; border: 1px solid #30363d; color: #c9d1d9;
+    padding: 4px 10px; border-radius: 4px; cursor: pointer;
+    font-family: inherit; font-size: 12px;
+  }
+  .toolbar button:hover { background: #30363d; }
+  .toolbar .meta { margin-left: auto; color: #8b949e; }
+  .feed {
+    background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+    padding: 8px; height: calc(100vh - 200px); overflow-y: auto;
+    font-size: 12px;
+  }
+  .event {
+    padding: 6px 8px; border-left: 3px solid #30363d; margin-bottom: 6px;
+    background: #0d1117; border-radius: 0 4px 4px 0;
+  }
+  .event-meta {
+    display: flex; justify-content: space-between;
+    color: #8b949e; font-size: 10px; margin-bottom: 4px;
+  }
+  .event-agent_started { border-color: #3fb950; }
+  .event-tool_use { border-color: #58a6ff; }
+  .event-llm_text { border-color: #d29922; }
+  .event-agent_finished { border-color: #f85149; }
+  .event-chat_post { border-color: #bc8cff; }
+  .event-chat_reaction { border-color: #6e7681; }
+  .event-orchestrator { border-color: #f97583; }
+  .event-question_dispatched { border-color: #ff7b72; background: #2d1d1d; }
+  .event-classification_applied { border-color: #79c0ff; background: #15243a; }
+  .event-task_event { border-color: #a371f7; }
+  .field-row { margin: 2px 0; font-size: 11px; }
+  .field-label { color: #8b949e; }
+  .event-pre {
+    white-space: pre-wrap; word-break: break-word;
+    background: #0a0d12; padding: 6px; border-radius: 4px;
+    margin: 4px 0 0; font-size: 11px;
+  }
+  details > summary { cursor: pointer; color: #8b949e; font-size: 11px; }
+  details[open] > summary { color: #c9d1d9; }
+  .pill {
+    display: inline-block; padding: 0 6px; background: #21262d;
+    border-radius: 8px; font-size: 10px; color: #79c0ff; margin-right: 4px;
+  }
+  .ws-pill { padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+  .ws-ok { background: #0f5132; color: #d1ecdb; }
+  .ws-err { background: #58151c; color: #f5c2c7; }
+</style>
+
+<h1 style="font-size: 18px; margin: 8px 0;">📡 Активность бота — live</h1>
+<p style="font-size: 12px; color: #8b949e; margin: 0 0 12px;">
+  Лента событий из <code>AgentTrace</code>: запуски агентов, вызовы инструментов,
+  ответы LLM, чат, оркестратор. История последних ~500 событий загружается при подключении.
+</p>
+
+<div class="toolbar">
+  <label>Тикет: <input type="text" id="filter-ticket" placeholder="DM-123" style="width: 110px;"></label>
+  <label>Тип:
+    <select id="filter-type">
+      <option value="">все</option>
+      <option value="orchestrator">orchestrator</option>
+      <option value="agent_started">agent_started</option>
+      <option value="agent_finished">agent_finished</option>
+      <option value="tool_use">tool_use</option>
+      <option value="llm_text">llm_text</option>
+      <option value="chat_post">chat_post</option>
+      <option value="question_dispatched">question_dispatched</option>
+      <option value="classification_applied">classification_applied</option>
+      <option value="task_event">task_event</option>
+    </select>
+  </label>
+  <button id="expand-all-btn" type="button">▼ Развернуть всё</button>
+  <button id="clear-btn" type="button">Очистить ленту</button>
+  <span class="meta">
+    <span id="event-count">0 событий</span> · WS:
+    <span id="ws-status" class="ws-pill ws-err">connecting…</span>
+  </span>
+</div>
+
+<div class="feed" id="activity"></div>
+
+<script>
+(function () {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${proto}//${location.host}/ws/activity`;
+  let ws = null;
+  let eventCount = 0;
+  let allExpanded = false;
+  // Keep raw events so the user can change the filter and re-render
+  // without losing history. Cap at 2000 so memory doesn't blow up on
+  // long-running operator tabs.
+  const MAX_BUFFER = 2000;
+  const buffer = [];
+
+  const $ = id => document.getElementById(id);
+  const activity = $('activity');
+
+  function escapeHtml(s) {
+    if (s == null) return '';
+    return String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+  }
+
+  // Best-effort ticket inference: AgentTrace events don't carry the
+  // ticket id directly, but most payloads include it under common keys.
+  function eventTicket(ev) {
+    const p = ev.payload || {};
+    return p.external_id || p.ticket || p.task_external_id ||
+           (p.detail && typeof p.detail === 'string' && (p.detail.match(/[A-Z]+-\d+/) || [])[0]) ||
+           '';
+  }
+
+  function eventMatchesFilters(ev) {
+    const ticket = ($('filter-ticket').value || '').trim().toUpperCase();
+    if (ticket) {
+      const evTicket = (eventTicket(ev) || '').toUpperCase();
+      if (!evTicket.includes(ticket)) return false;
+    }
+    const type = $('filter-type').value;
+    if (type && ev.type !== type) return false;
+    return true;
+  }
+
+  function rerenderAll() {
+    activity.innerHTML = '';
+    eventCount = 0;
+    for (const ev of buffer) {
+      if (eventMatchesFilters(ev)) appendEvent(ev);
+    }
+    $('event-count').textContent = `${eventCount} событий`;
+  }
+
+  function appendEvent(ev) {
+    eventCount += 1;
+    $('event-count').textContent = `${eventCount} событий`;
+    const div = document.createElement('div');
+    div.className = 'event event-' + ev.type;
+    const meta = document.createElement('div');
+    meta.className = 'event-meta';
+    const ticket = eventTicket(ev);
+    const pill = ticket ? `<span class="pill">${escapeHtml(ticket)}</span>` : '';
+    meta.innerHTML = `<span>${pill}${ev.type} · ${ev.agent_key}</span><span>${ev.timestamp.slice(11, 19)}</span>`;
+    div.appendChild(meta);
+    div.appendChild(renderPayload(ev));
+    activity.appendChild(div);
+    if (allExpanded) {
+      div.querySelectorAll('details').forEach((d) => { d.open = true; });
+    }
+    activity.scrollTop = activity.scrollHeight;
+  }
+
+  function collapsible(label, text) {
+    const det = document.createElement('details');
+    const sum = document.createElement('summary');
+    sum.textContent = `${label} (${(text || '').length} chars)`;
+    det.appendChild(sum);
+    const pre = document.createElement('pre');
+    pre.className = 'event-pre';
+    pre.textContent = text || '(empty)';
+    det.appendChild(pre);
+    return det;
+  }
+
+  function renderPayload(ev) {
+    const wrap = document.createElement('div');
+    const p = ev.payload || {};
+    if (ev.type === 'agent_started') {
+      wrap.innerHTML = `model=<code>${escapeHtml(p.model || '')}</code> max_turns=${p.max_turns || ''}`;
+      if (p.system_prompt) wrap.appendChild(collapsible('system_prompt', p.system_prompt));
+      if (p.user_prompt) wrap.appendChild(collapsible('user_prompt', p.user_prompt));
+    } else if (ev.type === 'tool_use') {
+      const head = document.createElement('div');
+      head.innerHTML = `#${p.n || '?'} <code>${escapeHtml(p.name || '')}</code>`;
+      wrap.appendChild(head);
+      if (p.input !== undefined) wrap.appendChild(collapsible('input', JSON.stringify(p.input, null, 2)));
+    } else if (ev.type === 'llm_text') {
+      const pre = document.createElement('pre');
+      pre.className = 'event-pre';
+      pre.textContent = p.text || '';
+      wrap.appendChild(pre);
+    } else if (ev.type === 'agent_finished') {
+      wrap.innerHTML = `stop=<code>${escapeHtml(p.stop_reason || '')}</code> turns=${p.turns || 0} tools=${p.tool_use_count || 0} cost=$${(p.cost_usd||0).toFixed(4)}`;
+    } else if (ev.type === 'chat_post') {
+      const target = p.target_user_id ? ` to <code>${escapeHtml(p.target_user_id)}</code>` : '';
+      wrap.innerHTML = `${escapeHtml(p.author || '')} → <code>${escapeHtml(p.channel_id || '')}</code>${p.thread_root_id ? ' (thread)' : ''}${target}`;
+      const pre = document.createElement('pre');
+      pre.className = 'event-pre';
+      pre.textContent = p.text || '';
+      wrap.appendChild(pre);
+    } else if (ev.type === 'question_dispatched') {
+      const sh = p.stakeholder || {};
+      wrap.innerHTML = `
+        <div><strong>Q#${p.question_id || '?'}</strong> depth=${p.chain_depth || 0}</div>
+        <div class="field-row"><span class="field-label">to:</span> <code>${escapeHtml(sh.display_name || sh.raw_hint || '(team-lead)')}</code></div>
+      `;
+      if (p.question_text) {
+        const pre = document.createElement('pre');
+        pre.className = 'event-pre';
+        pre.textContent = p.question_text;
+        wrap.appendChild(pre);
+      }
+    } else if (ev.type === 'classification_applied') {
+      wrap.innerHTML = `
+        <div><strong>Q#${p.question_id || '?'}</strong> classified as <code>${escapeHtml(p.classification || '')}</code></div>
+      `;
+      if (p.coalesced_answer) wrap.appendChild(collapsible('coalesced_answer', p.coalesced_answer));
+    } else if (ev.type === 'orchestrator') {
+      wrap.innerHTML = `<strong>${escapeHtml(p.action || '')}</strong> ${escapeHtml(p.detail || '')}`;
+    } else if (ev.type === 'task_event') {
+      wrap.innerHTML = `<strong>${escapeHtml(p.action || '')}</strong>`;
+      if (p.summary) {
+        const pre = document.createElement('pre');
+        pre.className = 'event-pre';
+        pre.textContent = p.summary;
+        wrap.appendChild(pre);
+      }
+    } else {
+      const pre = document.createElement('pre');
+      pre.className = 'event-pre';
+      pre.textContent = JSON.stringify(p, null, 2);
+      wrap.appendChild(pre);
+    }
+    return wrap;
+  }
+
+  function setWsStatus(text, ok) {
+    const el = $('ws-status');
+    el.textContent = text;
+    el.className = 'ws-pill ' + (ok ? 'ws-ok' : 'ws-err');
+  }
+
+  function connect() {
+    setWsStatus('connecting…', false);
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => setWsStatus('connected', true);
+    ws.onclose = () => {
+      setWsStatus('disconnected — retry in 2s', false);
+      setTimeout(connect, 2000);
+    };
+    ws.onerror = () => {};
+    ws.onmessage = (raw) => {
+      let ev;
+      try { ev = JSON.parse(raw.data); } catch { return; }
+      buffer.push(ev);
+      if (buffer.length > MAX_BUFFER) buffer.shift();
+      if (eventMatchesFilters(ev)) appendEvent(ev);
+    };
+  }
+
+  $('expand-all-btn').onclick = () => {
+    allExpanded = !allExpanded;
+    activity.querySelectorAll('details').forEach((d) => { d.open = allExpanded; });
+    $('expand-all-btn').textContent = allExpanded ? '▲ Свернуть всё' : '▼ Развернуть всё';
+  };
+
+  $('clear-btn').onclick = () => {
+    buffer.length = 0;
+    rerenderAll();
+  };
+
+  $('filter-ticket').oninput = rerenderAll;
+  $('filter-type').onchange = rerenderAll;
+
+  connect();
+})();
+</script>
+{% endblock %}

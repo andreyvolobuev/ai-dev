@@ -1,39 +1,159 @@
 {% extends "base.html" %}
 {% block title %}Планы — Virtual Dev{% endblock %}
 {% block content %}
-    <h1>Планы</h1>
-    {% if not plans %}
-        <div class="empty">Планов пока нет.</div>
-    {% else %}
-        <table>
-            <thead>
-                <tr>
-                    <th>Ticket</th>
-                    <th>Status</th>
-                    <th>Summary</th>
-                    <th>Confidence</th>
-                    <th>Repo</th>
-                    <th>Turns</th>
-                    <th>When</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for p in plans %}
-                    <tr>
-                        <td>
-                            {% set task_id = task_lookup.get((p.tracker, p.task_external_id)) %}
-                            {% if task_id %}<a href="/tasks/{{ task_id }}">{{ p.task_external_id }}</a>
-                            {% else %}{{ p.task_external_id }}{% endif %}
-                        </td>
-                        <td><span class="status status-{{ p.status }}">{{ p.status }}</span></td>
-                        <td>{{ p.summary | truncate(140) }}</td>
-                        <td>{{ "%.2f"|format(p.confidence) }}</td>
-                        <td>{{ p.target_repo_key or "—" }}</td>
-                        <td>{{ p.iterations }}</td>
-                        <td>{{ p.created_at.strftime("%Y-%m-%d %H:%M") if p.created_at else "—" }}</td>
-                    </tr>
-                {% endfor %}
-            </tbody>
-        </table>
-    {% endif %}
+<style>
+  /* Plan cards are wider than the body text — let them breathe. */
+  .plan-card {
+    border: 1px solid #e5e5e5; border-radius: 6px;
+    margin-bottom: 12px; background: #fff;
+  }
+  .plan-card > summary {
+    list-style: none; cursor: pointer; padding: 10px 14px;
+    display: grid; gap: 10px; align-items: baseline;
+    grid-template-columns: 90px 80px 1fr 90px 90px 130px;
+    font-size: 0.9rem;
+  }
+  .plan-card > summary::-webkit-details-marker { display: none; }
+  .plan-card > summary::before {
+    content: "▸"; color: #888; transition: transform 0.15s;
+  }
+  .plan-card[open] > summary::before { content: "▾"; }
+  .plan-card[open] > summary { border-bottom: 1px solid #e5e5e5; }
+  .plan-card .summary-cell { color: #333; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .plan-card .ticket-cell a { font-weight: 600; }
+  .plan-body { padding: 0 14px 12px; }
+  .plan-body h4 {
+    margin: 14px 0 6px; font-size: 0.85rem; color: #555;
+    text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .plan-summary {
+    background: #fafafa; padding: 10px 12px; border-radius: 4px;
+    white-space: pre-wrap; font-size: 0.9rem; line-height: 1.5;
+    border-left: 3px solid #1565c0;
+  }
+  .plan-steps { padding-left: 1.5rem; margin: 0; }
+  .plan-steps li { margin-bottom: 8px; }
+  .plan-step-summary { font-weight: 600; }
+  .plan-step-details { display: block; margin-top: 2px; color: #444; font-size: 0.85rem; white-space: pre-wrap; }
+  .plan-step-files { display: block; margin-top: 2px; color: #888; font-size: 0.8rem; }
+  .plan-step-files code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }
+  .plan-questions, .plan-risks { padding-left: 1.5rem; margin: 0; }
+  .plan-questions li { margin-bottom: 6px; }
+  .plan-question-text { font-weight: 600; }
+  .plan-question-meta { display: block; color: #666; font-size: 0.8rem; margin-top: 2px; }
+  .plan-empty-block { color: #888; font-style: italic; font-size: 0.85rem; }
+  .plans-toolbar {
+    display: flex; gap: 10px; align-items: center; margin-bottom: 12px;
+    font-size: 0.85rem; color: #555;
+  }
+  .plans-toolbar button {
+    background: #f0f0f0; border: 1px solid #ccc; padding: 4px 10px;
+    border-radius: 4px; cursor: pointer; font-size: 0.8rem;
+  }
+  .plans-toolbar button:hover { background: #e0e0e0; }
+</style>
+
+<h1>Планы</h1>
+{% if not plans %}
+    <div class="empty">Планов пока нет.</div>
+{% else %}
+    <div class="plans-toolbar">
+      <button id="expand-all" type="button">▾ Развернуть всё</button>
+      <button id="collapse-all" type="button">▸ Свернуть всё</button>
+      <span>{{ plans | length }} плана(ов)</span>
+    </div>
+
+    {% for p in plans %}
+        {% set task_id = task_lookup.get((p.tracker, p.task_external_id)) %}
+        <details class="plan-card">
+            <summary>
+                <span class="ticket-cell">
+                    {% if task_id %}<a href="/tasks/{{ task_id }}">{{ p.task_external_id }}</a>
+                    {% else %}{{ p.task_external_id }}{% endif %}
+                </span>
+                <span><span class="status status-{{ p.status }}">{{ p.status }}</span></span>
+                <span class="summary-cell" title="{{ p.summary }}">{{ p.summary | truncate(140) }}</span>
+                <span title="confidence">conf: {{ "%.2f"|format(p.confidence) }}</span>
+                <span title="iterations">turns: {{ p.iterations }}</span>
+                <span style="color:#888;font-size:0.8rem;">{{ p.created_at.strftime("%Y-%m-%d %H:%M") if p.created_at else "—" }}</span>
+            </summary>
+            <div class="plan-body">
+                <div style="font-size:0.8rem;color:#666;margin-top:8px;">
+                    target repo: <strong>{{ p.target_repo_key or "—" }}</strong>
+                    · model: <code>{{ p.model or "—" }}</code>
+                    · agent: <code>{{ p.agent_key or "—" }}</code>
+                    · cost: ${{ "%.4f"|format(p.cost_usd) }}
+                </div>
+
+                <h4>Summary</h4>
+                {% if p.summary %}
+                    <div class="plan-summary">{{ p.summary }}</div>
+                {% else %}
+                    <div class="plan-empty-block">— нет —</div>
+                {% endif %}
+
+                <h4>Steps</h4>
+                {% if p.steps_json %}
+                    <ol class="plan-steps">
+                        {% for step in p.steps_json %}
+                            <li>
+                                <span class="plan-step-summary">{{ step.get("summary") or step.get("title") or "(без названия)" }}</span>
+                                {% if step.get("details") %}
+                                    <span class="plan-step-details">{{ step.details }}</span>
+                                {% endif %}
+                                {% if step.get("files_touched") %}
+                                    <span class="plan-step-files">
+                                        Files: {% for f in step.files_touched %}<code>{{ f }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+                                    </span>
+                                {% endif %}
+                                {% if step.get("repo_key") %}
+                                    <span class="plan-step-files">Repo: <code>{{ step.repo_key }}</code></span>
+                                {% endif %}
+                            </li>
+                        {% endfor %}
+                    </ol>
+                {% else %}
+                    <div class="plan-empty-block">— нет —</div>
+                {% endif %}
+
+                <h4>Open questions</h4>
+                {% if p.open_questions_json %}
+                    <ul class="plan-questions">
+                        {% for q in p.open_questions_json %}
+                            <li>
+                                <span class="plan-question-text">{{ q.get("question") or "(без вопроса)" }}</span>
+                                {% if q.get("ask_whom") %}
+                                    <span class="plan-question-meta">ask: <code>{{ q.ask_whom }}</code></span>
+                                {% endif %}
+                                {% if q.get("why_it_matters") %}
+                                    <span class="plan-question-meta">{{ q.why_it_matters }}</span>
+                                {% endif %}
+                            </li>
+                        {% endfor %}
+                    </ul>
+                {% else %}
+                    <div class="plan-empty-block">— нет —</div>
+                {% endif %}
+
+                <h4>Risks</h4>
+                {% if p.risks_json %}
+                    <ul class="plan-risks">
+                        {% for r in p.risks_json %}<li>{{ r }}</li>{% endfor %}
+                    </ul>
+                {% else %}
+                    <div class="plan-empty-block">— нет —</div>
+                {% endif %}
+            </div>
+        </details>
+    {% endfor %}
+{% endif %}
+
+<script>
+  document.getElementById('expand-all')?.addEventListener('click', () => {
+    document.querySelectorAll('details.plan-card').forEach(d => { d.open = true; });
+  });
+  document.getElementById('collapse-all')?.addEventListener('click', () => {
+    document.querySelectorAll('details.plan-card').forEach(d => { d.open = false; });
+  });
+</script>
 {% endblock %}
