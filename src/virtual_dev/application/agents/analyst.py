@@ -182,11 +182,13 @@ class AnalystAgent:
         allowed_handles, allowed_emails = self._build_dm_whitelist(
             inp.task_row, inp.history,
         )
+        dm_threads = self._build_dm_threads(inp.history)
         run_state: dict[str, Any] = {
             "ask_dispatched": False,
             "terminal": False,
             "allowed_dm_handles": allowed_handles,
             "allowed_dm_emails": allowed_emails,
+            "dm_threads": dm_threads,
         }
 
         # Build tools first so the catalog (auto-discovered list of
@@ -550,6 +552,72 @@ class AnalystAgent:
                 emails.add(target_email.lower())
 
         return handles, emails
+
+    @staticmethod
+    def _build_dm_threads(
+        history: Sequence[ConversationStep],
+    ) -> dict[str, dict[str, str]]:
+        """Mirror the recipient's last reply mode for the next dm_user.
+
+        The bot's first DM to a recipient is always top-level (no
+        thread root yet). After that, the human can either reply
+        inside the thread under our question or as a plain top-level
+        message in the same DM channel. We mirror their choice on the
+        next outbound DM to that recipient — replies-in-thread → bot
+        threads its next message; top-level reply → bot stays
+        top-level.
+
+        How the data flows:
+
+        * ``BOT_ASKED.metadata`` records the bot's outbound post:
+          ``target_user_id``, ``channel_id``, ``asked_post_id`` (the
+          would-be thread root if any reply lands inside it).
+        * ``HUMAN_REPLIED.metadata`` records ``from_user_id`` plus a
+          ``replied_in_thread`` flag (set in
+          ``AnalystInbox._coalesce_and_resume`` based on whether any
+          fragment carried the awaiting post id as its
+          ``thread_root_id``).
+
+        This walks history in order, keeping for each recipient the
+        latest pair (BOT_ASKED → HUMAN_REPLIED). If the latest pair
+        was a thread reply, we emit a (channel_id, root_id) entry the
+        ``dm_user`` tool can use to send the next DM into that same
+        thread. If the latest pair was top-level, we emit nothing —
+        ``dm_user`` falls back to plain ``send_direct``.
+
+        Returns: ``{target_user_id: {"channel_id": ..., "root_id": ...}}``.
+        """
+        threads: dict[str, dict[str, str]] = {}
+        # Tracks the most recent BOT_ASKED per recipient so a
+        # subsequent HUMAN_REPLIED in the same iteration can use its
+        # asked_post_id / channel_id as the thread anchor.
+        last_ask: dict[str, dict[str, str]] = {}
+        for step in history:
+            meta = step.metadata or {}
+            if step.kind == ConversationStepKind.BOT_ASKED:
+                target_uid = (meta.get("target_user_id") or "").strip()
+                channel_id = (meta.get("channel_id") or "").strip()
+                asked_post_id = (meta.get("asked_post_id") or "").strip()
+                if target_uid and channel_id and asked_post_id:
+                    last_ask[target_uid] = {
+                        "channel_id": channel_id,
+                        "root_id": asked_post_id,
+                    }
+                continue
+            if step.kind == ConversationStepKind.HUMAN_REPLIED:
+                from_uid = (meta.get("from_user_id") or "").strip()
+                if not from_uid:
+                    continue
+                anchor = last_ask.get(from_uid)
+                if anchor is None:
+                    continue
+                if meta.get("replied_in_thread"):
+                    threads[from_uid] = anchor
+                else:
+                    # Top-level reply → forget any prior thread choice;
+                    # we mirror the latest mode.
+                    threads.pop(from_uid, None)
+        return threads
 
     # --- MCP server: tools/ auto-discovery + filesystem ---
 

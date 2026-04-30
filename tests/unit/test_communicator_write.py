@@ -142,3 +142,48 @@ async def test_send_drops_when_chat_not_configured() -> None:
     outcome = await svc.send_dm("uid", "hi")
     assert outcome.sent is False
     assert outcome.skip_reason == "chat_not_configured"
+
+
+@pytest.mark.asyncio
+async def test_send_dm_top_level_uses_send_direct() -> None:
+    chat = _RecordingChat()
+    svc = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+
+    outcome = await svc.send_dm("uid-alice", "привет")
+    assert outcome.sent is True
+    assert chat.sent_dms == [("uid-alice", "привет")]
+    assert chat.sent_channels == []
+
+
+@pytest.mark.asyncio
+async def test_send_dm_threaded_uses_send_to_channel() -> None:
+    """When the recipient's last reply was in-thread, the analyst
+    plumbs ``thread_channel_id`` + ``thread_root_id`` and we route via
+    ``send_to_channel`` so MM threads the message under the original
+    bot question."""
+    chat = _RecordingChat()
+    svc = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+
+    outcome = await svc.send_dm(
+        "uid-alice", "ещё вопрос",
+        thread_channel_id="dm-chan-1",
+        thread_root_id="bot-post-1",
+    )
+    assert outcome.sent is True
+    assert chat.sent_dms == []
+    assert chat.sent_channels == [("dm-chan-1", "ещё вопрос", "bot-post-1")]
+
+
+@pytest.mark.asyncio
+async def test_send_dm_threaded_falls_back_when_anchor_partial() -> None:
+    """If only one of the thread anchor fields is set we fall back to
+    plain top-level — partial anchors would crash send_to_channel."""
+    chat = _RecordingChat()
+    svc = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+
+    outcome = await svc.send_dm(
+        "uid-alice", "что-то", thread_channel_id="dm-chan-1",
+    )
+    assert outcome.sent is True
+    assert chat.sent_dms == [("uid-alice", "что-то")]
+    assert chat.sent_channels == []

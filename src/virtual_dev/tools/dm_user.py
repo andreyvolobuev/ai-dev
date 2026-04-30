@@ -106,7 +106,22 @@ def build(ctx: ToolContext):
                     "reporter for a confirmed handle."
                 ),
             })
-        outcome = await communicator.send_dm(uid, message)
+        # Mirror the recipient's reply mode. ``analyst.py`` builds the
+        # ``dm_threads`` map by walking history: a recipient gets a
+        # thread anchor here only if their LATEST reply landed inside
+        # the thread under our previous question. Top-level repliers
+        # (and brand-new recipients) hit the fall-through and we send
+        # a plain top-level DM.
+        dm_threads = run_state.get("dm_threads") or {}
+        thread_anchor = dm_threads.get(uid)
+        if thread_anchor:
+            outcome = await communicator.send_dm(
+                uid, message,
+                thread_channel_id=thread_anchor.get("channel_id"),
+                thread_root_id=thread_anchor.get("root_id"),
+            )
+        else:
+            outcome = await communicator.send_dm(uid, message)
         if not outcome.sent or outcome.message is None:
             return wrap_text({
                 "sent": False,

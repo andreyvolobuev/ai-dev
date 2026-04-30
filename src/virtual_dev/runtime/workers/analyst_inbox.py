@@ -276,6 +276,19 @@ class AnalystInbox:
                     seen_ids.add(fid)
                 attached_files.append(entry)
 
+        # Did the human reply IN the thread under our question, or as a
+        # plain top-level DM? Each fragment recorded the user's
+        # ``mm_post.thread_root_id`` as ``asked_post_id``; if any of
+        # them matches our awaiting post, this batch was a thread
+        # reply. The flag drives the bot's mirror-the-mode behaviour
+        # on the next ``dm_user`` to this same recipient (analyst.py /
+        # dm_user.py read ``replied_in_thread`` from the metadata).
+        replied_in_thread = any(
+            (f.asked_post_id is not None
+             and task_row.awaiting_post_id is not None
+             and f.asked_post_id == task_row.awaiting_post_id)
+            for f in fragments
+        )
         await self._sessions.append_step(
             task_id=task_row.id,
             kind=ConversationStepKind.HUMAN_REPLIED,
@@ -286,6 +299,9 @@ class AnalystInbox:
                 "from_user_id": task_row.awaiting_user_id,
                 "from_username": task_row.awaiting_username,
                 "attached_files": attached_files,
+                "replied_in_thread": replied_in_thread,
+                "thread_channel_id": task_row.awaiting_channel_id if replied_in_thread else None,
+                "thread_root_id": task_row.awaiting_post_id if replied_in_thread else None,
             },
         )
         await self._sessions.mark_fragments_flushed(task_row.id)
@@ -685,7 +701,7 @@ class AnalystInbox:
             body_template = (
                 mm.blocked_escalation_to_lead
                 or
-                "Перевел в Pending задачу [{external_id}]({task_url})\n\n"
+                "Перевела в Pending задачу [{external_id}]({task_url})\n\n"
                 "**Причина:** {reason}\n\n"
                 "**Цепочка шагов:**\n{chain_summary}"
             )
@@ -693,7 +709,7 @@ class AnalystInbox:
             body_template = (
                 mm.stuck_escalation_to_lead
                 or
-                "Застрял с уточнением по тикету [{external_id}]({task_url}).\n\n"
+                "Застряла с уточнением по тикету [{external_id}]({task_url}).\n\n"
                 "**Причина:** {reason}\n\n**Цель:** {original_question}\n\n"
                 "**Цепочка:**\n{chain_summary}"
             )

@@ -114,8 +114,30 @@ class CommunicatorService:
 
     # --- Writes (Phase 3) ---
 
-    async def send_dm(self, user_id: str, text: str) -> SendOutcome:
-        """DM the given user, subject to rate limit + working-hours policy."""
+    async def send_dm(
+        self,
+        user_id: str,
+        text: str,
+        *,
+        thread_channel_id: str | None = None,
+        thread_root_id: str | None = None,
+    ) -> SendOutcome:
+        """DM the given user, subject to rate limit + working-hours policy.
+
+        When ``thread_channel_id`` and ``thread_root_id`` are both
+        provided we route the message via ``send_to_channel`` so it
+        lands inside the existing DM thread (Mattermost direct
+        channels are still channels, threading works). Without them,
+        we fall back to ``send_direct`` which produces a top-level DM
+        post. The mode is decided upstream (analyst.py mirrors the
+        recipient's most recent reply mode).
+        """
+        if thread_channel_id and thread_root_id:
+            return await self._send(
+                "dm", user_id, text,
+                channel_id=thread_channel_id,
+                thread_root_id=thread_root_id,
+            )
         return await self._send("dm", user_id, text, channel_id=None, thread_root_id=None)
 
     async def send_channel(
@@ -160,7 +182,7 @@ class CommunicatorService:
             return SendOutcome(sent=False, skip_reason="rate_limited")
 
         try:
-            if kind == "dm":
+            if kind == "dm" and channel_id is None:
                 message = await self._chat.send_direct(target_key, text)
             else:
                 assert channel_id is not None

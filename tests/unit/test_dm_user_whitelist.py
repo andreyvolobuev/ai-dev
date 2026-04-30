@@ -25,14 +25,25 @@ class _StubCommunicator:
     def __init__(self, *, resolve_to: str | None = "uid-x") -> None:
         self._resolve_to = resolve_to
         self.dms: list[tuple[str, str]] = []
+        self.thread_calls: list[tuple[str, str, str | None, str | None]] = []
 
     async def resolve_user_id(
         self, *, username: str | None = None, email: str | None = None,
     ) -> str | None:
         return self._resolve_to
 
-    async def send_dm(self, user_id: str, text: str) -> SendOutcome:
+    async def send_dm(
+        self,
+        user_id: str,
+        text: str,
+        *,
+        thread_channel_id: str | None = None,
+        thread_root_id: str | None = None,
+    ) -> SendOutcome:
         self.dms.append((user_id, text))
+        self.thread_calls.append(
+            (user_id, text, thread_channel_id, thread_root_id),
+        )
         return SendOutcome(
             sent=True,
             message=ChatMessage(
@@ -131,6 +142,61 @@ async def test_dm_user_email_path_uses_email_whitelist() -> None:
     result = await _run(tool, {"to_email": "ceo@2gis.ru", "message": "x"})
     body = result["content"][0]["text"]
     assert '"sent": false' in body or '"sent":false' in body
+
+
+@pytest.mark.asyncio
+async def test_dm_user_threads_when_anchor_in_run_state() -> None:
+    """When ``run_state['dm_threads']`` has an anchor for the resolved
+    uid, ``dm_user`` plumbs it through ``send_dm`` so the message
+    lands inside the existing DM thread."""
+    comm = _StubCommunicator()
+    ctx = ToolContext(
+        communicator=comm,  # type: ignore[arg-type]
+        effects=[],
+        submit_capture={},
+        run_state={
+            "ask_dispatched": False,
+            "terminal": False,
+            "allowed_dm_handles": {"alice"},
+            "allowed_dm_emails": set(),
+            "dm_threads": {
+                "uid-x": {"channel_id": "dm-1", "root_id": "bot-q1"},
+            },
+        },
+    )
+    tool = build_dm_user(ctx)
+    assert tool is not None
+
+    result = await _run(tool, {"to_handle": "alice", "message": "ещё"})
+    body = result["content"][0]["text"]
+    assert '"sent": true' in body or '"sent":true' in body
+    assert comm.thread_calls == [("uid-x", "ещё", "dm-1", "bot-q1")]
+
+
+@pytest.mark.asyncio
+async def test_dm_user_top_level_when_no_anchor() -> None:
+    """No entry in ``dm_threads`` for this uid → top-level DM (no
+    thread params plumbed). Brand-new recipients hit this path."""
+    comm = _StubCommunicator()
+    ctx = ToolContext(
+        communicator=comm,  # type: ignore[arg-type]
+        effects=[],
+        submit_capture={},
+        run_state={
+            "ask_dispatched": False,
+            "terminal": False,
+            "allowed_dm_handles": {"alice"},
+            "allowed_dm_emails": set(),
+            "dm_threads": {},
+        },
+    )
+    tool = build_dm_user(ctx)
+    assert tool is not None
+
+    result = await _run(tool, {"to_handle": "alice", "message": "привет"})
+    body = result["content"][0]["text"]
+    assert '"sent": true' in body or '"sent":true' in body
+    assert comm.thread_calls == [("uid-x", "привет", None, None)]
 
 
 @pytest.mark.asyncio
