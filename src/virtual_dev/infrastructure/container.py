@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+import gitlab.exceptions
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -195,16 +196,40 @@ def build_container(config_dir: Path | str = "config") -> Container:
         # Resolve our own GitLab username so the Reviewer filters out the
         # bot's own MR comments instead of feeding them back through the
         # ThreadResponder (#13 in techdebt).
-        try:
-            client = vcs._client   # type: ignore[attr-defined]
-            client.auth()
-            gitlab_bot_username = (
-                str(client.user.username) if client.user else None  # type: ignore[union-attr]
-            ) or None
-            if gitlab_bot_username:
-                logger.info("GitLab bot username resolved: @{}", gitlab_bot_username)
-        except Exception:
-            logger.exception("could not resolve GitLab bot username; reviewer filter degraded")
+        explicit = (settings.gitlab_bot_username or "").lstrip("@").strip()
+        if explicit:
+            gitlab_bot_username = explicit
+            logger.info(
+                "GitLab bot username from GITLAB_BOT_USERNAME: @{}",
+                gitlab_bot_username,
+            )
+        else:
+            # Probe via /api/v4/user. Project / group / bot-account
+            # tokens often lack the ``api`` scope and answer 401 here
+            # — that's expected for bot tokens, so we log a single
+            # actionable line instead of a scary traceback.
+            try:
+                client = vcs._client   # type: ignore[attr-defined]
+                client.auth()
+                gitlab_bot_username = (
+                    str(client.user.username) if client.user else None  # type: ignore[union-attr]
+                ) or None
+                if gitlab_bot_username:
+                    logger.info(
+                        "GitLab bot username resolved: @{}", gitlab_bot_username,
+                    )
+            except gitlab.exceptions.GitlabAuthenticationError:
+                logger.warning(
+                    "GitLab token can't read /api/v4/user (401) — typical "
+                    "for project/group access tokens. Set "
+                    "GITLAB_BOT_USERNAME in .env to skip this probe and "
+                    "let Reviewer filter the bot's own comments."
+                )
+            except Exception:
+                logger.exception(
+                    "could not resolve GitLab bot username; reviewer "
+                    "filter degraded"
+                )
     else:
         logger.warning(
             "GitLab credentials missing — VCS disabled; Dev-agent will not run"

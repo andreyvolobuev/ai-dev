@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     # --- GitLab ---
     gitlab_url: str = ""
     gitlab_token: str = ""
+    # Override for the bot's GitLab username. Project / group access
+    # tokens (and most bot-account PATs without ``api`` scope) can't
+    # call GET /api/v4/user, so the auto-resolve falls back to a
+    # warning and the Reviewer can't filter the bot's own comments.
+    # Set this explicitly to skip the auth() probe entirely.
+    gitlab_bot_username: str = ""
 
     # --- Chat provider ---
     # Which chat adapter to wire. Default mattermost; "slack" /
