@@ -383,6 +383,49 @@ async def test_dev_skips_when_open_mr_already_exists(
 
 
 @pytest.mark.asyncio
+async def test_dev_does_not_raise_when_submission_captured_despite_is_error(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """Real prod regression: SDK saw a stream blip mid-run and set
+    is_error=True, BUT the model recovered, called submit_mr, and the
+    capture is set. Earlier code raised CodeAgentInfraError anyway,
+    bus redelivered, dev re-ran, model got confused and never
+    submitted the second time around — work was already done but
+    looked stuck.
+
+    Rule: a present capture is the ground truth. If the model
+    submitted, we proceed with commit/push/MR regardless of any
+    transient is_error from earlier in the stream."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    vcs = _FakeVcs(tmp_path / "workspace")
+    # Simulate a real edit so commit_all returns a sha (mirrors what
+    # the real model would have done before submit_mr).
+    vcs._dirty_files.add("stub.py")
+    vcs.mr_payload = {"iid": 99, "id": 999, "web_url": "https://gl/mr/999"}
+
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=22, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+        is_error=True,           # transient mid-stream error
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent,
+        preset_submission={
+            "title": "fix: blah",
+            "description": "details",
+            "status": "success",
+        },
+    )
+
+    result = await dev.handle_plan("jira", "DM-7")
+    # Did NOT raise; treat capture as authoritative.
+    assert result.outcome is DevOutcome.MR_OPENED
+
+
+@pytest.mark.asyncio
 async def test_dev_raises_on_infra_failure_so_bus_redelivers(
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path: Path,

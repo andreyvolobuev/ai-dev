@@ -185,12 +185,14 @@ class DevAgent:
             raise
 
         # Infra failure (CLI subprocess died, stream idle timeout,
-        # SDK reported is_error). The model didn't decide to fail —
-        # the world failed under it. Don't ack the bus message:
-        # leave the task in CODING and raise so AgentRunner skips
-        # the ack, the lease expires, and the bus redelivers when
-        # infra is healthy again.
-        if result.is_error:
+        # SDK reported is_error) — but ONLY when the model didn't
+        # manage to submit. A present capture is ground truth: the
+        # model recovered, called submit_mr, work is real. Earlier
+        # code raised here unconditionally, which caused the bus to
+        # redeliver and the second run got confused (real prod
+        # regression: 09:14 submit succeeded, 09:16 raised, 09:34
+        # second run hung tooling-out instead of just MR-ing).
+        if result.is_error and not captured:
             logger.warning(
                 "Dev[{}] infra failure for {} (stop={}); leaving task in "
                 "CODING for bus to redeliver",
