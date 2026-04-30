@@ -308,6 +308,12 @@ class AnalystConversationFragmentRow(Base):
     mm_post_id: Mapped[str] = mapped_column(String(64))
     asked_post_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     text: Mapped[str] = mapped_column(Text, default="")
+    # File attachments on the MM post — list of {id, name, url,
+    # mime_type, extension, size}. Persisted so the prompt builder
+    # can surface them with read_<format>_url hints; without this
+    # the analyst sees only the text body and misses screenshots /
+    # PDFs the reporter attached as the actual answer.
+    files_json: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
     received_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     flushed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 

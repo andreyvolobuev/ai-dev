@@ -191,12 +191,21 @@ class AnalystInbox:
     async def append_fragment(
         self, task_id: int, mm_post: ChatMessage,
     ) -> bool:
+        files_payload = [
+            {
+                "id": f.id, "name": f.name, "url": f.url,
+                "mime_type": f.mime_type, "extension": f.extension,
+                "size": f.size,
+            }
+            for f in (mm_post.files or [])
+        ]
         ok = await self._sessions.append_fragment(
             task_id=task_id,
             mm_post_id=mm_post.id,
             asked_post_id=mm_post.thread_root_id,
             text=mm_post.text,
             received_at=mm_post.timestamp,
+            files=files_payload,
         )
         if ok:
             self.stats.fragments_appended += 1
@@ -253,6 +262,20 @@ class AnalystInbox:
         ) or fragments[0].text
         last_post_id = fragments[-1].mm_post_id
 
+        # Aggregate file attachments from every fragment so the prompt
+        # builder can render ``read_<format>_url`` hints. Dedup by id
+        # in case the same screenshot landed in two fragments.
+        attached_files: list[dict[str, object]] = []
+        seen_ids: set[str] = set()
+        for fragment in fragments:
+            for entry in fragment.files_json or []:
+                fid = str(entry.get("id") or "")
+                if fid and fid in seen_ids:
+                    continue
+                if fid:
+                    seen_ids.add(fid)
+                attached_files.append(entry)
+
         await self._sessions.append_step(
             task_id=task_row.id,
             kind=ConversationStepKind.HUMAN_REPLIED,
@@ -262,6 +285,7 @@ class AnalystInbox:
                 "fragment_count": len(fragments),
                 "from_user_id": task_row.awaiting_user_id,
                 "from_username": task_row.awaiting_username,
+                "attached_files": attached_files,
             },
         )
         await self._sessions.mark_fragments_flushed(task_row.id)

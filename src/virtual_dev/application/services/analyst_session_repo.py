@@ -296,14 +296,22 @@ class AnalystSessionRepository:
         asked_post_id: str | None,
         text: str,
         received_at: datetime,
+        files: list[dict[str, Any]] | None = None,
     ) -> bool:
-        """Buffer a fragment. Returns False on duplicate. Stamps last_fragment_at."""
+        """Buffer a fragment. Returns False on duplicate. Stamps last_fragment_at.
+
+        ``files`` is the list of attachment dicts on the MM post —
+        kept verbatim so the prompt builder can render
+        ``read_<format>_url`` hints. Empty list (default) means the
+        post had no attachments.
+        """
         async with session_scope(self._session_factory) as session:
             frag = AnalystConversationFragmentRow(
                 task_id=task_id,
                 mm_post_id=mm_post_id,
                 asked_post_id=asked_post_id,
                 text=text,
+                files_json=list(files or []),
                 received_at=received_at,
             )
             session.add(frag)

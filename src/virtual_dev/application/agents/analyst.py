@@ -485,7 +485,20 @@ class AnalystAgent:
             ConversationStepKind.STALE_FRAGMENT,
         ):
             wrapped = filt.wrap(body, source=f"task:step:{step.seq}")
-            return head + "\n" + wrapped.wrapped_text
+            chunks = [head, wrapped.wrapped_text]
+            attached = meta.get("attached_files") or []
+            if attached:
+                chunks.append("")
+                chunks.append("**Attached files** — these are part of the reply, "
+                              "fetch them with the suggested tool:")
+                for entry in attached:
+                    if not isinstance(entry, dict):
+                        continue
+                    name = str(entry.get("name") or "(unnamed)")
+                    url = str(entry.get("url") or "")
+                    hint = _attachment_tool_hint(name)
+                    chunks.append(f"* `{name}` — call {hint}(url=\"{url}\")")
+            return "\n".join(chunks)
         if len(body) > 3000:
             body = body[:3000] + "\n[truncated]"
         return head + "\n" + body
