@@ -18,19 +18,19 @@ mattermost:
     Ребята, приглашаю на [МР]({web_url}): {title}
 
   merge_ping: |
-    [virtual-dev] MR `{repo_key}!{iid}` собрал апрувы. Просьба смержить: {web_url}
+    Мой реквестик [{iid}]({web_url}) собрал апрувы. Смержите, пожалуйста 😊
 
   stale_ping: |
-    [virtual-dev] MR `{repo_key}!{iid}` ждёт ревью уже {idle_hours}ч. {web_url}
+    Ребят, мой [реквестик]({web_url}) ждёт ревью уже {idle_hours}ч 😔 Гляньте, пожалуйста 🙏
 
   escalation_dm: |
-    [virtual-dev] MR `{repo_key}!{iid}` без активности {idle_hours}ч — напомни кому-нибудь или переназначь. {web_url}
+    Мой [МР]({web_url}) без активности уже {idle_hours}ч — напомни кому-нибудь или переназначь.
 
   # DevOps авто-фикс: ТОЛЬКО DM на escalation.mattermost_user, никогда не
   # в канал. Канал должен видеть MR только когда CI зелёный и можно ревью.
   # {repo_key}, {iid}, {title}, {web_url}, {attempts}, {failing_jobs}.
   pipeline_autofix_gave_up_dm: |
-    [virtual-dev] CI на `{repo_key}!{iid}` не починился после {attempts} попыток авто-фикса.
+    Проблемка: CI на `{repo_key}!{iid}` не починился после {attempts} попыток авто-фикса.
 
     Title: {title}
     Failing jobs: {failing_jobs}
@@ -40,18 +40,18 @@ mattermost:
 
   # Reviewer thread responses (MmThreadListener). {commit_sha_short}, {branch}.
   thread_reply_no_dev_agent: "Не могу внести правку: Dev-агент для этого репо не сконфигурирован."
-  thread_reply_no_task: "Не нашёл связанный тикет."
-  thread_reply_iteration_crashed: "Попробовал внести правку, но Dev-агент упал. Смотри логи."
+  thread_reply_no_task: "Не нашла связанный тикет."
+  thread_reply_iteration_crashed: "Попробовала внести правку, но Dev-агент упал. Смотри логи."
   # Постится в тред когда CI на iteration-коммите станет зелёным.
   # До этого момента бот молчит — нет смысла звать ревьюеров на код,
   # который ещё не подтверждён пайплайном.
-  thread_reply_iteration_done: "✅ Внёс правки, CI зелёный — коммит `{commit_sha_short}` на `{branch}`. Можно смотреть."
-  thread_reply_iteration_no_changes: "Рабочее дерево осталось чистым — правка не потребовалась или модель не смогла внести её. Смотри логи."
+  thread_reply_iteration_done: "✅ Внесла правки, CI зелёный — коммит `{commit_sha_short}` на `{branch}`. Можно смотреть 🙏"
+  thread_reply_iteration_no_changes: "Рабочее дерево осталось чистым — правка не потребовалась или я не смогла внести её. Смотри логи."
 
   # Постится top-level MR-комментом в GitLab когда фидбек был оставлен
   # в самом MR (а не в MM-треде). Текст идентичен thread_reply_iteration_done
   # по смыслу, но без MM-форматирования.
-  gitlab_reply_iteration_done: "✅ Внёс правки, CI зелёный — коммит `{commit_sha_short}` на `{branch}`. Можно смотреть."
+  gitlab_reply_iteration_done: "✅ Внесла правки, CI зелёный — коммит `{commit_sha_short}` на `{branch}`. Можно смотреть 🙏"
 
   # --- Lead-escalation DMs ---
   # The analyst agent composes the body of every per-recipient DM
@@ -68,7 +68,7 @@ mattermost:
   # Placeholders for both: {tracker}, {external_id}, {task_url},
   # {original_question}, {chain_summary}, {reason}.
   stuck_escalation_to_lead: |
-    Застрял с уточнением по тикету [{external_id}]({task_url}).
+    Застряла с уточнением по тикету [{external_id}]({task_url}).
 
     **Причина:** {reason}
 
@@ -80,7 +80,7 @@ mattermost:
     Помоги, пожалуйста, разобраться или подскажи, кому переадресовать.
 
   blocked_escalation_to_lead: |
-    Перевел в Pending задачу [{external_id}]({task_url})
+    Перевела в Pending задачу [{external_id}]({task_url})
 
     **Причина:** {reason}
 
@@ -97,45 +97,45 @@ mattermost:
 #   {web_url}, {branch}, {branch_block}, {notes_block}.
 jira:
   plan_comment: |
-    *[virtual-dev] Analyst produced a plan for this ticket.*
+    *Написала план по задаче*
 
-    *Status:* {status}
-    *Confidence:* {confidence}
+    *Статус:* {status}
+    *Увереность в плане:* {confidence}
     {target_repo_block}
-    *Summary*
+    *Суть*
     {summary}
     {steps_block}
     {open_questions_block}
     {risks_block}
 
-    _Turns: {iterations}._
+    _Шаги: {iterations}._
     {dashboard_block}
 
   mr_link_comment: |
-    *[virtual-dev] Dev agent opened a draft MR for this ticket.*
+    *Открыла реквест по задаче*
 
     - MR: {web_url}
-    - Branch: `{branch}`
+    - Ветка: `{branch}`
 
-    _Please review and merge when ready._
+    _Приходите на ревью_
 
   failure_comment: |
-    *[virtual-dev] Dev agent could not finish this ticket.*
+    *К сожалению, не смогла завершить задачу.*
     {branch_block}
     {notes_block}
 
-    _Task kept in FAILED state; a human can take it from here._
+    _Тут надо разобраться человеку. Прошу прощения, что у меня не получилось._
 
   # Posted when the analyst calls `blocked` — we move the ticket to
   # "Waiting For Response" and explain why in this comment, then DM
   # the lead with `blocked_escalation_to_lead`.
   # Available placeholders: {external_id}, {task_url}, {reason}.
   blocked_comment: |
-    *[virtual-dev] Задача переведена в "Waiting For Response".*
+    *Кинула задачу в PENDING*
 
     **Причина:** {reason}
 
-    _Бот уведомил тимлида и больше не работает над тикетом до указаний._
+    Уведомила тимлида и больше не работаю над тикетом до дальнейших указаний.
 
 # --- GitLab MR (то, что бот сам пишет в title / description / commit) ---
 # {key} — ticket external id, {title} — модель-сабмит, {url} — ticket URL,
@@ -144,7 +144,7 @@ merge_request:
   title: "{key}: {title}"
   commit_message: "[{key}] {title}"
   description: |
-    **Ticket:** [{key}]({url})
+    **Задача:** [{key}]({url})
 
     {description}
     {plan_block}
