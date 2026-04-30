@@ -197,6 +197,7 @@ class DevOpsAgent:
                     external_id=row.task_external_id or "",
                     branch_name=row.source_branch,
                     feedback=feedback,
+                    feedback_kind="ci_failure",
                 )
                 commit_sha = result.commit_sha or None
             except Exception:

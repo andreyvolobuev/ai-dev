@@ -36,6 +36,7 @@ from virtual_dev.infrastructure.config.schema import (
 )
 from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow, TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
+from virtual_dev.infrastructure.db.mappers import row_to_plan
 
 
 # --- Fakes ---
@@ -602,3 +603,74 @@ async def test_dev_branch_name_contains_task_id(
     assert result.branch_name.startswith("ai-dev/dm-7-")
     # Title slug clamped at 40 chars (plus prefix and id).
     assert len(result.branch_name) <= len("ai-dev/dm-7-") + 40
+
+
+@pytest.mark.asyncio
+async def test_iteration_prompt_for_mr_review_extracts_rule_into_claude_md(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """When iterating on MR-review feedback, dev must be told to also
+    add a generalised rule to the target repo's CLAUDE.md (so the next
+    Claude Code session on that repo doesn't repeat the mistake).
+
+    The instruction must mention CLAUDE.md by name and tell the model
+    to create the file if it doesn't exist."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _FakeVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=0, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent, preset_submission=None,
+    )
+
+    task_row, plan_row = await dev._load("jira", "DM-7")
+    assert task_row is not None and plan_row is not None
+    plan = row_to_plan(plan_row)
+
+    prompt = dev._render_iteration_prompt(
+        task_row=task_row,
+        plan=plan,
+        feedback="please use double quotes for strings",
+        feedback_kind="mr_review",
+    )
+
+    assert "CLAUDE.md" in prompt
+    # Should tell the model to create the file if missing.
+    assert "create" in prompt.lower() or "doesn't exist" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_iteration_prompt_for_ci_failure_does_not_pollute_claude_md(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """CI failure feedback is about a transient bug, not a project
+    convention — extracting it into CLAUDE.md would pollute the rule
+    book with one-off pipeline noise."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _FakeVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=0, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent, preset_submission=None,
+    )
+
+    task_row, plan_row = await dev._load("jira", "DM-7")
+    assert task_row is not None and plan_row is not None
+    plan = row_to_plan(plan_row)
+
+    prompt = dev._render_iteration_prompt(
+        task_row=task_row,
+        plan=plan,
+        feedback="job tests failed: AssertionError on line 12",
+        feedback_kind="ci_failure",
+    )
+
+    assert "CLAUDE.md" not in prompt

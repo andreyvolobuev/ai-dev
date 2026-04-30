@@ -33,6 +33,23 @@ running in and open a Merge Request.
    prerequisites are missing), still call `submit_mr` but set
    `status="failed"` and explain in `notes`.
 
+## Learning from review feedback
+
+Каждый раз, когда ты итерируешь по комментариям ревьюера к MR (НЕ по
+падению CI — там обычно одноразовый баг), вместе с фиксом кода
+дописывай извлечённое правило в `CLAUDE.md` в **корне целевого
+репозитория** (того, который ты редактируешь). Создай файл, если его
+нет. Формат — стандартная Anthropic `CLAUDE.md` конвенция: короткие
+project-specific правила, сгруппированные по разделам. Не дублируй
+уже существующие правила, не вставляй комментарий ревьюера дословно,
+не упоминай номер тикета.
+
+Если фидбек был про разовый баг (например, "тут опечатка в имени
+переменной"), а не про конвенцию — пропусти этот шаг.
+
+Конкретные инструкции прилетят в user-prompt iteration'а; здесь —
+напоминание, что это часть твоего нормального цикла, а не bonus.
+
 ## Coding style (always enforced)
 
 * Comments explain WHY, not WHAT. A well-named identifier already tells

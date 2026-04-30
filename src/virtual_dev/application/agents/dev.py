@@ -56,6 +56,35 @@ from virtual_dev.infrastructure.db.mappers import row_to_plan
 _SLUG_SAFE_RE = re.compile(r"[^a-z0-9]+")
 
 
+# Inserted into the iteration prompt only on the MR-review path.
+# The model addresses the code-fix feedback AND adds a generalised
+# rule to the target repo's CLAUDE.md so the next session on that
+# repo doesn't repeat the mistake. CI-failure iterations skip this —
+# pipeline flakes aren't project conventions worth pinning.
+_CLAUDE_MD_INSTRUCTION = (
+    "## Capture the lesson into CLAUDE.md\n"
+    "Along with the code fix, append a short rule extracted from the "
+    "feedback to the file `CLAUDE.md` in the **target repository's "
+    "root** (the repo you're editing — not this agent's config). "
+    "Create the file if it doesn't exist. The format is the standard "
+    "Anthropic `CLAUDE.md` convention: short, project-specific rules "
+    "in markdown, grouped under a heading, no general programming "
+    "advice. Keep each rule to one bullet — the *what* and a brief "
+    "*why* if it isn't obvious from the rule itself. Skip this step "
+    "only if the feedback was clearly about a one-off bug rather than "
+    "a project convention.\n\n"
+    "Examples:\n"
+    "* Feedback: \"use double quotes\" → bullet under `## Style`: "
+    "`Use double quotes for strings (project ruff config: quote-style"
+    "=\"double\").`\n"
+    "* Feedback: \"don't import test helpers from src/\" → bullet "
+    "under `## Imports`: `Test helpers live in tests/_helpers.py; "
+    "never import from src/ in tests.`\n\n"
+    "Don't restate rules already in CLAUDE.md, don't dump the full "
+    "review comment verbatim, don't reference the ticket id."
+)
+
+
 class CodeAgentInfraError(RuntimeError):
     """Infrastructure failure under the model (CLI died, stream timeout,
     SDK is_error). Distinct from a model deciding to fail — this kind
@@ -286,8 +315,16 @@ class DevAgent:
         external_id: str,
         branch_name: str,
         feedback: str,
+        feedback_kind: str = "mr_review",
     ) -> DevResult:
         """Apply reviewer feedback on top of an already-open MR.
+
+        ``feedback_kind`` is ``"mr_review"`` (a human left a comment on
+        the MR or in a MM thread) or ``"ci_failure"`` (DevOps observed
+        a red pipeline). Only the review path asks the model to
+        extract a rule into the target repo's ``CLAUDE.md`` — CI
+        failures are usually transient bugs, not project conventions
+        worth pinning.
 
         Called by the MM thread listener once the ThreadResponderAgent
         decides the feedback is actionable. We checkout the existing
@@ -326,6 +363,7 @@ class DevAgent:
         request = self._build_iteration_request(
             plan=plan, task_row=task_row,
             workspace_path=workspace_path, feedback=feedback,
+            feedback_kind=feedback_kind,
         )
         try:
             captured, result = await self._call_model(request)
@@ -385,10 +423,12 @@ class DevAgent:
     def _build_iteration_request(
         self, *, plan: Plan, task_row: TaskRow,
         workspace_path: str, feedback: str,
+        feedback_kind: str = "mr_review",
     ) -> CodeAgentRequest:
         system_prompt = self._compose_system_prompt(task_row)
         user_prompt = self._render_iteration_prompt(
             task_row=task_row, plan=plan, feedback=feedback,
+            feedback_kind=feedback_kind,
         )
         return CodeAgentRequest(
             agent_key=self._agent_key,
@@ -401,6 +441,7 @@ class DevAgent:
 
     def _render_iteration_prompt(
         self, *, task_row: TaskRow, plan: Plan, feedback: str,
+        feedback_kind: str = "mr_review",
     ) -> str:
         parts: list[str] = []
         parts.append(f"# Iteration on {task_row.tracker}:{task_row.external_id}")
@@ -419,6 +460,9 @@ class DevAgent:
         parts.append(feedback.strip())
         parts.append("</untrusted_content>")
         parts.append("")
+        if feedback_kind == "mr_review":
+            parts.append(_CLAUDE_MD_INSTRUCTION)
+            parts.append("")
         parts.append(
             "When you're done (or can't proceed), call `submit_mr` with status "
             "'success' or 'failed'. title is a short imperative like "
