@@ -782,3 +782,131 @@ async def test_iteration_prompt_for_ci_failure_does_not_pollute_claude_md(
     )
 
     assert "CLAUDE.md" not in prompt
+
+
+def _thread_msg(*, id: str, author: str, text: str) -> Any:
+    from datetime import UTC, datetime
+
+    from virtual_dev.domain.models.chat import ChatMessage
+    return ChatMessage(
+        id=id, channel_id="team-chan", author_id=author, text=text,
+        timestamp=datetime.now(UTC), thread_root_id="root-x",
+        trusted=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_iteration_prompt_includes_thread_when_provided(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """The thread responder boils a human conversation down to a single
+    ``iteration_feedback`` blob — but the original human words are the
+    source of truth. Forwarding the raw transcript lets the dev agent
+    sanity-check that interpretation against what reviewers actually
+    wrote."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _FakeVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=0, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent, preset_submission=None,
+    )
+
+    task_row, plan_row = await dev._load("jira", "DM-7")
+    assert task_row is not None and plan_row is not None
+    plan = row_to_plan(plan_row)
+
+    thread = [
+        _thread_msg(id="p1", author="alice", text="please rename foo to bar"),
+        _thread_msg(id="p2", author="bob",   text="actually let's call it baz"),
+    ]
+    prompt = dev._render_iteration_prompt(
+        task_row=task_row, plan=plan,
+        feedback="Rename foo to bar.",
+        feedback_kind="mr_review",
+        thread=thread,
+    )
+
+    assert "please rename foo to bar" in prompt
+    assert "actually let's call it baz" in prompt
+    # Wrapped in an untrusted-content envelope sourced from MM thread,
+    # consistent with how feedback itself is wrapped today.
+    assert 'source="mm:thread"' in prompt
+
+
+@pytest.mark.asyncio
+async def test_iteration_prompt_omits_thread_section_when_thread_empty(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """CI-failure iterations have no human thread; the prompt should
+    not render an empty 'Reviewer thread' section that would only
+    confuse the model into hallucinating context that isn't there."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _FakeVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=0, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent, preset_submission=None,
+    )
+    task_row, plan_row = await dev._load("jira", "DM-7")
+    assert task_row is not None and plan_row is not None
+    plan = row_to_plan(plan_row)
+
+    prompt_no_thread = dev._render_iteration_prompt(
+        task_row=task_row, plan=plan,
+        feedback="job tests failed", feedback_kind="ci_failure",
+    )
+    prompt_empty_thread = dev._render_iteration_prompt(
+        task_row=task_row, plan=plan,
+        feedback="job tests failed", feedback_kind="ci_failure",
+        thread=[],
+    )
+
+    for prompt in (prompt_no_thread, prompt_empty_thread):
+        assert "Reviewer thread" not in prompt
+        assert "Original thread" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_iteration_prompt_tells_dev_to_prefer_thread_on_conflict(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """When feedback (responder's interpretation) and the raw thread
+    disagree, the dev must NOT silently guess. Doctrine: trust the
+    humans' actual words, and if still ambiguous, submit ``failed``
+    with a clarifying note rather than fabricate intent."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _FakeVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=0, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent, preset_submission=None,
+    )
+    task_row, plan_row = await dev._load("jira", "DM-7")
+    assert task_row is not None and plan_row is not None
+    plan = row_to_plan(plan_row)
+
+    thread = [_thread_msg(id="p1", author="alice", text="anything")]
+    prompt = dev._render_iteration_prompt(
+        task_row=task_row, plan=plan,
+        feedback="Do X.", feedback_kind="mr_review", thread=thread,
+    )
+
+    lower = prompt.lower()
+    # Doctrine signal: model must be told to prefer the raw thread
+    # over the interpreted feedback when they disagree.
+    assert "conflict" in lower or "disagree" in lower or "differ" in lower
+    # And it must be told NOT to guess — set status=failed instead.
+    assert "guess" in lower or "fabricate" in lower or "status=\"failed\"" in lower or "status='failed'" in lower

@@ -323,3 +323,62 @@ async def test_skips_posts_without_thread_root(
 
     assert responder.calls == 0
     assert listener.stats.events_routed == 0
+
+
+@pytest.mark.asyncio
+async def test_iterate_forwards_full_thread_transcript_to_dev(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The dev needs the raw thread (not just the responder's
+    ``iteration_feedback`` blob) to ground itself in what reviewers
+    actually wrote — otherwise it inherits the responder's
+    interpretation as ground truth and there's nothing to cross-check
+    against. See discussion mirroring the Analyst+Clarification merge:
+    a downstream agent that only sees an upstream agent's prose
+    paraphrase silently loses the original intent."""
+    await _insert_mr(session_factory, root_id="root-thread-fwd")
+    events = [
+        _human_post(id="post-1", thread_root_id="root-thread-fwd",
+                    text="please rename foo to bar", author="alice"),
+        _human_post(id="post-2", thread_root_id="root-thread-fwd",
+                    text="actually let's call it baz", author="bob"),
+    ]
+    chat = _ScriptedChat(events)
+    # post-1 is prior history (already handled by the bot — pre-react ✅
+    # so the listener skips it on dispatch). post-2 is the new reply
+    # that should drive the iteration. Both stay in the transcript that
+    # ``read_thread`` returns.
+    chat._bot_reactions["post-1"] = [_PROCESSED_REACTION]
+    responder = _ScriptedResponder([ResponderDecision(
+        action=ResponderAction.ITERATE,
+        reply_text="Принято.",
+        iteration_feedback="Rename foo to baz.",
+        reasoning="latest-message-wins",
+    )])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(
+        outcome=DevOutcome.MR_OPENED, branch_name="ai-dev/dm-1",
+        commit_sha="cafef00d",
+    ))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await asyncio.sleep(0.1)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert len(dev.calls) == 1
+    call = dev.calls[0]
+    # Listener already fetched the transcript to feed the responder;
+    # it must hand the same transcript to the dev.
+    thread = call.get("thread")
+    assert thread is not None, "dev.handle_iteration must receive thread="
+    texts = [m.text for m in thread]
+    assert "please rename foo to bar" in texts
+    assert "actually let's call it baz" in texts

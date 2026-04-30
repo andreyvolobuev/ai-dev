@@ -426,7 +426,14 @@ class MmThreadListener:
             if decision.reply_text:
                 await self._post_reply(channel_id, root_id, decision.reply_text)
                 self.stats.replies_posted += 1
-            await self._run_iteration(row, decision.iteration_feedback, channel_id, root_id)
+            # Dev sees the full thread (transcript + the triggering reply
+            # itself). The responder splits "history" vs "latest" because
+            # it's deciding whether to act on the latest message; the dev
+            # just needs the conversation as the humans wrote it.
+            await self._run_iteration(
+                row, decision.iteration_feedback, channel_id, root_id,
+                thread=[*transcript, event],
+            )
             self.stats.iterations_dispatched += 1
 
         # React ✅ — always, including ignore, so we never reprocess.
@@ -473,6 +480,8 @@ class MmThreadListener:
         feedback: str,
         channel_id: str,
         root_id: str,
+        *,
+        thread: list[ChatMessage] | None = None,
     ) -> None:
         """Run a Dev iteration in response to a thread comment.
 
@@ -505,6 +514,7 @@ class MmThreadListener:
                 external_id=row.task_external_id,
                 branch_name=row.source_branch,
                 feedback=feedback,
+                thread=thread,
             )
         except Exception:
             logger.exception("MmThreadListener: iteration crashed")

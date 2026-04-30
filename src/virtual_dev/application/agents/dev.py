@@ -30,6 +30,7 @@ testable and local.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -40,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.adapters.vcs.gitlab import VcsError
 from virtual_dev.application.services import PromptsLoader, ResearcherToolkit, RulesLoader
+from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus
 from virtual_dev.domain.models.plan import Plan, PlanStatus
 from virtual_dev.domain.models.task import TaskStatus
@@ -138,6 +140,15 @@ _DEV_FALLBACK_PROMPT = (
     "the tests until they pass, then call submit_mr exactly once. Do NOT "
     "commit or push yourself — the runtime does that.\n"
 )
+
+
+def _render_thread_transcript(thread: Sequence[ChatMessage]) -> str:
+    lines: list[str] = []
+    for msg in thread:
+        who = "bot" if msg.trusted else f"@{msg.author_id}"
+        ts = msg.timestamp.isoformat() if msg.timestamp else ""
+        lines.append(f"{who} [{ts}]\n{msg.text}".rstrip())
+    return "\n\n".join(lines)
 
 
 def _strip_ticket_prefix(title: str, external_id: str) -> str:
@@ -342,6 +353,7 @@ class DevAgent:
         branch_name: str,
         feedback: str,
         feedback_kind: str = "mr_review",
+        thread: Sequence[ChatMessage] | None = None,
     ) -> DevResult:
         """Apply reviewer feedback on top of an already-open MR.
 
@@ -351,6 +363,12 @@ class DevAgent:
         extract a rule into the target repo's ``CLAUDE.md`` — CI
         failures are usually transient bugs, not project conventions
         worth pinning.
+
+        ``thread`` is the raw MM transcript that produced ``feedback``:
+        the Thread Responder distilled it into the prose blob, and the
+        dev cross-checks against the human originals so it doesn't
+        inherit a paraphrase as ground truth. Empty/None on the
+        ci_failure path (no human conversation behind it).
 
         Called by the MM thread listener once the ThreadResponderAgent
         decides the feedback is actionable. We checkout the existing
@@ -389,7 +407,7 @@ class DevAgent:
         request = self._build_iteration_request(
             plan=plan, task_row=task_row,
             workspace_path=workspace_path, feedback=feedback,
-            feedback_kind=feedback_kind,
+            feedback_kind=feedback_kind, thread=thread,
         )
         try:
             captured, result = await self._call_model(request)
@@ -450,6 +468,7 @@ class DevAgent:
         self, *, plan: Plan, task_row: TaskRow,
         workspace_path: str, feedback: str,
         feedback_kind: str = "mr_review",
+        thread: Sequence[ChatMessage] | None = None,
     ) -> CodeAgentRequest:
         from virtual_dev.tools import render_tools_catalog
 
@@ -458,7 +477,7 @@ class DevAgent:
         system_prompt = self._compose_system_prompt(task_row, tools_catalog)
         user_prompt = self._render_iteration_prompt(
             task_row=task_row, plan=plan, feedback=feedback,
-            feedback_kind=feedback_kind,
+            feedback_kind=feedback_kind, thread=thread,
         )
         request = CodeAgentRequest(
             agent_key=self._agent_key,
@@ -476,6 +495,7 @@ class DevAgent:
     def _render_iteration_prompt(
         self, *, task_row: TaskRow, plan: Plan, feedback: str,
         feedback_kind: str = "mr_review",
+        thread: Sequence[ChatMessage] | None = None,
     ) -> str:
         parts: list[str] = []
         parts.append(f"# Iteration on {task_row.tracker}:{task_row.external_id}")
@@ -494,6 +514,22 @@ class DevAgent:
         parts.append(feedback.strip())
         parts.append("</untrusted_content>")
         parts.append("")
+        if thread:
+            parts.append("## Reviewer thread (raw transcript — source of truth)")
+            parts.append(
+                "The ``Reviewer feedback`` block above is one agent's "
+                "paraphrase of the conversation below. The thread is the "
+                "humans' actual words; if the two disagree or the feedback "
+                "is missing nuance, prefer the thread. If the intent is "
+                "still ambiguous after reading both, do NOT guess — call "
+                "`submit_mr` with status=\"failed\" and put your clarifying "
+                "question in `notes`; the responder will surface it back to "
+                "the thread."
+            )
+            parts.append("<untrusted_content source=\"mm:thread\">")
+            parts.append(_render_thread_transcript(thread))
+            parts.append("</untrusted_content>")
+            parts.append("")
         if feedback_kind == "mr_review":
             parts.append(_CLAUDE_MD_INSTRUCTION)
             parts.append("")
