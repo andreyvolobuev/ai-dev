@@ -22,7 +22,12 @@ TOOL_GROUP = "responder"
 _SUBMIT_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "action": {"type": "string", "enum": ["reply", "iterate", "ignore"]},
+        "action": {
+            "type": "string",
+            "enum": [
+                "reply", "iterate", "ignore", "propose_alternative",
+            ],
+        },
         "reply_text": {"type": "string"},
         "iteration_feedback": {"type": "string"},
         "reasoning": {"type": "string"},
@@ -43,7 +48,10 @@ def build(ctx: ToolContext):
         "exactly once at the end. Action: 'reply' to post text back, "
         "'iterate' to ask Dev to update the MR (also include the "
         "feedback to act on), 'ignore' for chatter that doesn't need "
-        "a response.",
+        "a response, 'propose_alternative' to push back with a better "
+        "approach when the reviewer's request would degrade the system "
+        "(N+1, broken invariants, perf regression) — same payload as "
+        "'reply' (use reply_text for the explanation + alternative).",
         _SUBMIT_RESPONSE_SCHEMA,
     )
     async def _submit(args: dict[str, Any]) -> dict[str, Any]:

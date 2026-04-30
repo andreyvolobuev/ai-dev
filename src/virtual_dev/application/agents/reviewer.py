@@ -414,7 +414,13 @@ class ReviewerAgent:
             decision.action.value, decision.reasoning,
         )
 
-        if decision.action == ResponderAction.REPLY and decision.reply_text:
+        # PROPOSE_ALTERNATIVE has the same chat side-effect as REPLY on
+        # GitLab: post the text on the discussion. The semantic
+        # distinction (push-back vs answer) lives in logs/metrics, not
+        # in the routing.
+        if decision.action in (
+            ResponderAction.REPLY, ResponderAction.PROPOSE_ALTERNATIVE,
+        ) and decision.reply_text:
             assert self._vcs is not None
             try:
                 # Threaded reply when we know the discussion id; falls

@@ -382,3 +382,60 @@ async def test_iterate_forwards_full_thread_transcript_to_dev(
     texts = [m.text for m in thread]
     assert "please rename foo to bar" in texts
     assert "actually let's call it baz" in texts
+
+
+def test_responder_action_propose_alternative_parses() -> None:
+    """The new ``propose_alternative`` enum value must round-trip from
+    its serialised form. Without this the model's submit_response call
+    silently degrades to IGNORE (see thread_responder._call_model
+    fallback) and the push-back is invisible."""
+    assert ResponderAction("propose_alternative") is ResponderAction.PROPOSE_ALTERNATIVE
+
+
+@pytest.mark.asyncio
+async def test_propose_alternative_posts_text_without_iterating(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``propose_alternative`` is a chat-only action (the bot pushes
+    back with a concrete alternative and waits for confirmation). It
+    must NOT trigger a dev iteration, must post the text in the thread
+    like a regular reply, and must increment a separate stat counter so
+    we can observe how often the bot disagrees vs simply answers."""
+    await _insert_mr(session_factory, root_id="root-alt")
+    event = _human_post(
+        id="post-alt", thread_root_id="root-alt",
+        text="оберни это в цикл и дёргай по одному",
+    )
+    chat = _ScriptedChat([event])
+    responder = _ScriptedResponder([ResponderDecision(
+        action=ResponderAction.PROPOSE_ALTERNATIVE,
+        reply_text="Это создаст N+1 — лучше batch endpoint, ок?",
+        reasoning="n+1-warning",
+    )])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await asyncio.sleep(0.1)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    # Text reached the thread under the right root.
+    assert any(
+        body.startswith("Это создаст N+1") and root == "root-alt"
+        for _, body, root in chat.sent
+    )
+    # Dev was NOT dispatched — alternative is a conversation, not a code change.
+    assert dev.calls == []
+    # Listener tracked it under a dedicated counter (separate from
+    # plain ``replies_posted`` so we can measure push-back rate).
+    assert listener.stats.alternatives_proposed == 1
+    # ✅ marker still set so we don't reprocess the source post.
+    assert ("post-alt", _PROCESSED_REACTION) in chat.reactions

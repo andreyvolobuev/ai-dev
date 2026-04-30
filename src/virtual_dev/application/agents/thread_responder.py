@@ -50,6 +50,12 @@ class ResponderAction(str, Enum):
     REPLY = "reply"          # post a text reply in the thread, no code change
     ITERATE = "iterate"      # ask Dev-agent to update the MR, then reply
     IGNORE = "ignore"        # chatter, no response
+    # Like REPLY (text only, no code change) but semantically distinct:
+    # the bot is pushing back on a request because the proposed change
+    # would degrade the system (N+1, broken invariant, perf regression
+    # etc.) and proposing a better path. Tracked separately so we can
+    # measure how often the bot disagrees vs simply answers.
+    PROPOSE_ALTERNATIVE = "propose_alternative"
 
 
 @dataclass

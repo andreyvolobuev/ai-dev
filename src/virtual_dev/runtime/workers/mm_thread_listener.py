@@ -55,6 +55,10 @@ class MmListenerStats:
     events_routed: int = 0
     replies_posted: int = 0
     iterations_dispatched: int = 0
+    # Counted separately from ``replies_posted``: the bot pushed back
+    # on a request via ``propose_alternative`` rather than just
+    # answering. Tracking it lets us see how often the bot disagrees.
+    alternatives_proposed: int = 0
     catchup_posts_replayed: int = 0
     catchup_runs: int = 0
     errors: int = 0
@@ -420,6 +424,17 @@ class MmThreadListener:
         if decision.action == ResponderAction.REPLY and decision.reply_text:
             await self._post_reply(channel_id, root_id, decision.reply_text)
             self.stats.replies_posted += 1
+
+        elif (
+            decision.action == ResponderAction.PROPOSE_ALTERNATIVE
+            and decision.reply_text
+        ):
+            # Same chat side-effect as REPLY (post the text in the
+            # thread) but counted separately so push-back rate is
+            # observable. No dev iteration: we're waiting for the
+            # reviewer to confirm the alternative before changing code.
+            await self._post_reply(channel_id, root_id, decision.reply_text)
+            self.stats.alternatives_proposed += 1
 
         elif decision.action == ResponderAction.ITERATE:
             # Acknowledge immediately so the humans see activity.
