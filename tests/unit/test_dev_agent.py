@@ -383,6 +383,33 @@ async def test_dev_skips_when_open_mr_already_exists(
 
 
 @pytest.mark.asyncio
+async def test_dev_raises_on_infra_failure_so_bus_redelivers(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """When Claude CLI dies mid-run (network drop, stream idle timeout,
+    SDK reports is_error=True), dev must NOT swallow it as a normal
+    FAILED outcome — that gets ack'd and the work is silently lost.
+    Raise instead so AgentRunner skips the ack and the bus lease
+    expires → message is redelivered when the CLI is healthy again."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    vcs = _FakeVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=22, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="stop_sequence",
+        is_error=True,
+    ))
+    dev = _make_dev(session_factory, vcs=vcs, code_agent=code_agent, preset_submission=None)
+
+    with pytest.raises(Exception) as exc_info:
+        await dev.handle_plan("jira", "DM-7")
+    assert "infra" in str(exc_info.value).lower() or "stream" in str(exc_info.value).lower() \
+        or "claude" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
 async def test_dev_fails_when_no_submission(
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path: Path,

@@ -55,6 +55,12 @@ class CodeAgentResult:
     output_tokens: int
     cost_usd: float
     stopped_reason: str                  # "end_turn" | "max_turns" | "error" | "killed"
+    # True iff the underlying SDK reported is_error on its terminal
+    # message, OR the CLI subprocess died mid-stream. Callers treat
+    # this as an *infrastructure* failure (network / SDK / CLI), not
+    # as the model giving up — re-raising is the contract so the
+    # message bus's lease redelivers when infra is healthy again.
+    is_error: bool = False
 
 
 class CodeAgentPort(ABC):

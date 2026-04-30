@@ -109,6 +109,7 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
         output_tokens = 0
         stop_reason = "unknown"
         got_result = False
+        is_error = False
 
         # Trace: announce start with both prompts so the UI can show
         # exactly what we sent to the model. We don't truncate here —
@@ -164,6 +165,7 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
                     input_tokens = int(usage.get("input_tokens") or 0)
                     output_tokens = int(usage.get("output_tokens") or 0)
                     if event.is_error:
+                        is_error = True
                         logger.warning(
                             "Claude Agent SDK reported error for agent={} stop={}",
                             request.agent_key,
@@ -229,6 +231,7 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
             output_tokens=output_tokens,
             cost_usd=cost_usd,
             stopped_reason=stop_reason,
+            is_error=is_error,
         )
 
     def stream_task(self, request: CodeAgentRequest) -> AsyncIterator[str]:

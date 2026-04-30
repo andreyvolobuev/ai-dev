@@ -56,6 +56,13 @@ from virtual_dev.infrastructure.db.mappers import row_to_plan
 _SLUG_SAFE_RE = re.compile(r"[^a-z0-9]+")
 
 
+class CodeAgentInfraError(RuntimeError):
+    """Infrastructure failure under the model (CLI died, stream timeout,
+    SDK is_error). Distinct from a model deciding to fail — this kind
+    of failure must NOT be ack'd on the bus so the message is
+    redelivered when infra recovers."""
+
+
 class DevSkipReason(str, Enum):
     NO_TASK = "no_task"
     NO_READY_PLAN = "no_ready_plan"
@@ -176,6 +183,23 @@ class DevAgent:
             logger.exception("Dev[{}] model call failed for {}", self._agent_key, external_id)
             await self._set_internal_status(task_row.id, TaskStatus.FAILED)
             raise
+
+        # Infra failure (CLI subprocess died, stream idle timeout,
+        # SDK reported is_error). The model didn't decide to fail —
+        # the world failed under it. Don't ack the bus message:
+        # leave the task in CODING and raise so AgentRunner skips
+        # the ack, the lease expires, and the bus redelivers when
+        # infra is healthy again.
+        if result.is_error:
+            logger.warning(
+                "Dev[{}] infra failure for {} (stop={}); leaving task in "
+                "CODING for bus to redeliver",
+                self._agent_key, external_id, result.stopped_reason,
+            )
+            raise CodeAgentInfraError(
+                f"Claude Agent SDK reported infra failure for {external_id} "
+                f"(stop={result.stopped_reason!r})"
+            )
 
         if not captured:
             logger.warning(
