@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, cast
 
+import requests
 from atlassian import Jira
 from loguru import logger
 from requests.adapters import HTTPAdapter
@@ -91,7 +92,7 @@ class JiraTaskTracker(TaskTrackerPort):
         def _fetch() -> list[dict[str, Any]]:
             result = self._client.jql(jql, limit=limit)
             if not isinstance(result, dict):
-                raise RuntimeError(_unexpected_response_message(result))
+                _raise_for_non_dict_response(result)
             return cast(list[dict[str, Any]], result.get("issues", []))
 
         issues = await asyncio.to_thread(_fetch)
@@ -101,7 +102,7 @@ class JiraTaskTracker(TaskTrackerPort):
         def _fetch() -> dict[str, Any]:
             result = self._client.issue(external_id)
             if not isinstance(result, dict):
-                raise RuntimeError(_unexpected_response_message(result))
+                _raise_for_non_dict_response(result)
             return cast(dict[str, Any], result)
 
         issue = await asyncio.to_thread(_fetch)
@@ -403,3 +404,30 @@ def _unexpected_response_message(result: Any) -> str:
     if not preview:
         return f"Unexpected Jira response: {type_name} (empty body)"
     return f"Unexpected Jira response: {type_name}: {preview}"
+
+
+def _looks_like_html(body: str) -> bool:
+    """True if the body looks like an HTML document — almost always a
+    captive portal / WiFi login / proxy error page in our context.
+    Real Jira always responds with JSON."""
+    head = body.lstrip()[:200].lower()
+    return head.startswith(("<!doctype html", "<html"))
+
+
+def _raise_for_non_dict_response(result: Any) -> None:
+    """Classify a non-dict response and raise the appropriate type.
+
+    HTML body → ``requests.ConnectionError`` so the orchestrator's
+    existing tick-level retry treats it as a network blip (captive
+    portal / hotspot login / corp proxy banner). Anything else surfaces
+    as the original RuntimeError preview so the operator can diagnose.
+    """
+    body = str(result)
+    if _looks_like_html(body):
+        # Trim a one-line preview so the log entry stays grep-able.
+        preview = " ".join(body.split())[:160]
+        raise requests.ConnectionError(
+            f"captive-portal-like HTML response from Jira (no JSON); "
+            f"preview: {preview}"
+        )
+    raise RuntimeError(_unexpected_response_message(result))

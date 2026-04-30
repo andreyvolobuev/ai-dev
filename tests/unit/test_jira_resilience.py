@@ -52,23 +52,46 @@ def test_jira_session_has_retry_adapter() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_tasks_treats_html_response_as_captive_portal() -> None:
+    """A captive portal / hotspot login page returns HTML instead of
+    JSON. Treat as a network failure (ConnectionError), not as a
+    permanent unexpected-response error — orchestrator's existing
+    exception handler logs and retries the next tick instead of
+    surfacing a confusing RuntimeError per poll."""
+    import requests
+    tracker = _build()
+    captive = (
+        '<!DOCTYPE html><html> <head> <meta charset="UTF-8">'
+        '<title> Секретный уровень </title></head>'
+        '<body>Войдите в Wi-Fi 2GIS</body></html>'
+    )
+
+    with (
+        mock.patch.object(tracker._client, "jql", return_value=captive),  # type: ignore[attr-defined]
+        pytest.raises(requests.ConnectionError) as exc_info,
+    ):
+        await tracker.fetch_tasks("project = X")
+
+    msg = str(exc_info.value).lower()
+    assert "captive" in msg or "html" in msg or "portal" in msg
+
+
+@pytest.mark.asyncio
 async def test_fetch_tasks_logs_preview_on_non_json_response(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """When the proxy returns an HTML error page, the adapter
-    surfaces 'Unexpected Jira response: str'. Make the failure
-    diagnosable: the message must include a preview of the body so
-    operators can tell (login redirect / 5xx / captcha / ...)."""
+    """Non-HTML / non-JSON garbage (truncated body, broken proxy)
+    that we can't classify as a captive portal still surfaces with a
+    body preview so an operator can diagnose at a glance."""
     tracker = _build()
 
     # Patch the underlying client.jql to return a string the way
     # atlassian-python-api does when the response isn't JSON.
-    fake_html = (
-        "<html><head><title>503 Service Unavailable</title></head>"
-        "<body>upstream timed out</body></html>"
-    )
+    # Plain text (no HTML doctype) — falls through captive-portal
+    # detection and surfaces as the original RuntimeError preview.
+    fake_garbage = "503 Service Unavailable: upstream timed out"
     with (
-        mock.patch.object(tracker._client, "jql", return_value=fake_html),  # type: ignore[attr-defined]
+        mock.patch.object(tracker._client, "jql", return_value=fake_garbage),  # type: ignore[attr-defined]
         pytest.raises(RuntimeError) as exc_info,
     ):
         await tracker.fetch_tasks("project = X")
