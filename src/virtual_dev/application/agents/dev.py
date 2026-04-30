@@ -38,6 +38,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from virtual_dev.adapters.vcs.gitlab import VcsError
 from virtual_dev.application.services import PromptsLoader, ResearcherToolkit, RulesLoader
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus
 from virtual_dev.domain.models.plan import Plan, PlanStatus
@@ -90,6 +91,18 @@ class CodeAgentInfraError(RuntimeError):
     SDK is_error). Distinct from a model deciding to fail — this kind
     of failure must NOT be ack'd on the bus so the message is
     redelivered when infra recovers."""
+
+
+class CodeAgentPermanentError(RuntimeError):
+    """Failure that won't fix itself by retrying — operator action needed.
+
+    Examples: the local checkout has uncommitted changes; ``local_path``
+    points at a non-git directory; repository misconfigured. Distinct from
+    :class:`CodeAgentInfraError` (transient, should retry). The Dev-inbox
+    catches this, surfaces a tracker comment so a human can step in, and
+    returns normally so the bus acks (no redelivery). DevAgent transitions
+    the task to FAILED before raising so the recovery sweep skips it.
+    """
 
 
 class DevSkipReason(str, Enum):
@@ -195,10 +208,23 @@ class DevAgent:
         plan = row_to_plan(plan_row)
 
         # Prepare workspace — clone + fresh task branch off default.
-        workspace_path = await self._vcs.ensure_clone(self._repo_key)
-        branch_name = self._branch_name(task_row)
-        base_branch = self._default_branch()
-        await self._vcs.create_branch(self._repo_key, branch_name, base_branch)
+        # VcsError here is permanent: dirty working tree, non-git
+        # local_path, missing repo config. Bus retries can't fix any of
+        # these — flip the task to FAILED so the recovery sweep skips
+        # it, then raise CodeAgentPermanentError so the inbox surfaces
+        # a tracker comment for the human to act on.
+        try:
+            workspace_path = await self._vcs.ensure_clone(self._repo_key)
+            branch_name = self._branch_name(task_row)
+            base_branch = self._default_branch()
+            await self._vcs.create_branch(self._repo_key, branch_name, base_branch)
+        except VcsError as exc:
+            logger.warning(
+                "Dev[{}] permanent VCS failure for {}: {}",
+                self._agent_key, external_id, exc,
+            )
+            await self._set_internal_status(task_row.id, TaskStatus.FAILED)
+            raise CodeAgentPermanentError(str(exc)) from exc
 
         # Transition task.
         await self._set_internal_status(task_row.id, TaskStatus.CODING)

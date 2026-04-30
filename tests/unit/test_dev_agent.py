@@ -7,7 +7,6 @@ tracks calls and simulates a real workspace against tmp_path.
 
 from __future__ import annotations
 
-import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -16,7 +15,9 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from virtual_dev.adapters.vcs.gitlab import VcsError
 from virtual_dev.application.agents import DevAgent, DevOutcome, DevSkipReason
+from virtual_dev.application.agents.dev import CodeAgentPermanentError
 from virtual_dev.application.services import PromptsLoader, RulesLoader
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus, PipelineStatus
 from virtual_dev.domain.models.plan import PlanStatus
@@ -37,7 +38,6 @@ from virtual_dev.infrastructure.config.schema import (
 from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow, TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
-
 
 # --- Fakes ---
 
@@ -451,6 +451,52 @@ async def test_dev_raises_on_infra_failure_so_bus_redelivers(
         await dev.handle_plan("jira", "DM-7")
     assert "infra" in str(exc_info.value).lower() or "stream" in str(exc_info.value).lower() \
         or "claude" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_dev_raises_permanent_on_dirty_working_tree(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """If the local checkout has uncommitted changes (operator left
+    debris from a previous run), ``ensure_clone`` raises ``VcsError``.
+    Retrying won't fix it — we must mark the task FAILED, raise
+    ``CodeAgentPermanentError`` so the bus acks (no redelivery) and the
+    inbox can post a tracker comment so a human steps in."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    class _DirtyVcs(_FakeVcs):
+        async def ensure_clone(self, repo_key: str) -> str:
+            raise VcsError(
+                f"local_path for {repo_key!r} (/tmp) has uncommitted changes; "
+                f"stash or commit before running the Dev-agent"
+            )
+
+    vcs = _DirtyVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=0, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent, preset_submission=None,
+    )
+
+    with pytest.raises(CodeAgentPermanentError) as exc_info:
+        await dev.handle_plan("jira", "DM-7")
+    assert "uncommitted" in str(exc_info.value).lower()
+
+    # Task must be FAILED so the recovery sweep doesn't re-publish
+    # plan.ready every 600s.
+    async with session_factory() as session:
+        task_row = (await session.execute(
+            select(TaskRow).where(TaskRow.external_id == "DM-7")
+        )).scalar_one()
+    assert task_row.internal_status == TaskStatus.FAILED.value
+    # No model call, no commit/push.
+    kinds = [c[0] for c in vcs.calls]
+    assert "create_branch" not in kinds
+    assert "commit_all" not in kinds
 
 
 @pytest.mark.asyncio

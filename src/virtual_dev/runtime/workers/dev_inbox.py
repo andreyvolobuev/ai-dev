@@ -17,6 +17,7 @@ from __future__ import annotations
 from loguru import logger
 
 from virtual_dev.application.agents import DevAgent, DevOutcome
+from virtual_dev.application.agents.dev import CodeAgentPermanentError
 from virtual_dev.domain.ports.message_bus import AgentMessage
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 from virtual_dev.infrastructure.config import AppConfig
@@ -67,6 +68,35 @@ class DevInbox:
 
         try:
             result = await self._dev.handle_plan(tracker, external_id)
+        except CodeAgentPermanentError as exc:
+            # Won't fix itself by retrying — DevAgent already flipped the
+            # task to FAILED so the recovery sweep won't re-publish.
+            # Surface what's wrong via a tracker comment so the human
+            # can act (typically: clean a dirty local_path checkout).
+            logger.warning(
+                "DevInbox: permanent failure for {}: {}", external_id, exc,
+            )
+            if self._post_to_tracker and self._task_tracker is not None:
+                try:
+                    await self._task_tracker.comment(
+                        external_id,
+                        _render_failure_comment(
+                            self._config.notifications.jira.failure_comment,
+                            notes=(
+                                f"Dev-agent stopped permanently: {exc}\n\n"
+                                "This won't retry on its own — operator "
+                                "action needed (typically: clean the local "
+                                "checkout, then re-trigger)."
+                            ),
+                            branch=None,
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "DevInbox: permanent-failure comment failed for {}",
+                        external_id,
+                    )
+            return
         except Exception:
             logger.exception("DevInbox: Dev-agent raised for {}", external_id)
             return
