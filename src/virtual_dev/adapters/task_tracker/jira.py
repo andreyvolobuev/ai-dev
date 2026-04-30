@@ -14,6 +14,8 @@ from typing import Any, cast
 
 from atlassian import Jira
 from loguru import logger
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from virtual_dev.domain.models.task import (
     Task,
@@ -76,6 +78,12 @@ class JiraTaskTracker(TaskTrackerPort):
         # expects. The old ``username=user, password=token`` form sent Basic
         # Auth which PATs don't support in most Jira Server configurations.
         self._client = Jira(url=url, token=token, cloud=False)
+        # Mount a Retry-aware adapter on the underlying requests
+        # session. Default HTTPAdapter does no retries — so a single
+        # stale TCP socket after a network blip surfaces as
+        # ConnectionResetError instead of being transparently
+        # reconnected. See test_jira_resilience for the contract.
+        _install_retry_adapter(self._client._session)
         # For building web URLs to tickets.
         self._browse_base_url = (browse_base_url or url).rstrip("/")
 
@@ -83,7 +91,7 @@ class JiraTaskTracker(TaskTrackerPort):
         def _fetch() -> list[dict[str, Any]]:
             result = self._client.jql(jql, limit=limit)
             if not isinstance(result, dict):
-                raise RuntimeError(f"Unexpected Jira response: {type(result).__name__}")
+                raise RuntimeError(_unexpected_response_message(result))
             return cast(list[dict[str, Any]], result.get("issues", []))
 
         issues = await asyncio.to_thread(_fetch)
@@ -93,7 +101,7 @@ class JiraTaskTracker(TaskTrackerPort):
         def _fetch() -> dict[str, Any]:
             result = self._client.issue(external_id)
             if not isinstance(result, dict):
-                raise RuntimeError(f"Unexpected Jira response: {type(result).__name__}")
+                raise RuntimeError(_unexpected_response_message(result))
             return cast(dict[str, Any], result)
 
         issue = await asyncio.to_thread(_fetch)
@@ -357,3 +365,41 @@ def _fetch_comments(client: Jira, key: str) -> list[TaskComment]:
             external_id=str(entry.get("id") or "") or None,
         ))
     return out
+
+
+def _install_retry_adapter(session: Any) -> None:
+    """Mount an HTTPAdapter with Retry on a requests Session.
+
+    Defaults give 3 connect + 3 read retries with exponential backoff,
+    plus retry on 502/503/504 (transient proxy/upstream blips).
+    Connection-reset / dead-pool sockets after a network blip are
+    handled by ``connect`` retries because urllib3 raises a connect
+    error when the existing socket is found dead on first use.
+    """
+    retry = Retry(
+        total=5,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=1.0,
+        status_forcelist=[502, 503, 504],
+        allowed_methods=frozenset(["GET", "POST", "PUT", "DELETE"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+
+
+def _unexpected_response_message(result: Any) -> str:
+    """Format the 'non-dict response from Jira' error with a body
+    preview so the operator can tell what came back (login redirect /
+    5xx HTML / captcha / proxy banner / ...). Without the preview the
+    raw exception was just ``Unexpected Jira response: str``."""
+    type_name = type(result).__name__
+    preview = str(result).strip()
+    if len(preview) > 200:
+        preview = preview[:200] + "..."
+    if not preview:
+        return f"Unexpected Jira response: {type_name} (empty body)"
+    return f"Unexpected Jira response: {type_name}: {preview}"
