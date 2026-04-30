@@ -27,7 +27,7 @@ repositories:
     url: git@gitlab.2gis.ru:sd-data-mining/bellingshausen.git
     # local_path — машино-зависимо; задаётся в config/local.yaml (gitignored).
     description: "Монорепа (бэкенд + фронтенд)."
-    jira_components: []  # заполнишь позже
+    jira_components: ["Krusenstern"]
     default_branch: master
     agents:
       backend: true

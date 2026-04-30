@@ -94,6 +94,6 @@ escalation:
 #   аналиста без READY-плана эскалируем тимлиду.
 # max_goal_age_hours: hard deadline для всей задачи.
 clarification:
-  coalesce_window_seconds: 600
+  coalesce_window_seconds: 180
   max_planner_calls_per_goal: 8
   max_goal_age_hours: 48

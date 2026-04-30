@@ -617,6 +617,68 @@ async def test_system_prompt_includes_rules(
     assert "tests_cmd" in prompt  # repo context injected
 
 
+def test_dev_tool_surface_has_all_expected_tools(
+    tmp_path: Path,
+) -> None:
+    """Regression: every tool a dev-agent is supposed to use must
+    actually register in the MCP surface. A tool whose ``build()``
+    returns None (because ToolContext is missing a required field)
+    silently drops out of the allow-list and the agent never finds
+    it via the auto-rendered catalogue.
+
+    For dev that means:
+      * ``submit_mr`` — terminal tool. Needs submit_capture + run_state.
+      * ``search_mr_history`` — only shared-group tool the dev is
+        allowed to see (other shared tools are stripped from the
+        allow-list intentionally). Needs researcher.
+
+    Filesystem builtins (Read/Glob/Grep/Edit/Write/Bash) are SDK-side,
+    not MCP — checked separately as a sanity assertion."""
+    from virtual_dev.application.services import PromptsLoader, RulesLoader
+    from virtual_dev.application.agents.dev import DevAgent
+    from virtual_dev.application.services import ResearcherToolkit
+
+    cfg = _cfg()
+    dev = DevAgent(
+        agent_key="dev-bellingshausen-backend",
+        repo_key="bellingshausen",
+        specialisation="backend",
+        vcs=cast(VcsPort, _FakeVcs(tmp_path / "ws")),
+        code_agent=cast(CodeAgentPort, _FakeCodeAgent(CodeAgentResult(
+            final_text="", turns=0, input_tokens=0, output_tokens=0,
+            cost_usd=0.0, stopped_reason="end_turn",
+        ))),
+        rules_loader=RulesLoader(Path("/nonexistent_rules")),
+        prompts_loader=PromptsLoader("/no-prompts-dir"),
+        session_factory=cast(Any, None),
+        config=cfg,
+        settings=Settings(),
+        researcher=cast(ResearcherToolkit, object()),
+    )
+
+    _, allowed_tool_names, groups, captured = dev._build_tool_surface()
+
+    # Tools the dev MUST be able to call.
+    expected_mcp = {
+        "mcp__virtual_dev_dev__submit_mr",
+        "mcp__virtual_dev_shared__search_mr_history",
+    }
+    missing = expected_mcp - set(allowed_tool_names)
+    assert not missing, f"missing required dev tools: {missing}"
+
+    # The terminal tool must be in the dev-group catalogue so it
+    # surfaces in the auto-rendered tools_catalog.
+    assert any(t.name == "submit_mr" for t in groups.get("dev", []))
+
+    # SDK filesystem builtins are appended in addition.
+    for builtin in ("Read", "Glob", "Grep", "Edit", "Write", "Bash"):
+        assert builtin in allowed_tool_names
+
+    # captured is the same dict the runtime reads back after the
+    # model calls submit_mr; must be a mutable dict.
+    assert isinstance(captured, dict)
+
+
 def test_rules_loader_reads_agent_file(tmp_path: Path) -> None:
     (tmp_path / "foo.md").write_text("hello rules")
     loader = RulesLoader(tmp_path)

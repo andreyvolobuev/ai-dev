@@ -451,12 +451,16 @@ class DevAgent:
         workspace_path: str, feedback: str,
         feedback_kind: str = "mr_review",
     ) -> CodeAgentRequest:
-        system_prompt = self._compose_system_prompt(task_row)
+        from virtual_dev.tools import render_tools_catalog
+
+        mcp_servers, allowed_tool_names, groups, captured = self._build_tool_surface()
+        tools_catalog = render_tools_catalog(groups)
+        system_prompt = self._compose_system_prompt(task_row, tools_catalog)
         user_prompt = self._render_iteration_prompt(
             task_row=task_row, plan=plan, feedback=feedback,
             feedback_kind=feedback_kind,
         )
-        return CodeAgentRequest(
+        request = CodeAgentRequest(
             agent_key=self._agent_key,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -464,6 +468,10 @@ class DevAgent:
             max_turns=self._max_turns,
             model=self._config.agents.models.default,
         )
+        request.extras["mcp_servers"] = mcp_servers
+        request.extras["allowed_tool_names"] = allowed_tool_names
+        request.extras["submit_capture"] = captured
+        return request
 
     def _render_iteration_prompt(
         self, *, task_row: TaskRow, plan: Plan, feedback: str,
@@ -501,19 +509,46 @@ class DevAgent:
     async def _call_model(
         self, request: CodeAgentRequest
     ) -> tuple[dict[str, Any], CodeAgentResult]:
+        # ``mcp_servers`` / ``allowed_tool_names`` are populated by
+        # ``_build_tool_surface`` during request construction so the
+        # tools catalogue can also be inlined into the system prompt.
+        # The dev's submit_capture lives on ``request.extras`` for the
+        # same reason — it's wired in once when we build the surface.
+        captured: dict[str, Any] = request.extras.pop("submit_capture", {})
+
+        result = await self._code_agent.run_task(request)
+        return captured, result
+
+    def _build_tool_surface(
+        self,
+    ) -> tuple[
+        dict[str, Any], list[str], dict[str, list[Any]], dict[str, Any],
+    ]:
+        """Build the dev-scoped MCP server set + allowed-list + the
+        rendered tools catalogue. Returns also the ``submit_capture``
+        dict so the caller can read it back after the run.
+
+        ``submit_mr`` (the dev's terminal tool) lives in
+        ``tools/submit_mr.py``; auto-discovery wires it in alongside
+        the shared group's ``search_mr_history``. The ``only_groups``
+        filter keeps the dev scoped — it must not see analyst-only
+        tools like ``dm_user`` or ``submit_plan``.
+
+        Both ``submit_capture`` AND ``run_state`` must be set on the
+        context — ``submit_mr.build()`` returns None if either is
+        missing, which silently drops the terminal tool from the MCP
+        surface and the model finishes without being able to submit.
+        """
         from virtual_dev.tools import ToolContext, build_tool_servers
 
-        # ``submit_mr`` (the dev's terminal tool) lives in
-        # ``tools/submit_mr.py``; auto-discovery wires it in alongside
-        # the shared group's ``search_mr_history``. The ``only_groups``
-        # filter keeps the dev scoped — it must not see analyst-only
-        # tools like ``dm_user`` or ``submit_plan``.
         captured: dict[str, Any] = {}
+        run_state: dict[str, Any] = {"terminal": False}
         ctx = ToolContext(
             researcher=self._researcher,
             submit_capture=captured,
+            run_state=run_state,
         )
-        mcp_servers, allowed_tool_names, _ = build_tool_servers(
+        mcp_servers, allowed_tool_names, groups = build_tool_servers(
             ctx, only_groups={"dev", "shared"},
         )
         # Restrict the shared surface to just ``search_mr_history`` —
@@ -529,20 +564,27 @@ class DevAgent:
         allowed_tool_names.extend(
             ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
         )
-        request.extras["mcp_servers"] = mcp_servers
-        request.extras["allowed_tool_names"] = allowed_tool_names
-
-        result = await self._code_agent.run_task(request)
-        return captured, result
+        # Mirror the allow-list filter into the rendered catalogue:
+        # the model shouldn't see shared-group entries it can't call.
+        if "shared" in groups:
+            groups = dict(groups)
+            groups["shared"] = [
+                t for t in groups["shared"] if t.name == "search_mr_history"
+            ]
+        return mcp_servers, allowed_tool_names, groups, captured
 
     # --- request building ---
 
     def _build_request(
         self, *, plan: Plan, task_row: TaskRow, workspace_path: str
     ) -> CodeAgentRequest:
-        system_prompt = self._compose_system_prompt(task_row)
+        from virtual_dev.tools import render_tools_catalog
+
+        mcp_servers, allowed_tool_names, groups, captured = self._build_tool_surface()
+        tools_catalog = render_tools_catalog(groups)
+        system_prompt = self._compose_system_prompt(task_row, tools_catalog)
         user_prompt = self._render_user_prompt(task_row=task_row, plan=plan)
-        return CodeAgentRequest(
+        request = CodeAgentRequest(
             agent_key=self._agent_key,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
@@ -550,9 +592,19 @@ class DevAgent:
             max_turns=self._max_turns,
             model=self._config.agents.models.default,
         )
+        request.extras["mcp_servers"] = mcp_servers
+        request.extras["allowed_tool_names"] = allowed_tool_names
+        request.extras["submit_capture"] = captured
+        return request
 
-    def _compose_system_prompt(self, task_row: TaskRow) -> str:
-        base = self._prompts.load(_DEV_PROMPT_NAME, fallback=_DEV_FALLBACK_PROMPT)
+    def _compose_system_prompt(
+        self, task_row: TaskRow, tools_catalog: str = "",
+    ) -> str:
+        base = self._prompts.render(
+            _DEV_PROMPT_NAME,
+            fallback=_DEV_FALLBACK_PROMPT,
+            tools_catalog=tools_catalog,
+        )
         parts: list[str] = [base]
         repo_cfg = self._config.get_repository(self._repo_key)
         if repo_cfg is not None:
