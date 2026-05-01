@@ -50,6 +50,10 @@
   .event-review_ping_held { border-color: #d29922; background: #2d2718; }
   .event-comment_received { border-color: #79c0ff; }
   .event-comment_received[data-class="chatter"] { border-color: #6e7681; opacity: 0.85; }
+  .event-responder_decision { border-color: #bc8cff; }
+  .event-responder_decision[data-action="ignore"] { border-color: #6e7681; opacity: 0.85; }
+  .event-responder_decision[data-action="iterate"] { border-color: #3fb950; }
+  .event-responder_decision[data-action="propose_alternative"] { border-color: #d29922; background: #2d2718; }
   .field-row { margin: 2px 0; font-size: 11px; }
   .field-label { color: #8b949e; }
   .event-pre {
@@ -90,6 +94,7 @@
       <option value="task_event">task_event</option>
       <option value="review_ping_held">review_ping_held</option>
       <option value="comment_received">comment_received</option>
+      <option value="responder_decision">responder_decision</option>
     </select>
   </label>
   <button id="expand-all-btn" type="button">▼ Развернуть всё</button>
@@ -160,6 +165,9 @@
     div.className = 'event event-' + ev.type;
     if (ev.payload && ev.payload.classification) {
       div.dataset.class = ev.payload.classification;
+    }
+    if (ev.payload && ev.payload.action) {
+      div.dataset.action = ev.payload.action;
     }
     const meta = document.createElement('div');
     meta.className = 'event-meta';
@@ -257,6 +265,34 @@
       pre.className = 'event-pre';
       pre.textContent = p.preview || '';
       wrap.appendChild(pre);
+    } else if (ev.type === 'responder_decision') {
+      const url = p.mr_web_url ? `<a href="${escapeHtml(p.mr_web_url)}" target="_blank" rel="noopener">${escapeHtml(p.mr_title || 'MR')}</a>` : escapeHtml(p.mr_title || 'MR');
+      const action = p.action || '?';
+      const icon = action === 'reply' ? '💬' : action === 'iterate' ? '🔧' : action === 'propose_alternative' ? '⚠️' : '🤐';
+      const failureNote = p.reasoning === 'model-did-not-submit'
+        ? ' <strong style="color:#f85149">⚠ model ended turn without calling submit_response — see prompt/tool-surface bug</strong>'
+        : '';
+      wrap.innerHTML = `
+        <div>${icon} responder → <code>${escapeHtml(action)}</code> on ${url} (replying to <code>@${escapeHtml(p.latest_author || '')}</code>) · cost=$${(p.cost_usd||0).toFixed(4)}${failureNote}</div>
+        <div class="field-row"><span class="field-label">reasoning:</span> ${escapeHtml(p.reasoning || '(none)')}</div>
+      `;
+      if (p.reply_text) {
+        const pre = document.createElement('pre');
+        pre.className = 'event-pre';
+        pre.textContent = p.reply_text;
+        wrap.appendChild(pre);
+      }
+      if (p.iteration_feedback) {
+        const det = document.createElement('details');
+        const sum = document.createElement('summary');
+        sum.textContent = `iteration_feedback (${p.iteration_feedback.length} chars)`;
+        det.appendChild(sum);
+        const pre = document.createElement('pre');
+        pre.className = 'event-pre';
+        pre.textContent = p.iteration_feedback;
+        det.appendChild(pre);
+        wrap.appendChild(det);
+      }
     } else {
       const pre = document.createElement('pre');
       pre.className = 'event-pre';

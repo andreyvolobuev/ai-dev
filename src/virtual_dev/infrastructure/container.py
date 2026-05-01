@@ -303,6 +303,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         config=config,
         injection_filter=injection_filter,
         prompts_loader=prompts_loader,
+        trace=trace,
     )
 
     # Phase 5.0: analyst is the only agent.

@@ -35,6 +35,11 @@ from typing import Any
 
 from loguru import logger
 
+from virtual_dev.application.services.agent_trace import (
+    AgentTrace,
+    AgentTraceEvent,
+    emit_if,
+)
 from virtual_dev.application.services.injection_filter import (
     SYSTEM_PROMPT_ABOUT_UNTRUSTED,
     InjectionFilter,
@@ -88,12 +93,14 @@ class ThreadResponderAgent:
         prompts_loader: PromptsLoader,
         injection_filter: InjectionFilter | None = None,
         max_turns: int = 20,
+        trace: AgentTrace | None = None,
     ) -> None:
         self._code_agent = code_agent
         self._config = config
         self._prompts = prompts_loader
         self._filter = injection_filter or InjectionFilter()
         self._max_turns = max_turns
+        self._trace = trace
 
     async def decide(
         self,
@@ -120,23 +127,43 @@ class ThreadResponderAgent:
                 "ThreadResponder: model did not call submit_response (stop={})",
                 result.stopped_reason,
             )
-            return ResponderDecision(
+            decision = ResponderDecision(
                 action=ResponderAction.IGNORE,
                 reasoning="model-did-not-submit",
                 cost_usd=result.cost_usd,
             )
+        else:
+            try:
+                action = ResponderAction(str(captured.get("action") or "").lower())
+            except ValueError:
+                action = ResponderAction.IGNORE
+            decision = ResponderDecision(
+                action=action,
+                reply_text=str(captured.get("reply_text") or "").strip(),
+                iteration_feedback=str(captured.get("iteration_feedback") or "").strip(),
+                reasoning=str(captured.get("reasoning") or "").strip(),
+                cost_usd=result.cost_usd,
+            )
 
-        try:
-            action = ResponderAction(str(captured.get("action") or "").lower())
-        except ValueError:
-            action = ResponderAction.IGNORE
-        return ResponderDecision(
-            action=action,
-            reply_text=str(captured.get("reply_text") or "").strip(),
-            iteration_feedback=str(captured.get("iteration_feedback") or "").strip(),
-            reasoning=str(captured.get("reasoning") or "").strip(),
-            cost_usd=result.cost_usd,
-        )
+        # Surface every decision (including the failure mode where the
+        # model didn't submit) so the UI activity tab shows what the
+        # responder did with the comment. Without this an "ignore" goes
+        # silent and operators have no signal the bot saw the message.
+        await emit_if(self._trace, AgentTraceEvent(
+            type="responder_decision",
+            agent_key=self.agent_key,
+            payload={
+                "action": decision.action.value,
+                "reasoning": decision.reasoning,
+                "reply_text": decision.reply_text,
+                "iteration_feedback": decision.iteration_feedback,
+                "mr_title": mr_title,
+                "mr_web_url": mr_web_url,
+                "latest_author": latest_reply.author_id,
+                "cost_usd": decision.cost_usd,
+            },
+        ))
+        return decision
 
     # --- internals ---
 
@@ -148,8 +175,17 @@ class ThreadResponderAgent:
         # ``submit_response`` lives in ``tools/submit_response.py``
         # (group "responder"); auto-discovery wires it in. The
         # responder doesn't need analyst / dev / researcher tools.
+        # ``submit_response.build()`` returns None unless BOTH
+        # ``submit_capture`` and ``run_state`` are set on the context.
+        # Forgetting ``run_state`` silently drops the terminal tool
+        # from the MCP surface; the model then ends its turn with
+        # plaintext, and the wrapper logs a confusing
+        # "model did not call submit_response" warning. See
+        # ``tests/unit/test_thread_responder.py`` for the regression
+        # guard that pins both fields.
         captured: dict[str, Any] = {}
-        ctx = ToolContext(submit_capture=captured)
+        run_state: dict[str, Any] = {"terminal": False}
+        ctx = ToolContext(submit_capture=captured, run_state=run_state)
         mcp_servers, allowed, _ = build_tool_servers(
             ctx, only_groups={"responder"},
         )
@@ -171,6 +207,9 @@ class ThreadResponderAgent:
         )
         request.extras["mcp_servers"] = mcp_servers
         request.extras["allowed_tool_names"] = allowed
+        # Expose for tests — the in-process model fake mutates this
+        # dict to simulate the model calling submit_response.
+        request.extras["submit_capture"] = captured
         result = await self._code_agent.run_task(request)
         return captured, result
 
