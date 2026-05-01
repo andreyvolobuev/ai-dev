@@ -559,6 +559,48 @@ async def test_review_ping_not_sent_while_draft(
 
 
 @pytest.mark.asyncio
+async def test_review_ping_held_emits_activity_event_on_draft(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Holding the 'please review' ping while the MR is still Draft is
+    intentional, but operators get NO signal in the live activity tab —
+    they see hours of silence and assume the bot is broken. Emit a
+    ``review_ping_held`` AgentTraceEvent with the reason so the
+    activity feed shows the held state alongside the MR identifier."""
+    from virtual_dev.application.services.agent_trace import AgentTrace
+
+    await _insert_mr(session_factory, review_ping_sent=False, status="draft")
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        mr_status=MRStatus.DRAFT,
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    trace = AgentTrace()
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev",
+        trace=trace,
+    )
+
+    await agent.tick()
+
+    held = [e for e in list(trace._history) if e.type == "review_ping_held"]
+    assert len(held) == 1, (
+        f"expected exactly one review_ping_held event; "
+        f"got types={[e.type for e in trace._history]}"
+    )
+    event = held[0]
+    assert event.agent_key == "reviewer"
+    assert event.payload.get("reason") == "draft"
+    assert event.payload.get("repo_key") == "bellingshausen"
+    assert event.payload.get("iid") == 42
+
+
+@pytest.mark.asyncio
 async def test_approvals_threshold_posts_merge_ping(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

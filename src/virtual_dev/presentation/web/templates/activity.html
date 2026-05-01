@@ -47,6 +47,7 @@
   .event-question_dispatched { border-color: #ff7b72; background: #2d1d1d; }
   .event-classification_applied { border-color: #79c0ff; background: #15243a; }
   .event-task_event { border-color: #a371f7; }
+  .event-review_ping_held { border-color: #d29922; background: #2d2718; }
   .field-row { margin: 2px 0; font-size: 11px; }
   .field-label { color: #8b949e; }
   .event-pre {
@@ -85,6 +86,7 @@
       <option value="question_dispatched">question_dispatched</option>
       <option value="classification_applied">classification_applied</option>
       <option value="task_event">task_event</option>
+      <option value="review_ping_held">review_ping_held</option>
     </select>
   </label>
   <button id="expand-all-btn" type="button">▼ Развернуть всё</button>
@@ -232,6 +234,12 @@
         pre.textContent = p.summary;
         wrap.appendChild(pre);
       }
+    } else if (ev.type === 'review_ping_held') {
+      const url = p.web_url ? `<a href="${escapeHtml(p.web_url)}" target="_blank" rel="noopener">${escapeHtml(p.repo_key || '')}!${p.iid || ''}</a>` : `<code>${escapeHtml(p.repo_key || '')}!${p.iid || ''}</code>`;
+      wrap.innerHTML = `
+        <div>⏸ holding "please review" ping · reason=<code>${escapeHtml(p.reason || '')}</code></div>
+        <div class="field-row"><span class="field-label">MR:</span> ${url} — ${escapeHtml(p.title || '')}</div>
+      `;
     } else {
       const pre = document.createElement('pre');
       pre.className = 'event-pre';

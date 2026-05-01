@@ -345,6 +345,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         responder=thread_responder,
         dev_agents=dict(dev_agents),
         health=health,
+        trace=trace,
     )
 
     devops = DevOpsAgent(

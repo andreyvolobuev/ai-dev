@@ -41,6 +41,11 @@ from virtual_dev.application.agents.orchestrator import (
     TOPIC_MR_COMMENT,
     TOPIC_MR_STUCK,
 )
+from virtual_dev.application.services.agent_trace import (
+    AgentTrace,
+    AgentTraceEvent,
+    emit_if,
+)
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.domain.models.merge_request import MRStatus, ReviewComment
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
@@ -107,6 +112,7 @@ class ReviewerAgent:
         responder: object | None = None,   # ThreadResponderAgent (avoid circular import)
         dev_agents: dict[str, object] | None = None,
         health: "HealthTracker | None" = None,
+        trace: AgentTrace | None = None,
     ) -> None:
         self._vcs = vcs
         self._communicator = communicator
@@ -118,6 +124,7 @@ class ReviewerAgent:
         self._responder = responder
         self._dev_agents = dev_agents or {}
         self._health = health
+        self._trace = trace
 
     # --- Entry point (called by PollerWorker) ---
 
@@ -244,6 +251,13 @@ class ReviewerAgent:
                     "Reviewer: {}!{} — CI state {!r}, holding 'please review' ping",
                     row.repo_key, row.iid, ci_state,
                 )
+                await self._emit_ping_held(row, live.title, f"ci_{ci_state}")
+        elif not review_ping_sent and live.status != MRStatus.OPEN:
+            # Most common: still in Draft. Operators have no way to tell
+            # the bot is intentionally waiting vs broken — surface a
+            # ``review_ping_held`` event so the activity tab shows it.
+            reason = "draft" if live.status == MRStatus.DRAFT else live.status.value
+            await self._emit_ping_held(row, live.title, reason)
 
         # Iteration follow-up: a thread-driven or autofix iteration push
         # AFTER the review thread already exists. We post the "✅ CI
@@ -772,6 +786,25 @@ class ReviewerAgent:
             )).scalar_one_or_none()
             if row is not None:
                 row.status = new_status
+
+    async def _emit_ping_held(
+        self, row: MergeRequestRow, title: str, reason: str,
+    ) -> None:
+        """Surface a 'review_ping_held' activity event so the live tab
+        shows the bot is intentionally waiting (Draft / failing CI /
+        running CI) rather than silently doing nothing. No-op when no
+        ``trace`` is wired (production may keep it None)."""
+        await emit_if(self._trace, AgentTraceEvent(
+            type="review_ping_held",
+            agent_key=self.agent_key,
+            payload={
+                "reason": reason,
+                "repo_key": row.repo_key,
+                "iid": row.iid,
+                "title": title,
+                "web_url": row.web_url,
+            },
+        ))
 
 
 def _aware(dt: datetime | None) -> datetime:
