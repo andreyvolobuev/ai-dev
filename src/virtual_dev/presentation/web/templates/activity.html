@@ -48,6 +48,8 @@
   .event-classification_applied { border-color: #79c0ff; background: #15243a; }
   .event-task_event { border-color: #a371f7; }
   .event-review_ping_held { border-color: #d29922; background: #2d2718; }
+  .event-comment_received { border-color: #79c0ff; }
+  .event-comment_received[data-class="chatter"] { border-color: #6e7681; opacity: 0.85; }
   .field-row { margin: 2px 0; font-size: 11px; }
   .field-label { color: #8b949e; }
   .event-pre {
@@ -87,6 +89,7 @@
       <option value="classification_applied">classification_applied</option>
       <option value="task_event">task_event</option>
       <option value="review_ping_held">review_ping_held</option>
+      <option value="comment_received">comment_received</option>
     </select>
   </label>
   <button id="expand-all-btn" type="button">▼ Развернуть всё</button>
@@ -155,6 +158,9 @@
     $('event-count').textContent = `${eventCount} событий`;
     const div = document.createElement('div');
     div.className = 'event event-' + ev.type;
+    if (ev.payload && ev.payload.classification) {
+      div.dataset.class = ev.payload.classification;
+    }
     const meta = document.createElement('div');
     meta.className = 'event-meta';
     const ticket = eventTicket(ev);
@@ -240,6 +246,17 @@
         <div>⏸ holding "please review" ping · reason=<code>${escapeHtml(p.reason || '')}</code></div>
         <div class="field-row"><span class="field-label">MR:</span> ${url} — ${escapeHtml(p.title || '')}</div>
       `;
+    } else if (ev.type === 'comment_received') {
+      const url = p.web_url ? `<a href="${escapeHtml(p.web_url)}" target="_blank" rel="noopener">${escapeHtml(p.repo_key || '')}!${p.iid || ''}</a>` : `<code>${escapeHtml(p.repo_key || '')}!${p.iid || ''}</code>`;
+      const cls = p.classification || 'unknown';
+      const action = (cls === 'change_request' || cls === 'question') ? '→ routed' : '→ no action';
+      wrap.innerHTML = `
+        <div>💬 comment from <code>@${escapeHtml(p.author || '')}</code> on ${url} · class=<code>${escapeHtml(cls)}</code> ${escapeHtml(action)}</div>
+      `;
+      const pre = document.createElement('pre');
+      pre.className = 'event-pre';
+      pre.textContent = p.preview || '';
+      wrap.appendChild(pre);
     } else {
       const pre = document.createElement('pre');
       pre.className = 'event-pre';

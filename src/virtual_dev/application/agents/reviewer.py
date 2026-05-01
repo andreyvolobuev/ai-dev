@@ -195,6 +195,19 @@ class ReviewerAgent:
                 row.repo_key, row.iid, comment.author_username,
                 klass.value, comment.body[:160],
             )
+            await emit_if(self._trace, AgentTraceEvent(
+                type="comment_received",
+                agent_key=self.agent_key,
+                payload={
+                    "repo_key": row.repo_key,
+                    "iid": row.iid,
+                    "comment_id": comment.id,
+                    "author": comment.author_username,
+                    "classification": klass.value,
+                    "preview": comment.body[:280],
+                    "web_url": row.web_url,
+                },
+            ))
             if self._message_bus is not None:
                 # UUID, not deterministic comment id — the bus enforces
                 # UNIQUE on external_id, so replaying the same comment

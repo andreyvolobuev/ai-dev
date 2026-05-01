@@ -559,6 +559,69 @@ async def test_review_ping_not_sent_while_draft(
 
 
 @pytest.mark.asyncio
+async def test_reviewer_emits_comment_received_activity_event(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Every new MR comment must produce a ``comment_received`` event
+    on the AgentTrace — including those classified as chatter. Without
+    it the operator sees comments arrive in GitLab and zero feedback in
+    the live UI; the only signal today is a logger.info line in the
+    server console (and the message-bus publish, which doesn't
+    surface). The classification is part of the payload so the UI can
+    render 'received but skipped because chatter' vs 'received +
+    routed to thread responder'."""
+    from virtual_dev.application.services.agent_trace import AgentTrace
+
+    await _insert_mr(session_factory, last_activity_at=datetime.now(timezone.utc))
+    comments = [
+        ReviewComment(id="c-1", mr_id="42", author_username="virtual-dev", body="MR opened"),
+        ReviewComment(
+            id="c-2", mr_id="42", author_username="alice",
+            body="Мы пишем комменты по принципу зачем тут этот код",
+        ),
+        ReviewComment(id="c-3", mr_id="42", author_username="bob", body="LGTM"),
+    ]
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    trace = AgentTrace()
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev",
+        trace=trace,
+    )
+
+    await agent.tick()
+
+    received = [e for e in list(trace._history) if e.type == "comment_received"]
+    # virtual-dev's own comment is filtered before classification, so
+    # only the two human comments get through.
+    assert len(received) == 2, (
+        f"expected 2 comment_received events (one per human comment); "
+        f"got types={[e.type for e in trace._history]}"
+    )
+    by_author = {e.payload.get("author"): e for e in received}
+    assert "alice" in by_author
+    assert "bob" in by_author
+    # Classification is exposed so UI can colour 'received but ignored'
+    # (chatter) differently from 'received + routed' (change_request etc).
+    alice_event = by_author["alice"]
+    assert alice_event.payload.get("classification") in {
+        "change_request", "chatter", "question", "approval_hint",
+    }
+    assert alice_event.payload.get("repo_key") == "bellingshausen"
+    assert alice_event.payload.get("iid") == 42
+    # Preview should be present (truncated) so the operator can see the
+    # text without clicking through to GitLab.
+    assert "комменты" in alice_event.payload.get("preview", "")
+
+
+@pytest.mark.asyncio
 async def test_review_ping_held_emits_activity_event_on_draft(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
