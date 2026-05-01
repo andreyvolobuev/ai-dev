@@ -75,6 +75,8 @@ class GitLabVcs(VcsPort):
         if not gitlab_url or not gitlab_token:
             raise ValueError("GitLab URL and token must be provided")
         self._config = config
+        self._gitlab_url = gitlab_url.rstrip("/")
+        self._gitlab_token = gitlab_token
         self._client = Gitlab(url=gitlab_url, private_token=gitlab_token)
         self._workspaces_dir = Path(workspaces_dir).resolve()
         self._identity = identity
@@ -259,6 +261,35 @@ class GitLabVcs(VcsPort):
                 )
             return ""
 
+    def _https_push_url_for(self, repo_key: str) -> str:
+        """Build a HTTPS push URL with the bot's PAT embedded.
+
+        The workspace's ``origin`` remote is typically the SSH form
+        (``git@gitlab.host:group/project.git``) inherited from however
+        the operator originally cloned. Pushing through that remote
+        uses the operator's SSH key, which makes GitLab attribute the
+        triggered pipeline to the operator instead of to the bot. We
+        fix that by pushing to a one-off HTTPS URL that authenticates
+        as the bot's PAT — pipeline attribution then follows the PAT
+        owner.
+
+        The token lands in argv (and therefore in the loguru ``git``
+        debug line) but NOT in any persisted file — callers must use
+        this URL one-shot, never with ``--set-upstream``.
+        """
+        from urllib.parse import urlparse
+
+        host = urlparse(self._gitlab_url).hostname or ""
+        if not host:
+            raise VcsError(
+                f"cannot derive HTTPS host from gitlab_url "
+                f"{self._gitlab_url!r}"
+            )
+        return (
+            f"https://oauth2:{self._gitlab_token}@{host}/"
+            f"{self._project_path(repo_key)}.git"
+        )
+
     async def push(self, repo_key: str, branch: str) -> None:
         """Push with limited retry.
 
@@ -266,13 +297,34 @@ class GitLabVcs(VcsPort):
         similar transient errors on otherwise-healthy clusters. We've
         already invested turns into the commit by this point — a quick
         retry loop avoids throwing the whole Dev-agent run away.
+
+        Push goes via a one-off HTTPS URL with the bot's PAT (see
+        :meth:`_https_push_url_for`) instead of the workspace's SSH
+        ``origin``, so GitLab attributes the pipeline to the bot
+        rather than to whoever's SSH key is loaded locally.
         """
         async with self._lock(repo_key):
             path = await self._ensure_local(repo_key)
+            # Real GitLab remote (git@ / https://) → push via PAT for
+            # bot pipeline-attribution. Local-file remotes (test fixtures
+            # using a tmp dir as "upstream") fall back to ``origin`` —
+            # there's no PAT to embed and no GitLab to attribute to.
+            repo_url = self._repo(repo_key).url
+            if repo_url.startswith(("git@", "https://", "http://")):
+                push_target = self._https_push_url_for(repo_key)
+                push_args: tuple[str, ...] = (
+                    "push", push_target, f"{branch}:{branch}",
+                )
+            else:
+                push_args = ("push", "--set-upstream", "origin", branch)
             last_exc: VcsError | None = None
             for attempt in range(1, 4):
                 try:
-                    await self._run_git(path, "push", "--set-upstream", "origin", branch)
+                    # No ``--set-upstream`` against the tokenised URL —
+                    # that would persist the PAT into ``.git/config``.
+                    # The bot's flow re-derives the URL on each push so
+                    # upstream tracking isn't needed.
+                    await self._run_git(path, *push_args)
                     if attempt > 1:
                         logger.info("git push succeeded on attempt {}/3", attempt)
                     return

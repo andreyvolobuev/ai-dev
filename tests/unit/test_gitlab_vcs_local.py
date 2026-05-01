@@ -153,6 +153,135 @@ async def test_unknown_repo_is_loud(tmp_path: Path) -> None:
         await vcs.ensure_clone("no_such_repo")
 
 
+def test_https_push_url_embeds_token_and_host(tmp_path: Path) -> None:
+    """The push URL must:
+    1. use HTTPS (not the SSH form of the remote in .git/config),
+    2. embed the bot's PAT as ``oauth2:<token>@host``,
+    3. point at the same project path the SSH URL refers to.
+
+    Pushing through this URL makes GitLab attribute the resulting
+    pipeline to the bot account that owns the PAT, instead of to
+    whoever's SSH key is loaded in the user's agent."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _init_remote_repo(upstream)
+    cfg = AppConfig(
+        repositories=[RepositoryCfg(
+            key="demo",
+            url="git@gitlab.example.com:group/sub/demo.git",
+            default_branch="main",
+        )],
+        agents=AgentsCfg(),
+        mappings=MappingsCfg(),
+    )
+    vcs = GitLabVcs(
+        config=cfg,
+        gitlab_url="https://gitlab.example.com/",
+        gitlab_token="glpat-FAKE-TOKEN",
+        workspaces_dir=tmp_path / "workspaces",
+        identity=GitIdentity(name="Virtual Dev", email="vdev@example"),
+    )
+
+    url = vcs._https_push_url_for("demo")
+    assert url == (
+        "https://oauth2:glpat-FAKE-TOKEN@gitlab.example.com/"
+        "group/sub/demo.git"
+    )
+
+
+@pytest.mark.asyncio
+async def test_push_uses_https_url_with_token_not_ssh_origin(tmp_path: Path) -> None:
+    """The current pipeline-attribution bug: ``git push origin <branch>``
+    over an SSH remote pushes via the user's SSH key, so GitLab marks
+    every pipeline as 'Created by: <user>'. Push instead via HTTPS with
+    the bot's PAT embedded so attribution lands on the bot account.
+    Token must NOT be persisted to .git/config (no ``--set-upstream``
+    against the temp URL)."""
+    # We use a local file URL for the actual fetch/clone (so workspace
+    # setup works), but configure the *repo URL* in AppConfig to look
+    # like a real GitLab SSH remote. ``push`` triggers HTTPS-with-PAT
+    # mode based on URL shape; the underlying ``git push`` is mocked
+    # below so we never actually contact the example host.
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _init_remote_repo(upstream)
+    cfg = AppConfig(
+        repositories=[RepositoryCfg(
+            key="demo",
+            url="git@gitlab.example.com:group/demo.git",
+            default_branch="main",
+        )],
+        agents=AgentsCfg(),
+        mappings=MappingsCfg(),
+    )
+    vcs = GitLabVcs(
+        config=cfg,
+        gitlab_url="https://gitlab.example.com/",
+        gitlab_token="glpat-FAKE-TOKEN",
+        workspaces_dir=tmp_path / "workspaces",
+        identity=GitIdentity(name="Virtual Dev", email="vdev@example"),
+    )
+    # Manually clone from the file upstream so the workspace exists,
+    # bypassing _ensure_local's URL-based clone (which would try the
+    # fake gitlab.example.com host).
+    workspace = tmp_path / "workspaces" / "demo"
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "clone", "-q", str(upstream), str(workspace)],
+        check=True,
+    )
+    vcs._verified_local_path.add("demo")
+    # Override _ensure_local so it doesn't re-clone via the fake URL.
+    async def _local(_repo: str) -> Path:
+        return workspace
+    vcs._ensure_local = _local  # type: ignore[method-assign]
+    subprocess.run(
+        ["git", "checkout", "-b", "ai-dev/dm-1"],
+        cwd=workspace, check=True, capture_output=True,
+    )
+    (workspace / "x.txt").write_text("hi")
+    subprocess.run(["git", "add", "-A"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=vdev@example", "-c", "user.name=Virtual Dev",
+         "commit", "-qm", "feat: x"],
+        cwd=workspace, check=True,
+    )
+
+    captured: list[list[str]] = []
+    real_run_git = vcs._run_git
+
+    async def _capture(_cwd: Path | None, *args: str) -> str:
+        captured.append(list(args))
+        # Don't actually exec git for `push` — we only care about args.
+        if args and args[0] == "push":
+            return ""
+        return await real_run_git(_cwd, *args)
+
+    vcs._run_git = _capture  # type: ignore[method-assign]
+    await vcs.push("demo", "ai-dev/dm-1")
+
+    push_calls = [a for a in captured if a and a[0] == "push"]
+    assert len(push_calls) == 1, f"expected exactly one push, got {push_calls}"
+    push_args = push_calls[0]
+    # First arg after 'push' is the destination — must be the HTTPS-with-token URL.
+    dest = push_args[1] if len(push_args) > 1 else ""
+    assert dest.startswith("https://oauth2:"), (
+        f"expected HTTPS-with-token push URL, got {dest!r}"
+    )
+    assert "@" in dest and ".git" in dest
+    # The temp URL must NOT include --set-upstream (would persist token to config).
+    assert "--set-upstream" not in push_args, (
+        f"--set-upstream against the token URL would leak the PAT into "
+        f".git/config; got args={push_args!r}"
+    )
+
+    # Workspace .git/config must remain free of the token even after push.
+    cfg_text = (workspace / ".git" / "config").read_text()
+    assert "glpat" not in cfg_text and "oauth2:" not in cfg_text, (
+        f"PAT leaked into workspace .git/config: {cfg_text}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_commit_all_rejects_model_self_commit(tmp_path: Path) -> None:
     """If the model bypassed the prompt rule and ran ``git commit`` itself,
