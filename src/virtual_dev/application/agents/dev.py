@@ -39,7 +39,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from virtual_dev.adapters.vcs.gitlab import VcsError
+from virtual_dev.adapters.vcs.gitlab import VcsError, VcsRogueCommitError
 from virtual_dev.application.services import PromptsLoader, ResearcherToolkit, RulesLoader
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus
@@ -297,7 +297,9 @@ class DevAgent:
 
         # Commit → push → MR.
         commit_message = self._render_commit_message(task_row, captured)
-        commit_sha = await self._vcs.commit_all(self._repo_key, commit_message)
+        commit_sha = await self._safe_commit_all(
+            task_row=task_row, message=commit_message,
+        )
 
         if not commit_sha:
             logger.info(
@@ -435,7 +437,9 @@ class DevAgent:
         commit_message = (
             f"[{task_row.external_id}] {_strip_ticket_prefix(str(captured.get('title') or 'iteration'), task_row.external_id)}"
         )
-        commit_sha = await self._vcs.commit_all(self._repo_key, commit_message)
+        commit_sha = await self._safe_commit_all(
+            task_row=task_row, message=commit_message,
+        )
         if not commit_sha:
             logger.info(
                 "Dev[{}] iteration: no changes to commit for {}",
@@ -837,6 +841,30 @@ class DevAgent:
             )).scalar_one_or_none()
             if row is not None:
                 row.internal_status = status.value
+
+    async def _safe_commit_all(
+        self, *, task_row: TaskRow, message: str,
+    ) -> str:
+        """``commit_all`` + permanent-failure translation for rogue commits.
+
+        The model is told not to commit (see ``config/prompts/dev.md``
+        ## Process step 4). If it does anyway, ``VcsRogueCommitError``
+        bubbles out of the adapter — pushing that commit would attribute
+        the MR to whoever's git config is set in the workspace. Mark the
+        task FAILED so the recovery sweep skips it, and raise
+        ``CodeAgentPermanentError`` so the dev-inbox / listener surfaces
+        the failure to humans instead of silently inheriting the wrong
+        author.
+        """
+        try:
+            return await self._vcs.commit_all(self._repo_key, message)
+        except VcsRogueCommitError as exc:
+            logger.warning(
+                "Dev[{}] aborting {}: {}",
+                self._agent_key, task_row.external_id, exc,
+            )
+            await self._set_internal_status(task_row.id, TaskStatus.FAILED)
+            raise CodeAgentPermanentError(str(exc)) from exc
 
     # --- misc ---
 

@@ -53,6 +53,15 @@ class VcsError(RuntimeError):
     """Raised when a git or GitLab API call fails."""
 
 
+class VcsRogueCommitError(VcsError):
+    """Raised by ``commit_all`` when local HEAD is ahead of origin but
+    its author isn't the bot — i.e. the dev model bypassed the prompt
+    rule and ran ``git commit`` itself via Bash. Pushing such a commit
+    would attribute the MR to whoever's local git config is set in the
+    workspace (often the human operator), so we refuse and let the
+    caller mark the run failed."""
+
+
 class GitLabVcs(VcsPort):
     def __init__(
         self,
@@ -198,15 +207,18 @@ class GitLabVcs(VcsPort):
     async def commit_all(self, repo_key: str, message: str) -> str:
         """Stage + commit pending changes; return the SHA to push.
 
-        Two paths:
+        Three paths:
 
         * Pending uncommitted changes → ``git add -A`` + commit with the
           bot's identity. Return the new HEAD sha.
-        * Working tree clean BUT local HEAD is ahead of ``origin/<branch>``
-          → the Dev model committed itself despite being told not to.
-          Return the existing HEAD sha so the caller still pushes the
-          work; we'd rather lose the per-call bot identity than silently
-          drop a commit the LLM made.
+        * Working tree clean, local HEAD ahead of ``origin/<branch>``,
+          and HEAD authored by the bot → idempotent return of the same
+          sha so the caller can still push.
+        * Working tree clean, local HEAD ahead of ``origin/<branch>``,
+          BUT HEAD's author isn't the bot → the model self-committed
+          via Bash. Raise :class:`VcsRogueCommitError` so the caller
+          aborts the run; pushing would attribute the MR to whoever's
+          local git config is set in the workspace.
 
         Returns ``""`` only when there's truly nothing to push.
         """
@@ -231,12 +243,20 @@ class GitLabVcs(VcsPort):
                 # Branch doesn't exist on origin yet → any commit is "new".
                 remote_head = ""
             if local_head and local_head != remote_head:
-                logger.warning(
-                    "VCS: working tree clean but {!r} HEAD {} ≠ origin {!r}; "
-                    "Dev appears to have committed itself — pushing anyway",
-                    branch, local_head[:12], remote_head[:12] or "(none)",
+                head_author_email = (
+                    await self._run_git(path, "log", "-1", "--format=%ae")
+                ).strip()
+                if head_author_email == self._identity.email:
+                    # Our own prior commit (e.g. another commit_all call
+                    # in the same flow before push). Idempotent return.
+                    return local_head
+                raise VcsRogueCommitError(
+                    f"branch {branch!r} HEAD {local_head[:12]} authored by "
+                    f"{head_author_email!r} (not bot identity "
+                    f"{self._identity.email!r}); model self-committed via "
+                    f"Bash despite the prompt rule. Refusing to push to "
+                    f"keep the bot's commit author canonical."
                 )
-                return local_head
             return ""
 
     async def push(self, repo_key: str, branch: str) -> None:

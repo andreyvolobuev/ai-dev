@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from virtual_dev.adapters.vcs.gitlab import VcsError
+from virtual_dev.adapters.vcs.gitlab import VcsError, VcsRogueCommitError
 from virtual_dev.application.agents import DevAgent, DevOutcome, DevSkipReason
 from virtual_dev.application.agents.dev import CodeAgentPermanentError
 from virtual_dev.application.services import PromptsLoader, RulesLoader
@@ -497,6 +497,65 @@ async def test_dev_raises_permanent_on_dirty_working_tree(
     kinds = [c[0] for c in vcs.calls]
     assert "create_branch" not in kinds
     assert "commit_all" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_iteration_aborts_on_rogue_commit_detection(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """If the model bypassed the prompt rule and ran ``git commit`` via
+    Bash, ``commit_all`` raises ``VcsRogueCommitError`` (HEAD author
+    isn't the bot). handle_iteration must NOT push that commit — pushing
+    would put the local user's identity on the MR. Instead it flips the
+    task to FAILED and raises ``CodeAgentPermanentError`` so the
+    listener surfaces a clear "iteration crashed" signal rather than
+    silently inheriting the wrong author."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    class _RogueVcs(_FakeVcs):
+        async def commit_all(self, repo_key: str, message: str) -> str:
+            self.calls.append(("commit_all", (repo_key, message)))
+            raise VcsRogueCommitError(
+                "branch 'ai-dev/dm-7' HEAD ab29843d authored by "
+                "'an.volobuev@2gis.local' (not bot identity "
+                "'virtual-dev@datamining.2gis.ru'); model self-committed "
+                "via Bash despite the prompt rule. Refusing to push."
+            )
+
+    vcs = _RogueVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=3, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent,
+        preset_submission={
+            "status": "success",
+            "title": "address review: rename foo",
+            "description": "rename foo to bar per reviewer ask",
+        },
+    )
+
+    with pytest.raises(CodeAgentPermanentError):
+        await dev.handle_iteration(
+            tracker="jira", external_id="DM-7",
+            branch_name="ai-dev/dm-7",
+            feedback="please rename foo",
+        )
+
+    async with session_factory() as session:
+        task_row = (await session.execute(
+            select(TaskRow).where(TaskRow.external_id == "DM-7")
+        )).scalar_one()
+    assert task_row.internal_status == TaskStatus.FAILED.value
+
+    # commit_all was attempted (and rejected) but push must NOT have run
+    # — pushing the rogue commit is exactly what we're preventing.
+    kinds = [c[0] for c in vcs.calls]
+    assert "commit_all" in kinds
+    assert "push" not in kinds
 
 
 @pytest.mark.asyncio

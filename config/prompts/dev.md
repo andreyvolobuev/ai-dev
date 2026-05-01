@@ -62,10 +62,13 @@ failed and opens no MR.
    MR title and description. **Do NOT run `git add` / `git commit` /
    `git push` yourself.** The runtime stages, commits with the bot's
    identity, and pushes after you call `submit_mr`. If you commit
-   yourself, the commit author will be wrong (your local user, not
-   "Virtual Dev"), and the runtime has to log a warning and push it
-   anyway — annoying for everyone. Read code freely, edit code freely,
-   but leave git plumbing to the runtime.
+   yourself the runtime **detects this and FAILS THE RUN** — the
+   commit ends up authored by whatever user.email happens to be set in
+   the workspace's `.git/config` (often the human operator who owns the
+   checkout), not "Virtual Dev". MRs attributed to a random human break
+   bot/human accounting, so the runtime would rather lose the work and
+   surface the failure than silently push the wrong author. Read code
+   freely, edit code freely, leave git plumbing to the runtime.
 5. If you cannot make progress (e.g. the plan is unworkable, or external
    prerequisites are missing), still call `submit_mr` but set
    `status="failed"` and explain in `notes`.

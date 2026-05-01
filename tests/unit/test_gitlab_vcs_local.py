@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from virtual_dev.adapters.vcs import GitIdentity, GitLabVcs, VcsError
+from virtual_dev.adapters.vcs.gitlab import VcsRogueCommitError
 from virtual_dev.infrastructure.config.schema import (
     AgentsCfg,
     AppConfig,
@@ -150,6 +151,64 @@ async def test_unknown_repo_is_loud(tmp_path: Path) -> None:
     vcs = _vcs(tmp_path, _cfg("demo", tmp_path / "nowhere"))
     with pytest.raises(VcsError):
         await vcs.ensure_clone("no_such_repo")
+
+
+@pytest.mark.asyncio
+async def test_commit_all_rejects_model_self_commit(tmp_path: Path) -> None:
+    """If the model bypassed the prompt rule and ran ``git commit`` itself,
+    HEAD lands on the local user's identity rather than the bot's. Pushing
+    that anyway means MRs show up under whoever happened to be running the
+    process — confusing and blocks per-repo bot-vs-human accounting. The
+    runtime must refuse and force the operator/dev path to clean up rather
+    than silently inheriting the wrong author.
+
+    We simulate the rogue commit by writing a file and committing with a
+    foreign identity (the bot's own commits go through ``commit_all`` which
+    pins the bot identity via ``git -c user.name=...``)."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _init_remote_repo(upstream)
+    vcs = _vcs(tmp_path, _cfg("demo", upstream))
+
+    workspace = Path(await vcs.ensure_clone("demo"))
+    await vcs.create_branch("demo", "ai-dev/dm-rogue", "main")
+
+    # Model self-committed via Bash with the local user's identity.
+    (workspace / "rogue.txt").write_text("hi from model\n")
+    subprocess.run(["git", "add", "-A"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=an.volobuev@2gis.local",
+                "-c", "user.name=Andrey Volobuev",
+         "commit", "-qm", "[DM-1] sneaky self-commit"],
+        cwd=workspace, check=True,
+    )
+
+    # Tree clean, HEAD ahead of origin, but author is NOT the bot.
+    with pytest.raises(VcsRogueCommitError):
+        await vcs.commit_all("demo", "noop")
+
+
+@pytest.mark.asyncio
+async def test_commit_all_idempotent_after_bot_commit(tmp_path: Path) -> None:
+    """Counterpart to the rejection test: after ``commit_all`` itself
+    creates a commit (with bot identity), a second ``commit_all`` on the
+    still-clean tree must NOT mistake the bot's own prior commit for a
+    rogue one. It returns the same sha so the caller's push goes through.
+    Regression guard for the author-check added alongside rogue rejection."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _init_remote_repo(upstream)
+    vcs = _vcs(tmp_path, _cfg("demo", upstream))
+
+    workspace = Path(await vcs.ensure_clone("demo"))
+    await vcs.create_branch("demo", "ai-dev/dm-ok", "main")
+    (workspace / "ok.txt").write_text("hi from bot\n")
+    sha = await vcs.commit_all("demo", "feat: add ok.txt")
+    assert sha
+    # No new edits, but local HEAD is still ahead of origin (we haven't
+    # pushed yet). HEAD's author is the bot — must NOT raise.
+    sha2 = await vcs.commit_all("demo", "noop")
+    assert sha2 == sha
 
 
 @pytest.mark.asyncio
