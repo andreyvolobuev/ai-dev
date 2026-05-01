@@ -90,20 +90,28 @@ class JiraTaskTracker(TaskTrackerPort):
 
     async def fetch_tasks(self, jql: str, limit: int = 50) -> Sequence[Task]:
         def _fetch() -> list[dict[str, Any]]:
-            result = self._client.jql(jql, limit=limit)
-            if not isinstance(result, dict):
-                _raise_for_non_dict_response(result)
-            return cast(list[dict[str, Any]], result.get("issues", []))
+            try:
+                result = self._client.jql(jql, limit=limit)
+                if not isinstance(result, dict):
+                    _raise_for_non_dict_response(result)
+                return cast(list[dict[str, Any]], result.get("issues", []))
+            except JiraCaptivePortalError:
+                self._purge_session_pool()
+                raise
 
         issues = await asyncio.to_thread(_fetch)
         return [self._issue_to_task(issue) for issue in issues]
 
     async def get_task(self, external_id: str) -> Task:
         def _fetch() -> dict[str, Any]:
-            result = self._client.issue(external_id)
-            if not isinstance(result, dict):
-                _raise_for_non_dict_response(result)
-            return cast(dict[str, Any], result)
+            try:
+                result = self._client.issue(external_id)
+                if not isinstance(result, dict):
+                    _raise_for_non_dict_response(result)
+                return cast(dict[str, Any], result)
+            except JiraCaptivePortalError:
+                self._purge_session_pool()
+                raise
 
         issue = await asyncio.to_thread(_fetch)
         task = self._issue_to_task(issue)
@@ -172,6 +180,30 @@ class JiraTaskTracker(TaskTrackerPort):
 
         await asyncio.to_thread(_run)
         logger.info("Jira {} commented ({} chars)", external_id, len(body))
+
+    def _purge_session_pool(self) -> None:
+        """Clear pooled HTTP connections on the underlying Session.
+
+        Called when ``JiraCaptivePortalError`` fires — a stale TCP
+        socket left over from a network blip can land in the pool and
+        keep returning the captive page across all in-session retries.
+        ``HTTPAdapter.close()`` invokes ``PoolManager.clear()`` which
+        drops every cached connection without tearing the adapter
+        down; the next request opens fresh sockets via the same
+        retry-mounted adapter, so retry semantics are preserved.
+        """
+        try:
+            session = self._client._session
+        except AttributeError:
+            return
+        for adapter in list(session.adapters.values()):
+            try:
+                adapter.close()
+            except Exception:
+                logger.debug(
+                    "Jira: adapter.close() raised during pool purge; ignoring",
+                    exc_info=True,
+                )
 
     # --- internals ---
 
@@ -406,6 +438,16 @@ def _unexpected_response_message(result: Any) -> str:
     return f"Unexpected Jira response: {type_name}: {preview}"
 
 
+class JiraCaptivePortalError(requests.ConnectionError):
+    """HTML body returned where JSON expected. Subclass of
+    ``requests.ConnectionError`` so the orchestrator's existing
+    network-blip handler treats it as transient — but distinct enough
+    that the JiraTracker callsites can recognise it and purge the
+    underlying connection pool. Without the purge a stale TCP socket
+    in the pool keeps returning the same captive page across all
+    retries until the bot process is restarted."""
+
+
 def _looks_like_html(body: str) -> bool:
     """True if the body looks like an HTML document — almost always a
     captive portal / WiFi login / proxy error page in our context.
@@ -417,16 +459,18 @@ def _looks_like_html(body: str) -> bool:
 def _raise_for_non_dict_response(result: Any) -> None:
     """Classify a non-dict response and raise the appropriate type.
 
-    HTML body → ``requests.ConnectionError`` so the orchestrator's
-    existing tick-level retry treats it as a network blip (captive
-    portal / hotspot login / corp proxy banner). Anything else surfaces
-    as the original RuntimeError preview so the operator can diagnose.
+    HTML body → ``JiraCaptivePortalError`` (subclass of
+    ``requests.ConnectionError``) so the orchestrator's existing
+    tick-level retry treats it as a network blip AND the JiraTracker
+    callsite recognises it as the specific case that warrants purging
+    the underlying connection pool. Anything else surfaces as the
+    original RuntimeError preview so the operator can diagnose.
     """
     body = str(result)
     if _looks_like_html(body):
         # Trim a one-line preview so the log entry stays grep-able.
         preview = " ".join(body.split())[:160]
-        raise requests.ConnectionError(
+        raise JiraCaptivePortalError(
             f"captive-portal-like HTML response from Jira (no JSON); "
             f"preview: {preview}"
         )

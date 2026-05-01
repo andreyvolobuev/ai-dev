@@ -101,5 +101,51 @@ async def test_fetch_tasks_logs_preview_on_non_json_response(
     assert "503" in msg or "Service Unavailable" in msg  # body preview reaches operator
 
 
+@pytest.mark.asyncio
+async def test_fetch_tasks_recycles_session_pool_on_captive_html() -> None:
+    """A poisoned TCP socket in the pool keeps returning captive-portal
+    HTML across reuse — internal session-level retries hit the same
+    dead socket. On HTML detection we MUST clear the connection pool
+    so the next tick opens fresh sockets, otherwise the bot spams the
+    same error indefinitely (until restart) even after the network
+    fully recovers."""
+    import requests
+
+    tracker = _build()
+    captive = (
+        '<!DOCTYPE html><html><head><title>Секретный уровень</title>'
+        '</head><body>x</body></html>'
+    )
+
+    # Track close() on every adapter mounted on the session — we don't
+    # care which exact one (http:// vs https://), just that the pool
+    # was purged at least once.
+    session = tracker._client._session  # type: ignore[attr-defined]
+    close_counts = {scheme: 0 for scheme in session.adapters}
+    real_closes = {}
+    for scheme, adapter in session.adapters.items():
+        real_closes[scheme] = adapter.close
+
+        def _wrapped(_scheme: str = scheme) -> None:
+            close_counts[_scheme] += 1
+
+        adapter.close = _wrapped  # type: ignore[method-assign]
+
+    try:
+        with (
+            mock.patch.object(tracker._client, "jql", return_value=captive),  # type: ignore[attr-defined]
+            pytest.raises(requests.ConnectionError),
+        ):
+            await tracker.fetch_tasks("project = X")
+    finally:
+        for scheme, adapter in session.adapters.items():
+            adapter.close = real_closes[scheme]  # type: ignore[method-assign]
+
+    assert sum(close_counts.values()) >= 1, (
+        f"expected at least one adapter.close() to clear the pool; "
+        f"got {close_counts}"
+    )
+
+
 def _adapter_for(session: Any, url: str) -> Any:
     return session.get_adapter(url)
