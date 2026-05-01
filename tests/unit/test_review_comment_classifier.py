@@ -108,6 +108,32 @@ async def test_classifier_short_circuits_empty_body() -> None:
 
 
 @pytest.mark.asyncio
+async def test_classifier_routes_coding_rule_through_change_request() -> None:
+    """Coding-rule comments ("comments should explain WHY, not WHAT",
+    "use double quotes", "always typecheck X") were silently bucketed
+    as chatter because the previous schema only recognised "asks for a
+    specific code change". The model can now reply with ``coding_rule``
+    when the comment is a directive about how the codebase should be
+    written; the parser maps it onto CHANGE_REQUEST so the downstream
+    actionable-comment routing fires (ThreadResponder gets it, may
+    iterate or push back via propose_alternative)."""
+    classifier = ReviewCommentClassifier(llm=_StubLlm("coding_rule"), model="x")
+    assert await classifier.classify("anything") == CommentClass.CHANGE_REQUEST
+
+
+def test_classifier_prompt_documents_coding_rule_category() -> None:
+    """The prompt must enumerate coding_rule and give Haiku at least
+    one example so it picks the new label over the historical
+    chatter fallback for convention/style directives."""
+    from virtual_dev.application.services.review_comment_classifier import (
+        _SYSTEM_PROMPT,
+    )
+    assert "coding_rule" in _SYSTEM_PROMPT, (
+        "prompt must list coding_rule as a category the model can pick"
+    )
+
+
+@pytest.mark.asyncio
 async def test_classifier_handles_russian_change_request() -> None:
     """Real motivation for the rewrite — the regex implementation never
     matched non-English change requests. Now we hand the body to the

@@ -21,7 +21,7 @@ from virtual_dev.application.agents.reviewer import CommentClass
 from virtual_dev.domain.ports.llm import LlmMessage, LlmPort
 
 _SYSTEM_PROMPT = (
-    "You classify code-review comments into exactly one of four "
+    "You classify code-review comments into exactly one of five "
     "categories. Reply with ONLY the category token (one word, "
     "snake_case), nothing else.\n\n"
     "Categories:\n"
@@ -29,25 +29,42 @@ _SYSTEM_PROMPT = (
     "одобряю, можно мерджить).\n"
     "- question: asks the author for clarification (in any language, "
     "with or without `?`).\n"
-    "- change_request: asks for a code change (rename, fix, rework, "
-    "remove, add, исправь, поправь, замени).\n"
+    "- change_request: asks for a SPECIFIC code change in this MR "
+    "(rename foo to bar, fix the off-by-one in line 12, remove this "
+    "import, исправь опечатку, поправь типы).\n"
+    "- coding_rule: a directive about HOW the codebase should be "
+    "written — a team convention or style rule the author should apply "
+    "to this MR and going forward, rather than a single line edit. "
+    "Examples: 'comments should explain WHY not WHAT', "
+    "'use double quotes for strings', 'always typecheck X before Y', "
+    "'не используем регулярки для классификации текста', "
+    "'мы пишем комменты по принципу зачем тут этот код'.\n"
     "- chatter: noise that needs no action (thanks, nice work, fyi, "
-    "спасибо, кстати).\n\n"
+    "спасибо, кстати, +кошки emoji).\n\n"
     "Comments may be in English, Russian, or mixed. Classify by intent, "
-    "not by surface keywords."
+    "not by surface keywords. When a comment teaches a rule rather than "
+    "asking for one specific edit, prefer coding_rule over chatter — "
+    "it IS actionable, the dev should incorporate it.\n"
+    "When a comment is borderline between change_request and "
+    "coding_rule, prefer coding_rule (broader scope)."
 )
 
 # Map every spelling variant we'll accept from the model back to the
-# enum. Anything not in here → CHATTER fallback.
+# enum. Anything not in here → CHATTER fallback. Note that
+# ``coding_rule`` collapses onto CHANGE_REQUEST for the downstream
+# routing (actionable vs not) — the distinction is for the prompt's
+# benefit (Haiku has a clearer category boundary against chatter), not
+# for the reviewer agent's branching.
 _REPLY_TO_CLASS: dict[str, CommentClass] = {
     "approval_hint": CommentClass.APPROVAL_HINT,
     "question": CommentClass.QUESTION,
     "change_request": CommentClass.CHANGE_REQUEST,
+    "coding_rule": CommentClass.CHANGE_REQUEST,
     "chatter": CommentClass.CHATTER,
 }
 
 _TOKEN_RE = re.compile(
-    r"\b(approval_hint|question|change_request|chatter)\b",
+    r"\b(approval_hint|question|change_request|coding_rule|chatter)\b",
     re.IGNORECASE,
 )
 
