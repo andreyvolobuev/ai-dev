@@ -113,6 +113,7 @@ class ReviewerAgent:
         dev_agents: dict[str, object] | None = None,
         health: "HealthTracker | None" = None,
         trace: AgentTrace | None = None,
+        mr_summarizer: object | None = None,   # MrSummarizer (avoid import cycle)
     ) -> None:
         self._vcs = vcs
         self._communicator = communicator
@@ -125,6 +126,7 @@ class ReviewerAgent:
         self._dev_agents = dev_agents or {}
         self._health = health
         self._trace = trace
+        self._mr_summarizer = mr_summarizer
 
     # --- Entry point (called by PollerWorker) ---
 
@@ -557,10 +559,30 @@ class ReviewerAgent:
                 row.repo_key,
             )
             return False
+        title = live_title or row.title
+        # Build the {summary} fragment for templates that use it. The
+        # template author can include {summary} in `review_ping` to get
+        # a 1-2 sentence first-person feminine description ("в котором
+        # я добавила X, исправила Y"). When summarizer isn't wired or
+        # the LLM returns nothing, fall back to the title — same text
+        # the prior template variant showed.
+        summary = ""
+        if self._mr_summarizer is not None:
+            try:
+                summary = await self._mr_summarizer.summarize(   # type: ignore[attr-defined]
+                    title=title, description=row.description or "",
+                )
+            except Exception:
+                logger.exception(
+                    "Reviewer: MR summarizer failed for {}!{}; "
+                    "falling back to title", row.repo_key, row.iid,
+                )
+        if not summary:
+            summary = title
         body = self._render_template(
             self._config.notifications.mattermost.review_ping,
             repo_key=row.repo_key, iid=row.iid,
-            title=live_title or row.title, web_url=row.web_url,
+            title=title, web_url=row.web_url, summary=summary,
         )
         outcome = await self._communicator.send_channel(channel_id, body)
         if outcome.sent and outcome.message is not None:

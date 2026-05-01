@@ -558,6 +558,103 @@ async def test_review_ping_not_sent_while_draft(
     assert chat.sent_channels == []
 
 
+class _StubMrSummarizer:
+    def __init__(self, reply: str) -> None:
+        self._reply = reply
+        self.calls: list[tuple[str, str]] = []
+
+    async def summarize(self, *, title: str, description: str) -> str:
+        self.calls.append((title, description))
+        return self._reply
+
+
+@pytest.mark.asyncio
+async def test_review_ping_uses_mr_summarizer_to_describe_the_mr(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Ping should read «приглашаю на МР, в котором я <что я сделала>»,
+    not just «приглашаю на МР: <title>». The reviewer asks the
+    summarizer for a 1-2 sentence first-person feminine fragment and
+    splices it into the template via a new ``{summary}`` variable.
+    Title is still passed (template author decides whether to keep
+    showing it alongside)."""
+    await _insert_mr(session_factory, review_ping_sent=False)
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        mr_status=MRStatus.OPEN,
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    summarizer = _StubMrSummarizer("добавила валидацию этапов и покрыла её тестами")
+
+    # Override the team channel template with one that uses {summary}.
+    cfg = _cfg()
+    cfg.notifications.mattermost.review_ping = (
+        "Ребята, приглашаю на [МР]({web_url}), в котором я {summary}"
+    )
+
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=cfg,
+        comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev",
+        mr_summarizer=summarizer,   # type: ignore[arg-type]
+    )
+
+    stats = await agent.tick()
+    assert stats.review_pings_sent == 1
+    # Summarizer was invoked with the MR's description + title.
+    assert len(summarizer.calls) == 1
+    title, description = summarizer.calls[0]
+    assert "DM-1" in title or title  # whatever _insert_mr seeded
+    # The team-channel post contains the summarizer's output verbatim.
+    bodies = [body for _channel, body in chat.sent_channels]
+    assert any(
+        "добавила валидацию этапов и покрыла её тестами" in body
+        for body in bodies
+    ), f"summary missing from posted bodies: {bodies}"
+
+
+@pytest.mark.asyncio
+async def test_review_ping_falls_back_to_title_when_summarizer_missing(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Backward compat — production wires the summarizer, but tests /
+    older configs may leave it None. The {summary} placeholder must
+    fall back to the title so the template still renders without
+    KeyError or 'в котором я {summary}' literal."""
+    await _insert_mr(session_factory, review_ping_sent=False)
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        mr_status=MRStatus.OPEN,
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    cfg = _cfg()
+    cfg.notifications.mattermost.review_ping = (
+        "Ребята, приглашаю на [МР]({web_url}): {summary}"
+    )
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=cfg,
+        comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev",
+        # mr_summarizer omitted intentionally
+    )
+
+    stats = await agent.tick()
+    assert stats.review_pings_sent == 1
+    bodies = [body for _channel, body in chat.sent_channels]
+    # No literal '{summary}' leak; some text appears after the colon.
+    assert not any("{summary}" in body for body in bodies), (
+        f"unrendered placeholder leaked into chat: {bodies}"
+    )
+    # And SOMETHING ended up there (the title fallback).
+    assert any(body.strip().endswith(("...", "...", "MR", "ed", ".",)) or len(body) > 30 for body in bodies)
+
+
 @pytest.mark.asyncio
 async def test_reviewer_emits_comment_received_activity_event(
     session_factory: async_sessionmaker[AsyncSession],

@@ -14,8 +14,11 @@
 # `escalation.mattermost_user`. Все доступные placeholders:
 # {repo_key}, {iid}, {title}, {web_url}, {idle_hours} (только в stale/escalation).
 mattermost:
+  # {summary} is a 1-2 sentence first-person feminine fragment from
+  # the MrSummarizer ("добавила X, исправила Y"). Falls back to {title}
+  # when no summarizer is wired.
   review_ping: |
-    Ребята, приглашаю на [МР]({web_url}): {title}
+    Ребята, приглашаю на [МР]({web_url}), в котором я {summary}
 
   merge_ping: |
     Мой реквестик [{iid}]({web_url}) собрал апрувы. Смержите, пожалуйста 😊

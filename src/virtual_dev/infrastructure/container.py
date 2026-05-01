@@ -333,6 +333,8 @@ def build_container(config_dir: Path | str = "config") -> Container:
         llm=llm,
         model=reviewer_model,
     )
+    from virtual_dev.application.services.mr_summarizer import MrSummarizer
+    mr_summarizer = MrSummarizer(llm=llm, model=reviewer_model)
     health = HealthTracker()
     reviewer = ReviewerAgent(
         vcs=vcs,
@@ -346,6 +348,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         dev_agents=dict(dev_agents),
         health=health,
         trace=trace,
+        mr_summarizer=mr_summarizer,
     )
 
     devops = DevOpsAgent(
