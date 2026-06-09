@@ -924,3 +924,187 @@ async def test_ping_fires_before_escalation(
     assert stats.pings_sent == 1
     assert stats.escalations_sent == 0
     assert any("waiting for a review" in text for _, text in chat.sent_channels)
+
+
+# --- last_seen coupled to actually handling the comment -----------------
+
+
+class _StubResponder:
+    """Minimal ThreadResponder returning a fixed decision."""
+
+    def __init__(self, action: object, *, reply_text: str = "", feedback: str = "") -> None:
+        from virtual_dev.application.agents import ResponderDecision
+        self._decision = ResponderDecision(
+            action=action,   # type: ignore[arg-type]
+            reply_text=reply_text, reasoning="stub",
+            iteration_feedback=feedback,
+        )
+        self.calls = 0
+
+    async def decide(self, **kwargs: object) -> object:
+        self.calls += 1
+        return self._decision
+
+
+@pytest.mark.asyncio
+async def test_actionable_comment_not_marked_seen_when_reply_fails(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression: ``last_seen`` advanced unconditionally at end of tick,
+    so an actionable comment whose reply FAILED to post got marked read
+    yet never answered — lost forever. The cursor must stay put so the
+    next tick retries instead of silently dropping the question."""
+    from virtual_dev.application.agents import ResponderAction
+
+    mr_id = await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="what is this dependency for?",
+        ),
+    ]
+
+    class _PostFailsVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+        async def add_mr_comment(self, repo_key: str, iid: int, body: str) -> None:
+            raise RuntimeError("network down")
+
+    vcs = _PostFailsVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(ResponderAction.REPLY, reply_text="here's why")
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+    )
+    await agent.tick()
+
+    assert responder.calls == 1   # it did try to answer
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.last_seen_comment_id == "c-0"   # held — not advanced past unanswered c-1
+
+
+@pytest.mark.asyncio
+async def test_actionable_comment_marked_seen_when_reply_succeeds(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Companion: a cleanly-posted reply DOES advance the cursor, so we
+    don't answer the same comment on every subsequent tick."""
+    from virtual_dev.application.agents import ResponderAction
+
+    mr_id = await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="what is this dependency for?",
+        ),
+    ]
+
+    class _PostOkVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+    vcs = _PostOkVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(ResponderAction.REPLY, reply_text="here's why")
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+    )
+    await agent.tick()
+
+    assert vcs.posted_mr_comments and vcs.posted_mr_comments[0][2] == "here's why"
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.last_seen_comment_id == "c-1"   # advanced after a successful answer
+
+
+@pytest.mark.asyncio
+async def test_gitlab_iterate_posts_acknowledgement(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression: on the GitLab-comment path an ITERATE decision ran the
+    code change but never posted the responder's acknowledgement, so the
+    reviewer saw the bot go silent — looked hung even though it was
+    fixing the issue. The MM-thread path posts the ack immediately; the
+    GitLab path must do the same."""
+    from virtual_dev.application.agents import (
+        DevOutcome,
+        DevResult,
+        ResponderAction,
+    )
+
+    await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="why is this dependency here?",
+        ),
+    ]
+
+    class _OkVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+    vcs = _OkVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(
+        ResponderAction.ITERATE,
+        reply_text="oops, accidental — removing it",
+        feedback="remove the accidental certifi dependency",
+    )
+
+    class _StubDev:
+        async def handle_iteration(self, **kwargs: object) -> object:
+            return DevResult(
+                outcome=DevOutcome.MR_OPENED,
+                branch_name="ai-dev/dm-1-42", commit_sha="abc123def456",
+            )
+
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+        dev_agents={"bellingshausen": _StubDev()},
+    )
+    await agent.tick()
+
+    # The acknowledgement the responder composed must reach the reviewer.
+    assert any(
+        "removing it" in body for _, _, body in vcs.posted_mr_comments
+    ), f"ack not posted; MR comments = {vcs.posted_mr_comments}"

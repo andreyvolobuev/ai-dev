@@ -235,8 +235,11 @@ class ReviewerAgent:
         # only the LATEST one this tick — multiple back-to-back comments
         # often refer to each other, and one round-trip with the full
         # transcript is cheaper than N independent decisions.
+        handled = True
         if actionable_comments and self._responder is not None:
-            await self._handle_gitlab_actionable(row, comments, actionable_comments[-1], stats)
+            handled = await self._handle_gitlab_actionable(
+                row, comments, actionable_comments[-1], stats,
+            )
 
         # "Please review" ping — once, when MR is no longer a draft AND
         # the CI pipeline of the latest commit is green (or there's no
@@ -327,7 +330,11 @@ class ReviewerAgent:
             row_id=row.id,
             new_status=current_status,
             new_title=live.title,
-            new_last_seen=(new_comments[-1].id if new_comments else None),
+            # Hold the cursor when an actionable comment wasn't handled
+            # (e.g. the reply failed to post): marking it seen here would
+            # drop a question we never answered. None → last_seen stays,
+            # so the next tick re-evaluates and retries.
+            new_last_seen=(new_comments[-1].id if (new_comments and handled) else None),
             approvals_count=approvals.count,
             approvals_required=approvals_required,
             review_ping_sent=review_ping_sent,
@@ -382,16 +389,41 @@ class ReviewerAgent:
             row.repo_key, row.iid, sha[:12],
         )
 
+    async def _post_comment_reply(
+        self, row: MergeRequestRow, latest: ReviewComment, text: str,
+    ) -> bool:
+        """Post ``text`` as a reply to a GitLab MR comment — threaded when
+        we know the discussion id, top-level otherwise. Returns False on a
+        transient post failure so callers can keep the cursor pinned."""
+        assert self._vcs is not None
+        try:
+            if latest.discussion_id:
+                await self._vcs.reply_to_comment(
+                    row.repo_key, row.iid, latest.discussion_id, text,
+                )
+            else:
+                await self._vcs.add_mr_comment(row.repo_key, row.iid, text)
+        except Exception:
+            logger.exception("Reviewer: GitLab reply post failed")
+            return False
+        return True
+
     async def _handle_gitlab_actionable(
         self,
         row: MergeRequestRow,
         all_comments: list[ReviewComment],
         latest: ReviewComment,
         stats: ReviewerTickStats,
-    ) -> None:
+    ) -> bool:
         """Route a question / change-request comment from GitLab through
         ThreadResponder. Reply / iterate / ignore — same shape as the
-        Mattermost-driven path, but staying in GitLab."""
+        Mattermost-driven path, but staying in GitLab.
+
+        Returns whether the comment was *handled*: the decision executed
+        without a transient failure (post sent / iteration dispatched /
+        deliberately ignored). A swallowed network error returns False so
+        the caller keeps ``last_seen`` pinned and retries next tick — we
+        must not mark a comment read that we never managed to answer."""
         # Build a "thread" of prior non-system, non-bot comments as
         # context. Convert to ChatMessage shape so ThreadResponder is
         # medium-agnostic.
@@ -450,23 +482,10 @@ class ReviewerAgent:
         if decision.action in (
             ResponderAction.REPLY, ResponderAction.PROPOSE_ALTERNATIVE,
         ) and decision.reply_text:
-            assert self._vcs is not None
-            try:
-                # Threaded reply when we know the discussion id; falls
-                # back to top-level only when GitLab didn't expose one.
-                if latest.discussion_id:
-                    await self._vcs.reply_to_comment(
-                        row.repo_key, row.iid,
-                        latest.discussion_id, decision.reply_text,
-                    )
-                else:
-                    await self._vcs.add_mr_comment(
-                        row.repo_key, row.iid, decision.reply_text,
-                    )
-                stats.gitlab_replies_posted += 1
-            except Exception:
-                logger.exception("Reviewer: GitLab reply post failed")
-            return
+            if not await self._post_comment_reply(row, latest, decision.reply_text):
+                return False
+            stats.gitlab_replies_posted += 1
+            return True
 
         if decision.action == ResponderAction.ITERATE:
             dev = self._dev_agents.get(row.repo_key)
@@ -475,7 +494,15 @@ class ReviewerAgent:
                     "Reviewer: cannot iterate on {}!{} — missing dev agent or task id",
                     row.repo_key, row.iid,
                 )
-                return
+                # Nothing we can do about a config gap by retrying; treat
+                # as handled so we don't loop on this comment forever.
+                return True
+            # Acknowledge immediately so the reviewer sees the bot is
+            # acting on the comment — mirrors the MM-thread path, which
+            # posts the ack before iterating. Best-effort: a dropped ack
+            # must not abort the substantive code change below.
+            if decision.reply_text:
+                await self._post_comment_reply(row, latest, decision.reply_text)
             try:
                 result = await dev.handle_iteration(   # type: ignore[union-attr]
                     tracker="jira",
@@ -485,7 +512,7 @@ class ReviewerAgent:
                 )
             except Exception:
                 logger.exception("Reviewer: GitLab iteration crashed")
-                return
+                return False
             if result.commit_sha:
                 # Mark as pending CI confirmation, with ack-target=gitlab
                 # so the green-CI ack lands as a GitLab MR comment, not
@@ -499,6 +526,11 @@ class ReviewerAgent:
                     "for {}!{} sha={}",
                     row.repo_key, row.iid, result.commit_sha[:12],
                 )
+
+        # ITERATE that ran (with or without a commit), or a no-op decision
+        # (IGNORE / empty reply_text): nothing failed transiently, so the
+        # comment is handled and may be marked seen.
+        return True
 
     async def _load_plan(self, task_external_id: str | None):
         """Load the latest non-superseded plan for an MR's task, for the
