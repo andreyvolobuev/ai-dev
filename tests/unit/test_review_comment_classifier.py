@@ -134,6 +134,35 @@ def test_classifier_prompt_documents_coding_rule_category() -> None:
 
 
 @pytest.mark.asyncio
+async def test_classifier_frames_comment_as_delimited_data() -> None:
+    """Regression: the bare comment was sent as the user turn, so Haiku
+    *answered* comment-shaped inputs instead of classifying them.
+
+    Live repro: a bare reviewer question (see ``body`` below) made the
+    model reply with an actual answer ("I need to clarify which
+    dependency…") instead of a token; the non-token reply then silently
+    degraded to chatter, and a real reviewer question was dropped with
+    ``no action``. The user turn must
+    present the comment as DELIMITED DATA and carry the classify
+    instruction itself (not rely on the system prompt alone), so the
+    model emits a category token rather than conversing with the comment.
+    """
+    llm = _StubLlm("question")
+    classifier = ReviewCommentClassifier(llm=llm, model="x")
+    body = "А для чего эта зависимость?"  # noqa: RUF001  — real reviewer comment, kept verbatim
+    await classifier.classify(body)
+
+    messages, _ = llm.calls[0]
+    user_text = "\n".join(m.content for m in messages if m.role == "user")
+    # Comment present verbatim, but wrapped so it can't be read as an
+    # instruction to the assistant.
+    assert body in user_text
+    assert "<comment>" in user_text and "</comment>" in user_text
+    # The classify directive rides in the user turn too.
+    assert "classif" in user_text.lower()
+
+
+@pytest.mark.asyncio
 async def test_classifier_handles_russian_change_request() -> None:
     """Real motivation for the rewrite — the regex implementation never
     matched non-English change requests. Now we hand the body to the
