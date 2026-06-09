@@ -114,6 +114,13 @@ class MergeRequestRow(Base):
     # escalation policy. last_pipeline_notified_status lets DevOps avoid
     # re-posting when a red pipeline reruns and stays red.
     last_seen_comment_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Actionable comments (questions / change-requests) we've classified but
+    # not yet managed to *deliver a reply* to. last_seen_comment_id advances
+    # past them (so we don't re-classify), so this set is what keeps an
+    # unanswered comment alive: every tick we retry each pending comment's
+    # thread until the reply lands, then drop it. Prevents "fixed it but
+    # never replied, yet marked the comment done".
+    pending_comment_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
     last_activity_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_pipeline_notified_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
     last_escalation_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

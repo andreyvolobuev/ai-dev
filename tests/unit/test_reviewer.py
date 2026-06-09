@@ -947,13 +947,13 @@ class _StubResponder:
 
 
 @pytest.mark.asyncio
-async def test_actionable_comment_not_marked_seen_when_reply_fails(
+async def test_failed_reply_keeps_comment_pending_for_retry(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Regression: ``last_seen`` advanced unconditionally at end of tick,
-    so an actionable comment whose reply FAILED to post got marked read
-    yet never answered — lost forever. The cursor must stay put so the
-    next tick retries instead of silently dropping the question."""
+    """An actionable comment whose reply FAILED to post must not be
+    silently dropped. last_seen still advances (it's only the "classified"
+    watermark), but the comment id is recorded in pending_comment_ids so
+    the next tick retries the reply instead of losing the question."""
     from virtual_dev.application.agents import ResponderAction
 
     mr_id = await _insert_mr(
@@ -995,7 +995,9 @@ async def test_actionable_comment_not_marked_seen_when_reply_fails(
         row = (await s.execute(
             select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
         )).scalar_one()
-        assert row.last_seen_comment_id == "c-0"   # held — not advanced past unanswered c-1
+        # Classified (watermark advances) but kept alive for retry.
+        assert row.last_seen_comment_id == "c-1"
+        assert row.pending_comment_ids == ["c-1"]
 
 
 @pytest.mark.asyncio
@@ -1111,12 +1113,12 @@ async def test_gitlab_iterate_posts_acknowledgement(
 
 
 @pytest.mark.asyncio
-async def test_gitlab_iterate_not_marked_seen_when_ack_fails(
+async def test_failed_ack_keeps_comment_pending_and_skips_iteration(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A comment must never be marked seen if the bot couldn't actually
-    reply. When the ITERATE acknowledgement fails to post, the comment
-    stays unhandled (cursor held) so the next tick retries — and the dev
+    """A comment must never be resolved if the bot couldn't actually
+    reply. When the ITERATE acknowledgement fails to post, the comment id
+    stays in pending_comment_ids so the next tick retries — and the dev
     iteration is NOT dispatched, so we don't change code we couldn't tell
     the reviewer about."""
     from virtual_dev.application.agents import (
@@ -1175,11 +1177,140 @@ async def test_gitlab_iterate_not_marked_seen_when_ack_fails(
     )
     await agent.tick()
 
-    # Ack couldn't be delivered → comment is NOT marked seen.
+    # Ack couldn't be delivered → comment stays pending for retry.
     async with session_factory() as s:
         row = (await s.execute(
             select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
         )).scalar_one()
-        assert row.last_seen_comment_id == "c-0", "comment marked seen despite failed reply"
+        assert row.pending_comment_ids == ["c-1"], "comment resolved despite failed reply"
     # And we didn't run a dev iteration we couldn't announce.
     assert iterated == [], "iteration dispatched even though the ack never reached the reviewer"
+
+
+@pytest.mark.asyncio
+async def test_answers_each_discussion_thread_not_just_latest(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A reviewer who comments in several inline threads gets an answer in
+    EACH thread (replied via that thread's discussion id), not a single
+    reply to only the most-recent comment across the MR."""
+    from virtual_dev.application.agents import ResponderAction
+
+    mr_id = await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="seen"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="why this?", discussion_id="disc-A",
+        ),
+        ReviewComment(
+            id="c-2", mr_id="42", author_username="alice",
+            body="why that?", discussion_id="disc-B",
+        ),
+    ]
+
+    replies: list[tuple[str, str]] = []
+
+    class _ThreadVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+        async def reply_to_comment(
+            self, repo_key: str, iid: int, comment_id: str, body: str,
+        ) -> None:
+            replies.append((comment_id, body))
+
+    vcs = _ThreadVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(ResponderAction.REPLY, reply_text="here's why")
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+    )
+    await agent.tick()
+
+    # One reply per thread, each into its own discussion.
+    assert {disc for disc, _ in replies} == {"disc-A", "disc-B"}
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pending_comment_ids == []   # both delivered
+
+
+@pytest.mark.asyncio
+async def test_pending_comment_retried_until_reply_delivered(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An undelivered reply is retried on the next tick (even with no new
+    comments) and resolved once it finally lands."""
+    from virtual_dev.application.agents import ResponderAction
+
+    mr_id = await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="seen"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="why this?", discussion_id="disc-A",
+        ),
+    ]
+
+    state = {"fail": True}
+    posted: list[tuple[str, str]] = []
+
+    class _FlakyVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+        async def reply_to_comment(
+            self, repo_key: str, iid: int, comment_id: str, body: str,
+        ) -> None:
+            if state["fail"]:
+                raise RuntimeError("network down")
+            posted.append((comment_id, body))
+
+    vcs = _FlakyVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(ResponderAction.REPLY, reply_text="here's why")
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+    )
+
+    # Tick 1: reply fails → comment kept pending, nothing delivered.
+    await agent.tick()
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pending_comment_ids == ["c-1"]
+    assert posted == []
+
+    # Tick 2: network back, no new comments — the pending reply is retried
+    # and resolved.
+    state["fail"] = False
+    await agent.tick()
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pending_comment_ids == []
+    assert [d for d, _ in posted] == ["disc-A"]

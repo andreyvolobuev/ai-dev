@@ -186,10 +186,11 @@ class ReviewerAgent:
         now = datetime.now(timezone.utc)
         touched = False
 
-        # Comments that warrant a bot response: questions and change
-        # requests. Approval hints (LGTM) are inferred from approvals
-        # endpoint; chatter ("nice work") needs no reply.
-        actionable_comments: list[ReviewComment] = []
+        # Classify each NEW comment exactly once — last_seen advances past
+        # it below, so we never re-run Haiku on the same comment. Questions
+        # and change-requests are actionable; approval hints come from the
+        # approvals endpoint and chatter ("nice work") needs no reply.
+        new_actionable: list[ReviewComment] = []
         for comment in new_comments:
             klass = await self._comment_classifier.classify(comment.body)
             logger.info(
@@ -229,17 +230,16 @@ class ReviewerAgent:
                 ))
             touched = True
             if klass in (CommentClass.QUESTION, CommentClass.CHANGE_REQUEST):
-                actionable_comments.append(comment)
+                new_actionable.append(comment)
 
-        # Route actionable comments through ThreadResponder. We process
-        # only the LATEST one this tick — multiple back-to-back comments
-        # often refer to each other, and one round-trip with the full
-        # transcript is cheaper than N independent decisions.
-        handled = True
-        if actionable_comments and self._responder is not None:
-            handled = await self._handle_gitlab_actionable(
-                row, comments, actionable_comments[-1], stats,
-            )
+        # Reply in EVERY actionable discussion thread — new ones plus any
+        # from earlier ticks whose reply never landed (pending_comment_ids).
+        # The comment id stays pending until its thread's reply is actually
+        # delivered, so an undelivered answer is retried instead of being
+        # silently marked done.
+        pending = await self._resolve_actionable_threads(
+            row, comments, new_actionable, stats,
+        )
 
         # "Please review" ping — once, when MR is no longer a draft AND
         # the CI pipeline of the latest commit is green (or there's no
@@ -330,11 +330,11 @@ class ReviewerAgent:
             row_id=row.id,
             new_status=current_status,
             new_title=live.title,
-            # Hold the cursor when an actionable comment wasn't handled
-            # (e.g. the reply failed to post): marking it seen here would
-            # drop a question we never answered. None → last_seen stays,
-            # so the next tick re-evaluates and retries.
-            new_last_seen=(new_comments[-1].id if (new_comments and handled) else None),
+            # last_seen is the pure "already classified" watermark and
+            # advances unconditionally — an undelivered reply is kept alive
+            # by `pending_comment_ids`, not by holding this cursor.
+            new_last_seen=(new_comments[-1].id if new_comments else None),
+            pending_comment_ids=pending,
             approvals_count=approvals.count,
             approvals_required=approvals_required,
             review_ping_sent=review_ping_sent,
@@ -388,6 +388,51 @@ class ReviewerAgent:
             "Reviewer: posted MM iteration-done ack for {}!{} sha={}",
             row.repo_key, row.iid, sha[:12],
         )
+
+    async def _resolve_actionable_threads(
+        self,
+        row: MergeRequestRow,
+        comments: list[ReviewComment],
+        new_actionable: list[ReviewComment],
+        stats: ReviewerTickStats,
+    ) -> list[str]:
+        """Reply to each actionable discussion thread — new ones plus any
+        from earlier ticks whose reply never landed — one reply per thread.
+
+        Returns the comment ids still awaiting a delivered reply, to persist
+        as the new pending set. A thread is resolved (its ids dropped from
+        pending) only when ``_handle_gitlab_actionable`` reports the reply
+        was actually delivered.
+        """
+        by_id = {c.id: c for c in comments}
+        prior_pending = [
+            by_id[cid] for cid in (row.pending_comment_ids or []) if cid in by_id
+        ]
+        if self._responder is None:
+            # Can't act without a responder. Keep prior pending whose
+            # comment still exists; drop ones that vanished.
+            return [c.id for c in prior_pending]
+
+        seen_ids = {c.id for c in new_actionable}
+        candidates = new_actionable + [c for c in prior_pending if c.id not in seen_ids]
+        if not candidates:
+            return []
+
+        # Group by discussion thread; top-level notes key on their own id.
+        order = {c.id: i for i, c in enumerate(comments)}
+        threads: dict[str, list[ReviewComment]] = {}
+        for c in candidates:
+            threads.setdefault(c.discussion_id or c.id, []).append(c)
+
+        still_pending: list[str] = []
+        for group in threads.values():
+            # Reply to the newest comment in the thread (comments arrive
+            # oldest-first); the rest is context inside the handler. The
+            # whole thread is resolved when that one reply is delivered.
+            latest = max(group, key=lambda c: order.get(c.id, 0))
+            if not await self._handle_gitlab_actionable(row, comments, latest, stats):
+                still_pending.append(latest.id)
+        return still_pending
 
     async def _post_comment_reply(
         self, row: MergeRequestRow, latest: ReviewComment, text: str,
@@ -816,6 +861,7 @@ class ReviewerAgent:
         new_status: str,
         new_title: str,
         new_last_seen: str | None,
+        pending_comment_ids: list[str],
         approvals_count: int,
         approvals_required: int,
         review_ping_sent: bool,
@@ -836,6 +882,7 @@ class ReviewerAgent:
                 row.title = new_title
             if new_last_seen:
                 row.last_seen_comment_id = new_last_seen
+            row.pending_comment_ids = list(pending_comment_ids)
             row.approvals_count = approvals_count
             row.approvals_required = approvals_required
             row.review_ping_sent = review_ping_sent
