@@ -448,9 +448,16 @@ class MmThreadListener:
         channel_id = row.review_thread_channel_id or event.channel_id
         root_id = event.thread_root_id
 
+        # A post is only marked ✅-processed once we've actually delivered
+        # our response. IGNORE has nothing to send, so it counts as
+        # delivered; a dropped reply leaves the post unreacted so the
+        # catch-up sweep retries it rather than silently swallowing it.
+        delivered = True
+
         if decision.action == ResponderAction.REPLY and decision.reply_text:
-            await self._post_reply(channel_id, root_id, decision.reply_text)
-            self.stats.replies_posted += 1
+            delivered = await self._post_reply(channel_id, root_id, decision.reply_text)
+            if delivered:
+                self.stats.replies_posted += 1
 
         elif (
             decision.action == ResponderAction.PROPOSE_ALTERNATIVE
@@ -460,13 +467,20 @@ class MmThreadListener:
             # thread) but counted separately so push-back rate is
             # observable. No dev iteration: we're waiting for the
             # reviewer to confirm the alternative before changing code.
-            await self._post_reply(channel_id, root_id, decision.reply_text)
-            self.stats.alternatives_proposed += 1
+            delivered = await self._post_reply(channel_id, root_id, decision.reply_text)
+            if delivered:
+                self.stats.alternatives_proposed += 1
 
         elif decision.action == ResponderAction.ITERATE:
-            # Acknowledge immediately so the humans see activity.
+            # Acknowledge BEFORE touching code. If we can't even tell the
+            # humans we're on it, don't change code we can't announce and
+            # don't mark the post processed — leave it for catch-up to
+            # retry (mirrors the GitLab reviewer path).
+            if decision.reply_text and not await self._post_reply(
+                channel_id, root_id, decision.reply_text,
+            ):
+                return
             if decision.reply_text:
-                await self._post_reply(channel_id, root_id, decision.reply_text)
                 self.stats.replies_posted += 1
             # Dev sees the full thread (transcript + the triggering reply
             # itself). The responder splits "history" vs "latest" because
@@ -478,7 +492,10 @@ class MmThreadListener:
             )
             self.stats.iterations_dispatched += 1
 
-        # React ✅ — always, including ignore, so we never reprocess.
+        # React ✅ only when the response was delivered (or nothing needed
+        # sending) — a dropped reply stays unreacted so catch-up retries.
+        if not delivered:
+            return
         try:
             await self._chat.add_reaction(event.id, _PROCESSED_REACTION)
         except Exception:
@@ -610,8 +627,13 @@ class MmThreadListener:
             return str(Path(repo_cfg.local_path).expanduser().resolve())
         return str(Path(self._settings.workspaces_dir).resolve() / repo_key)
 
-    async def _post_reply(self, channel_id: str, root_id: str, text: str) -> None:
-        await self._communicator.send_channel(channel_id, text, thread_root_id=root_id)
+    async def _post_reply(self, channel_id: str, root_id: str, text: str) -> bool:
+        """Post into the thread; return whether it was actually delivered
+        (False on rate-limit / outside-hours / send error)."""
+        outcome = await self._communicator.send_channel(
+            channel_id, text, thread_root_id=root_id,
+        )
+        return outcome.sent
 
     async def _load_mr_by_thread(self, thread_root_id: str) -> MergeRequestRow | None:
         async with self._session_factory() as session:

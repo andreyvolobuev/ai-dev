@@ -509,3 +509,52 @@ async def test_propose_alternative_posts_text_without_iterating(
     assert listener.stats.alternatives_proposed == 1
     # ✅ marker still set so we don't reprocess the source post.
     assert ("post-alt", _PROCESSED_REACTION) in chat.reactions
+
+
+@pytest.mark.asyncio
+async def test_iterate_ack_failure_leaves_post_unmarked(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """MM-thread mirror of the GitLab invariant: a post must not get the
+    ✅ "processed" marker if the bot couldn't deliver its reply. When the
+    ITERATE acknowledgement fails to post, leave the post unreacted (so
+    the catch-up sweep retries) and do NOT run the dev iteration we
+    couldn't announce."""
+    await _insert_mr(session_factory, root_id="root-ackfail")
+    event = _human_post(
+        id="post-ackfail", thread_root_id="root-ackfail",
+        text="please rename foo to bar",
+    )
+
+    class _SendFailsChat(_ScriptedChat):
+        async def send_to_channel(self, channel_id, text, thread_root_id=None):  # type: ignore[no-untyped-def]
+            raise RuntimeError("network down")
+
+    chat = _SendFailsChat([event])
+    responder = _ScriptedResponder([ResponderDecision(
+        action=ResponderAction.ITERATE,
+        reply_text="Принято, правлю.",
+        iteration_feedback="Rename foo to bar.",
+        reasoning="clear-rename",
+    )])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(
+        outcome=DevOutcome.MR_OPENED, branch_name="ai-dev/dm-1",
+        commit_sha="deadbeef",
+    ))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await asyncio.sleep(0.1)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    # Ack never reached the thread → no ✅, and no iteration we can't announce.
+    assert ("post-ackfail", _PROCESSED_REACTION) not in chat.reactions
+    assert dev.calls == []
