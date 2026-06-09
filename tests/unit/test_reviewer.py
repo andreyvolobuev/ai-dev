@@ -1108,3 +1108,78 @@ async def test_gitlab_iterate_posts_acknowledgement(
     assert any(
         "removing it" in body for _, _, body in vcs.posted_mr_comments
     ), f"ack not posted; MR comments = {vcs.posted_mr_comments}"
+
+
+@pytest.mark.asyncio
+async def test_gitlab_iterate_not_marked_seen_when_ack_fails(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A comment must never be marked seen if the bot couldn't actually
+    reply. When the ITERATE acknowledgement fails to post, the comment
+    stays unhandled (cursor held) so the next tick retries — and the dev
+    iteration is NOT dispatched, so we don't change code we couldn't tell
+    the reviewer about."""
+    from virtual_dev.application.agents import (
+        DevOutcome,
+        DevResult,
+        ResponderAction,
+    )
+
+    mr_id = await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="please fix the duplication here",
+        ),
+    ]
+
+    class _AckFailsVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+        async def add_mr_comment(self, repo_key: str, iid: int, body: str) -> None:
+            raise RuntimeError("network down")
+
+    vcs = _AckFailsVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(
+        ResponderAction.ITERATE,
+        reply_text="ack: removing it",
+        feedback="extract the repeated block into a helper",
+    )
+
+    iterated: list[dict] = []
+
+    class _StubDev:
+        async def handle_iteration(self, **kwargs: object) -> object:
+            iterated.append(dict(kwargs))
+            return DevResult(
+                outcome=DevOutcome.MR_OPENED,
+                branch_name="ai-dev/dm-1-42", commit_sha="abc123",
+            )
+
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+        dev_agents={"bellingshausen": _StubDev()},
+    )
+    await agent.tick()
+
+    # Ack couldn't be delivered → comment is NOT marked seen.
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.last_seen_comment_id == "c-0", "comment marked seen despite failed reply"
+    # And we didn't run a dev iteration we couldn't announce.
+    assert iterated == [], "iteration dispatched even though the ack never reached the reviewer"

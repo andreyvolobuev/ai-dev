@@ -497,12 +497,17 @@ class ReviewerAgent:
                 # Nothing we can do about a config gap by retrying; treat
                 # as handled so we don't loop on this comment forever.
                 return True
-            # Acknowledge immediately so the reviewer sees the bot is
-            # acting on the comment — mirrors the MM-thread path, which
-            # posts the ack before iterating. Best-effort: a dropped ack
-            # must not abort the substantive code change below.
-            if decision.reply_text:
-                await self._post_comment_reply(row, latest, decision.reply_text)
+            # Acknowledge the reviewer BEFORE touching code. A comment
+            # must never be marked seen without a reply the human can see
+            # (the whole point of this path), so if we can't deliver the
+            # ack we bail out as unhandled — the cursor stays put and the
+            # next tick retries, rather than silently changing code we
+            # couldn't announce. Mirrors the MM-thread path, which also
+            # posts the ack first.
+            if decision.reply_text and not await self._post_comment_reply(
+                row, latest, decision.reply_text,
+            ):
+                return False
             try:
                 result = await dev.handle_iteration(   # type: ignore[union-attr]
                     tracker="jira",
