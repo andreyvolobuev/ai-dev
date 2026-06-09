@@ -384,6 +384,76 @@ async def test_iterate_forwards_full_thread_transcript_to_dev(
     assert "actually let's call it baz" in texts
 
 
+@pytest.mark.asyncio
+async def test_concurrent_dispatch_of_same_post_is_processed_once(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The same MM post must be handled at most once even if two delivery
+    paths race on it.
+
+    In production both the WebSocket listener and the 60s catch-up poller
+    call ``_dispatch``. The ✅ idempotency reaction is only added AFTER the
+    (multi-second) ``responder.decide`` + post, so without an in-flight
+    guard both dispatches pass the early ✅-check, both call the LLM, and
+    the bot posts two *divergent* replies to a single human message —
+    observed live as an offer ("if you want, I'll fix it — just say")
+    immediately followed by a phantom "good catch, I'll fix it" with no
+    human confirmation in between. Exactly one decision must win.
+    """
+    await _insert_mr(session_factory, root_id="root-race")
+    event = _human_post(
+        id="post-race", thread_root_id="root-race",
+        text="почему здесь PUT вместо PATCH?",
+    )
+    chat = _ScriptedChat([event])
+
+    # Responder that blocks inside decide() until released — this holds
+    # both racing dispatches open across the ✅-check→✅-set window, the
+    # exact condition the WS/catch-up overlap creates in production.
+    release = asyncio.Event()
+
+    class _BlockingResponder:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def decide(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            await release.wait()
+            return ResponderDecision(
+                action=ResponderAction.REPLY,
+                reply_text="Ответ на вопрос про PUT/PATCH.",
+                reasoning="explain",
+            )
+
+    responder = _BlockingResponder()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    # Two concurrent deliveries of the SAME post (WS + catch-up overlap).
+    d1 = asyncio.create_task(listener._dispatch(event))
+    d2 = asyncio.create_task(listener._dispatch(event))
+    # Let both tasks run up to decide() (buggy code) or be rejected by the
+    # in-flight guard (fixed code) before we unblock decide().
+    for _ in range(5):
+        await asyncio.sleep(0)
+    release.set()
+    await asyncio.wait_for(asyncio.gather(d1, d2), timeout=2)
+
+    assert responder.calls == 1, (
+        f"same post sent through the LLM {responder.calls} times — "
+        f"double-dispatch race not guarded"
+    )
+    posted = [body for _, body, root in chat.sent if root == "root-race"]
+    assert len(posted) == 1, f"expected exactly one reply, got {len(posted)}: {posted}"
+
+
 def test_responder_action_propose_alternative_parses() -> None:
     """The new ``propose_alternative`` enum value must round-trip from
     its serialised form. Without this the model's submit_response call

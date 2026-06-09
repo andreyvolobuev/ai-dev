@@ -106,6 +106,11 @@ class MmThreadListener:
         # _ServerAuthSSLWebsocket so we don't have two layers fighting.
         self._sub_initial_backoff = subscription_initial_backoff
         self._sub_max_backoff = subscription_max_backoff
+        # Post ids currently being dispatched. Guards against the WS
+        # listener and the catch-up poller processing the same post
+        # concurrently (the ✅-reaction marker is only set after the slow
+        # responder.decide(), so it can't close that window on its own).
+        self._inflight_posts: set[str] = set()
         self.stats = MmListenerStats()
 
     @property
@@ -338,6 +343,28 @@ class MmThreadListener:
         if event.trusted:
             return
 
+        # Idempotency across concurrent delivery paths. The WS listener
+        # and the catch-up poller can hand us the SAME post at the same
+        # time; the ✅-reaction guard inside _dispatch_inner is only set
+        # AFTER the multi-second responder.decide(), so on its own it
+        # leaves a window where both dispatches run the LLM and the bot
+        # posts two divergent replies to one message. The claim below is
+        # synchronous (no await between the membership test and add), so
+        # two coroutines on one event loop cannot both win it.
+        if event.id and event.id in self._inflight_posts:
+            logger.debug(
+                "MmThreadListener: post {} already being dispatched, skipping",
+                event.id,
+            )
+            return
+        if event.id:
+            self._inflight_posts.add(event.id)
+        try:
+            await self._dispatch_inner(event)
+        finally:
+            self._inflight_posts.discard(event.id)
+
+    async def _dispatch_inner(self, event: ChatMessage) -> None:
         # Phase 5.0 (analyst-driven): an MM event under a bot-asked
         # post is one fragment of the analyst's pending question. We
         # append it; the coalescer flushes after the idle window and
