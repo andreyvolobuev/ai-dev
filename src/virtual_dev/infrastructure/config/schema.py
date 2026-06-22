@@ -116,6 +116,9 @@ class MmTemplatesCfg(_StrictModel):
     # channel — only DM'd to escalation.mattermost_user when the bot
     # has exhausted its auto-fix attempts.
     pipeline_autofix_gave_up_dm: str = ""
+    # Confirmation the bot posts when the team-lead replies `/restart` in
+    # the give-up DM thread and the autofix counter is reset.
+    pipeline_autofix_restart_ack: str = ""
     thread_reply_no_dev_agent: str = ""
     thread_reply_no_task: str = ""
     thread_reply_iteration_crashed: str = ""

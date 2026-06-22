@@ -246,6 +246,32 @@ async def test_attempts_exhausted_dms_escalation_user(
 
 
 @pytest.mark.asyncio
+async def test_escalation_dm_post_recorded_for_restart(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The give-up DM's post id is stored on the MR so a `/restart` reply
+    in that thread can be routed back to reset this MR's autofix counter."""
+    mr_id = await _insert_mr(session_factory, pipeline_autofix_attempts=3)
+    vcs = _StubVcs({("bellingshausen", 42): [_job("tests", "failed")]})
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = DevOpsAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(max_attempts=3),
+        dev_agents={"bellingshausen": _ScriptedDev()},   # type: ignore[dict-item]
+    )
+
+    await agent.tick()
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pipeline_autofix_escalated is True
+        # _msg() (what the stub chat returns for send_direct) has id "m".
+        assert row.autofix_escalation_root_id == "m"
+
+
+@pytest.mark.asyncio
 async def test_already_escalated_does_not_re_dm(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

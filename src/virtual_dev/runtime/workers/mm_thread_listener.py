@@ -365,6 +365,16 @@ class MmThreadListener:
             self._inflight_posts.discard(event.id)
 
     async def _dispatch_inner(self, event: ChatMessage) -> None:
+        # Team-lead command: a reply in the autofix give-up DM thread.
+        # `/restart` there resets this MR's auto-fix counter so the bot
+        # tries again. Checked first because the escalation root is a
+        # specific stored post id — a match is unambiguous.
+        if event.thread_root_id:
+            escalated = await self._load_mr_by_escalation_thread(event.thread_root_id)
+            if escalated is not None:
+                await self._handle_autofix_restart(escalated, event)
+                return
+
         # Phase 5.0 (analyst-driven): an MM event under a bot-asked
         # post is one fragment of the analyst's pending question. We
         # append it; the coalescer flushes after the idle window and
@@ -641,6 +651,54 @@ class MmThreadListener:
                 MergeRequestRow.review_thread_root_id == thread_root_id,
             )
             return (await session.execute(stmt)).scalar_one_or_none()
+
+    async def _load_mr_by_escalation_thread(
+        self, thread_root_id: str,
+    ) -> MergeRequestRow | None:
+        async with self._session_factory() as session:
+            stmt = select(MergeRequestRow).where(
+                MergeRequestRow.autofix_escalation_root_id == thread_root_id,
+            )
+            return (await session.execute(stmt)).scalar_one_or_none()
+
+    @staticmethod
+    def _is_restart_command(text: str) -> bool:
+        """True when the message is the `/restart` command — first token,
+        case-insensitive. A literal command, not NL classification."""
+        tokens = (text or "").strip().lower().split()
+        return bool(tokens) and tokens[0] == "/restart"
+
+    async def _handle_autofix_restart(
+        self, row: MergeRequestRow, event: ChatMessage,
+    ) -> None:
+        """The team-lead replied in the give-up DM thread. On `/restart`,
+        reset this MR's auto-fix counter so DevOps retries; ack and mark
+        the command processed. Other chatter in the thread is ignored."""
+        if not self._is_restart_command(event.text):
+            return
+        async with session_scope(self._session_factory) as session:
+            fresh = (await session.execute(
+                select(MergeRequestRow).where(MergeRequestRow.id == row.id)
+            )).scalar_one_or_none()
+            if fresh is None:
+                return
+            fresh.pipeline_autofix_attempts = 0
+            fresh.pipeline_autofix_escalated = False
+        logger.info(
+            "MmThreadListener: /restart reset autofix counter for {}!{}",
+            row.repo_key, row.iid,
+        )
+        ack = (
+            self._config.notifications.mattermost.pipeline_autofix_restart_ack
+            or "Ок, сбросила счётчик попыток — пробую починить заново."
+        )
+        await self._post_reply(event.channel_id, event.thread_root_id or event.id, ack)
+        try:
+            await self._chat.add_reaction(event.id, _PROCESSED_REACTION)
+        except Exception:
+            logger.warning(
+                "MmThreadListener: add_reaction failed for /restart post {}", event.id,
+            )
 
     async def _load_plan(self, row: MergeRequestRow):
         if not row.task_external_id:

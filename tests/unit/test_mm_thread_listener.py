@@ -102,6 +102,7 @@ def _test_config() -> AppConfig:
             thread_reply_iteration_crashed="dev упал",
             thread_reply_iteration_done="готово {commit_sha_short} на {branch}",
             thread_reply_iteration_no_changes="без изменений",
+            pipeline_autofix_restart_ack="ack: retrying",
         )),
     )
 
@@ -558,3 +559,103 @@ async def test_iterate_ack_failure_leaves_post_unmarked(
     # Ack never reached the thread → no ✅, and no iteration we can't announce.
     assert ("post-ackfail", _PROCESSED_REACTION) not in chat.reactions
     assert dev.calls == []
+
+
+async def _insert_escalated_mr(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    escalation_root_id: str,
+    attempts: int = 3,
+) -> int:
+    async with session_scope(session_factory) as session:
+        row = MergeRequestRow(
+            repo_key="bellingshausen", iid=1001, external_id="1001",
+            task_external_id="DM-1", title="t", description="d",
+            source_branch="ai-dev/dm-1", target_branch="master",
+            author_username="virtual-dev",
+            web_url="https://gitlab/x/merge_requests/1001",
+            status="open", approvals_count=0, approvals_required=1,
+            review_ping_sent=True,
+            pipeline_autofix_attempts=attempts,
+            pipeline_autofix_escalated=True,
+            autofix_escalation_root_id=escalation_root_id,
+        )
+        session.add(row)
+        await session.flush()
+        return row.id
+
+
+@pytest.mark.asyncio
+async def test_restart_command_resets_autofix_counter(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A `/restart` reply in the autofix give-up DM thread resets the MR's
+    autofix counter + escalated flag, acks the team-lead, and marks the
+    command processed. It must NOT go through the review responder."""
+    mr_id = await _insert_escalated_mr(session_factory, escalation_root_id="esc-root")
+    event = _human_post(id="cmd-1", thread_root_id="esc-root", text="/restart")
+    chat = _ScriptedChat([event])
+    responder = _ScriptedResponder([])   # a command is not a review reply
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await asyncio.sleep(0.1)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    from sqlalchemy import select
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pipeline_autofix_attempts == 0
+        assert row.pipeline_autofix_escalated is False
+    # Acked the lead in the thread, marked the command processed, and did
+    # NOT invoke the review responder.
+    assert any(body == "ack: retrying" and root == "esc-root" for _, body, root in chat.sent)
+    assert ("cmd-1", _PROCESSED_REACTION) in chat.reactions
+    assert responder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_non_restart_reply_in_escalation_thread_does_not_reset(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Arbitrary chatter in the give-up DM thread must not reset the
+    counter — only the explicit `/restart` command does."""
+    mr_id = await _insert_escalated_mr(session_factory, escalation_root_id="esc-root")
+    event = _human_post(id="cmd-2", thread_root_id="esc-root", text="спасибо, посмотрю сама")
+    chat = _ScriptedChat([event])
+    responder = _ScriptedResponder([])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await asyncio.sleep(0.1)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    from sqlalchemy import select
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pipeline_autofix_attempts == 3   # unchanged
+        assert row.pipeline_autofix_escalated is True
+    assert chat.sent == []
+    assert responder.calls == 0

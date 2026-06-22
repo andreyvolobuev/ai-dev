@@ -39,7 +39,11 @@ mattermost:
     Failing jobs: {failing_jobs}
     URL: {web_url}
 
-    Нужно вручную разобраться, что не так.
+    Нужно вручную разобраться, что не так. Ответь `/restart` в этом треде, когда захочешь, чтобы я попробовала снова.
+
+  # Подтверждение сброса авто-фикс счётчика по команде /restart от тимлида.
+  pipeline_autofix_restart_ack: |
+    Ок, сбросила счётчик попыток — пробую починить CI заново.
 
   # Reviewer thread responses (MmThreadListener). {commit_sha_short}, {branch}.
   thread_reply_no_dev_agent: "Не могу внести правку: Dev-агент для этого репо не сконфигурирован."

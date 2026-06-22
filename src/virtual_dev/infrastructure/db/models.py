@@ -139,6 +139,10 @@ class MergeRequestRow(Base):
     # the team-lead, so we don't keep DMing on every subsequent tick.
     pipeline_autofix_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     pipeline_autofix_escalated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # MM post id of the "I gave up after N attempts" DM to the team-lead.
+    # A `/restart` reply in this post's thread resets the autofix counter
+    # for this MR (the lead nudging the bot to try again).
+    autofix_escalation_root_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     # Set by both MM-driven and autofix iteration paths after a successful
     # push. The Reviewer poll ack-posts to the thread when CI for this sha
     # turns green, then clears the field. Means: "we have an unannounced

@@ -131,10 +131,11 @@ class DevOpsAgent:
 
         if attempts >= max_attempts:
             if not row.pipeline_autofix_escalated:
-                await self._escalate_via_dm(row, jobs, attempts)
+                escalation_root_id = await self._escalate_via_dm(row, jobs, attempts)
                 stats.escalations_sent += 1
                 await self._persist_pipeline_status(
                     row.id, pipeline_status, mark_escalated=True,
+                    escalation_root_id=escalation_root_id,
                 )
             else:
                 await self._persist_pipeline_status(row.id, pipeline_status)
@@ -218,7 +219,10 @@ class DevOpsAgent:
 
     async def _escalate_via_dm(
         self, row: MergeRequestRow, jobs: list[PipelineJob], attempts: int,
-    ) -> None:
+    ) -> str | None:
+        """DM the team-lead that auto-fix is exhausted. Returns the DM
+        post id so the caller can record it — a `/restart` reply in that
+        post's thread resets this MR's counter. None if no DM was sent."""
         user = await self._resolve_escalation_user()
         if user is None:
             logger.warning(
@@ -226,7 +230,7 @@ class DevOpsAgent:
                 "exhausted on {}!{}, but cannot DM anyone",
                 row.repo_key, row.iid,
             )
-            return
+            return None
         failing_names = ", ".join(j.name for j in jobs if j.status == "failed") or "n/a"
         try:
             text = self._config.notifications.mattermost.pipeline_autofix_gave_up_dm.format(
@@ -240,7 +244,10 @@ class DevOpsAgent:
                 f"CI на {row.repo_key}!{row.iid} не починился после {attempts} "
                 f"попыток. {row.web_url}"
             )
-        await self._communicator.send_dm(user, text)
+        outcome = await self._communicator.send_dm(user, text)
+        if outcome.sent and outcome.message is not None:
+            return outcome.message.id
+        return None
 
     async def _resolve_escalation_user(self) -> str | None:
         handle = (self._config.agents.escalation.mattermost_user or "").strip()
@@ -265,6 +272,7 @@ class DevOpsAgent:
         attempts_reset: bool = False,
         mark_escalated: bool = False,
         increment_attempts: bool = False,
+        escalation_root_id: str | None = None,
     ) -> None:
         async with session_scope(self._session_factory) as session:
             row = (await session.execute(
@@ -278,6 +286,8 @@ class DevOpsAgent:
                 row.pipeline_autofix_escalated = False
             if mark_escalated:
                 row.pipeline_autofix_escalated = True
+            if escalation_root_id:
+                row.autofix_escalation_root_id = escalation_root_id
             if increment_attempts:
                 row.pipeline_autofix_attempts = (row.pipeline_autofix_attempts or 0) + 1
 
