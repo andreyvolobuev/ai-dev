@@ -56,6 +56,7 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
         default_model: str | None = None,
         permission_mode: str = "bypassPermissions",
         cli_path: str | None = None,
+        env: dict[str, str] | None = None,
         rate_limit_max_retries: int = 2,
         rate_limit_initial_backoff_seconds: int = 60,
         trace: AgentTrace | None = None,
@@ -63,6 +64,10 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
         self._default_model = default_model
         self._permission_mode = permission_mode
         self._cli_path = cli_path
+        # Extra env for the spawned `claude` CLI (e.g. corporate gateway:
+        # ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY / CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).
+        # Empty → CLI inherits the parent env and uses the local Claude Max login.
+        self._env = env or {}
         self._rate_limit_max_retries = max(0, rate_limit_max_retries)
         self._rate_limit_initial_backoff = max(1, rate_limit_initial_backoff_seconds)
         # Optional debug-trace channel — UI subscribers see every
@@ -271,6 +276,8 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
             kwargs["allowed_tools"] = list(allowed_tool_names)
         if self._cli_path:
             kwargs["cli_path"] = self._cli_path
+        if self._env:
+            kwargs["env"] = self._env
         if stderr_sink is not None:
             # Capture CLI subprocess stderr line-by-line. Surfaced in logs on
             # failure so "Command failed with exit code 1 — check stderr" is

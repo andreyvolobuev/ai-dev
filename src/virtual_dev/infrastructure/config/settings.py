@@ -61,6 +61,20 @@ class Settings(BaseSettings):
     confluence_user: str = ""
     confluence_token: str = ""
 
+    # --- LLM / Claude gateway ---
+    # By default the bot uses the local `claude` CLI login (Claude Max) — leave
+    # both empty. To route Claude Agent SDK through a corporate Anthropic-
+    # compatible gateway, set:
+    #   ANTHROPIC_BASE_URL — base BEFORE /v1/messages
+    #                        (e.g. https://ai-openai-proxy.k8s.n3.2gis.io/anthropic)
+    #   ANTHROPIC_API_KEY  — sent as x-api-key (this gateway rejects Bearer)
+    # When base_url is set, the container also forces
+    # CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1, because the strict gateway
+    # rejects Claude Code's beta request fields (e.g. context_management →
+    # 400 "Extra inputs are not permitted"). Do NOT set ANTHROPIC_AUTH_TOKEN.
+    anthropic_base_url: str = ""
+    anthropic_api_key: str = ""
+
     # --- Runtime ---
     db_url: str = "sqlite+aiosqlite:///./data/virtual_dev.db"
     workspaces_dir: str = "./workspaces"

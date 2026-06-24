@@ -1,9 +1,13 @@
 # Настройки агентов и Jira-фильтрации.
 #
 # Модели:
-#   Используем Claude Sonnet 4.5 как основную, Haiku для лёгких задач.
-#   Названия модели можно переопределить на агента.
-#   Полный перечень моделей: https://docs.claude.com/en/docs/about-claude/models/overview
+#   Sonnet — основная, Haiku — для лёгких задач. Переопределяются на агента.
+#   ВАЖНО: при работе через корпоративный шлюз (ANTHROPIC_BASE_URL в .env)
+#   принимаются только id из /anthropic/v1/models — короткие алиасы для
+#   4.6+/fable-5, но для 4.5 и haiku ТОЛЬКО датированные id
+#   (голые claude-sonnet-4-5 / claude-haiku-4-5 там дают 404). На локальном
+#   Claude Max эти id тоже валидны, так что годятся для обоих режимов.
+#   Полный перечень: https://docs.claude.com/en/docs/about-claude/models/overview
 #
 # ВАЖНО: бот работает через Claude Max подписку (claude CLI в subprocess),
 # так что полей про budget / токены / деньги тут НЕТ. max_iterations_per_task —
@@ -11,8 +15,8 @@
 # спама в MM каналах (Phase 3).
 
 models:
-  default: "claude-sonnet-4-5"
-  lightweight: "claude-haiku-4-5"
+  default: "claude-sonnet-4-6"
+  lightweight: "claude-haiku-4-5-20251001"
 
 # JQL, по которому Orchestrator забирает задачи из Jira.
 # На старте — свои задачи пользователя с определённым label.

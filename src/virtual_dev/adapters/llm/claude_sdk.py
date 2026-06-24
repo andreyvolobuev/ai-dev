@@ -33,9 +33,13 @@ class ClaudeAgentSdkLlm(LlmPort):
         *,
         permission_mode: str = "bypassPermissions",
         cli_path: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> None:
         self._permission_mode = permission_mode
         self._cli_path = cli_path
+        # Extra env for the spawned `claude` CLI (corporate gateway routing).
+        # Empty → inherit parent env and use the local Claude Max login.
+        self._env = env or {}
 
     async def complete(
         self,
@@ -98,6 +102,7 @@ class ClaudeAgentSdkLlm(LlmPort):
             max_turns=1,
             allowed_tools=[],          # no tools; this is a plain completion
             cli_path=self._cli_path,
+            env=self._env,
         )
 
 

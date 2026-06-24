@@ -48,8 +48,12 @@ class RepositoriesCfg(_StrictModel):
 
 
 class ModelsCfg(_StrictModel):
-    default: str = "claude-sonnet-4-5"
-    lightweight: str = "claude-haiku-4-5"
+    # NB: the corporate gateway (see Settings.anthropic_base_url) accepts only
+    # ids from /anthropic/v1/models — bare aliases for 4.6+/fable-5, but ONLY
+    # dated ids for 4.5 and haiku (bare claude-sonnet-4-5 / claude-haiku-4-5
+    # → 404 there). Keep these gateway-valid.
+    default: str = "claude-sonnet-4-6"
+    lightweight: str = "claude-haiku-4-5-20251001"
 
 
 class TaskSourceCfg(_StrictModel):

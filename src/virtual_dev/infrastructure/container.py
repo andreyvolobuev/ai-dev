@@ -139,6 +139,39 @@ class Container:
         return _host(self.settings.gitlab_url)
 
 
+def _build_claude_env(settings: Settings) -> dict[str, str]:
+    """Environment for the spawned ``claude`` CLI subprocess.
+
+    Empty when no gateway is configured → the SDK inherits the parent env and
+    uses the local ``claude`` login (Claude Max). When ``ANTHROPIC_BASE_URL``
+    is set, route Claude Code through the corporate Anthropic-compatible
+    gateway: point it at the gateway, authenticate via ``x-api-key``
+    (``ANTHROPIC_API_KEY``), and strip Claude Code's beta request fields — the
+    strict gateway rejects e.g. ``context_management`` with
+    ``400 "Extra inputs are not permitted"``.
+
+    Note: ``.env`` values land in :class:`Settings`, not in ``os.environ``, so
+    they must be passed to the CLI explicitly via ``ClaudeAgentOptions.env``.
+    """
+    if not settings.anthropic_base_url:
+        return {}
+    env = {
+        "ANTHROPIC_BASE_URL": settings.anthropic_base_url,
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    }
+    if settings.anthropic_api_key:
+        env["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+    else:
+        logger.warning(
+            "ANTHROPIC_BASE_URL is set but ANTHROPIC_API_KEY is empty — "
+            "gateway requests will likely fail with 401"
+        )
+    logger.info(
+        "Routing Claude Agent SDK through gateway: {}", settings.anthropic_base_url
+    )
+    return env
+
+
 def build_container(config_dir: Path | str = "config") -> Container:
     """Assemble a :class:`Container` from YAML configs + env.
 
@@ -247,11 +280,13 @@ def build_container(config_dir: Path | str = "config") -> Container:
         logger.info("MR-history index disabled (VCS not configured)")
 
     trace = AgentTrace()
+    claude_env = _build_claude_env(settings)
     code_agent: CodeAgentPort = ClaudeAgentSdkCodeAgent(
         default_model=config.agents.models.default,
+        env=claude_env,
         trace=trace,
     )
-    llm: LlmPort = ClaudeAgentSdkLlm()
+    llm: LlmPort = ClaudeAgentSdkLlm(env=claude_env)
 
     injection_filter = InjectionFilter()
     researcher = ResearcherToolkit(
