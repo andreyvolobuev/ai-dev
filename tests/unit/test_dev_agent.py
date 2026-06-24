@@ -324,7 +324,7 @@ async def test_dev_happy_path_opens_mr(
     assert task_row.internal_status == TaskStatus.MR_OPEN.value
     assert mr_row.task_external_id == "DM-7"
     assert mr_row.source_branch == result.branch_name
-    assert mr_row.status == MRStatus.DRAFT.value
+    assert mr_row.status == MRStatus.OPEN.value
 
 
 @pytest.mark.asyncio

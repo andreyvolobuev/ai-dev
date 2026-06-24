@@ -86,7 +86,7 @@ class Settings(BaseSettings):
     dev_git_author_name: str = "Virtual Dev"
     dev_git_author_email: str = "virtual-dev@datamining.2gis.ru"
     dev_branch_prefix: str = "ai-dev"
-    dev_mr_draft: bool = True   # open MRs as draft by default
+    dev_mr_draft: bool = False  # open MRs as open; set DEV_MR_DRAFT=true for draft
 
     web_host: str = "127.0.0.1"
     web_port: int = 8080

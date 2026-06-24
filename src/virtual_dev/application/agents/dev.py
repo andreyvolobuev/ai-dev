@@ -1,4 +1,4 @@
-"""Dev agent — turns a Plan into code and a draft MR.
+"""Dev agent — turns a Plan into code and an MR.
 
 Flow for one task:
 
@@ -17,7 +17,7 @@ Flow for one task:
        captures the final title / description / notes.
     6. If submit_mr was called and the working tree has changes:
          * commit + push the branch
-         * create a draft MR via the VCS port
+         * create an MR via the VCS port (draft only if DEV_MR_DRAFT=true)
          * persist ``MergeRequestRow`` and link it to the task
     7. Bubble up a structured :class:`DevResult` to the caller (the inbox
        decides side-effects in Jira / message bus).
