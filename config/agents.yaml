@@ -48,10 +48,12 @@ working_hours:
   end_hour: 20
   weekdays_only: true
 
-# Настройки по отдельным агентам. Только те ключи, которые код реально
-# читает: `analyst`, `developer`, `communicator`, `reviewer`. Если
-# нужен override другого агента — сначала проплямбь его в Container,
-# потом добавляй сюда (иначе ключ будет тихо игнорироваться).
+# Настройки по отдельным агентам.
+# `model` честно читается для analyst / developer / reviewer / thread_responder
+# (резолвится через AgentsCfg.model_for: "default"/"lightweight" → models.*,
+# иначе значение берётся как готовый id модели). У communicator модели нет —
+# он не зовёт LLM, поэтому `model` ему не задаём. Остальные ключи
+# (max_iterations_per_task, rate_limit_per_hour) читаются как и раньше.
 agents:
   analyst:
     model: default
@@ -61,7 +63,7 @@ agents:
     max_iterations_per_task: 40
 
   communicator:
-    model: lightweight  # мелкие сообщения, Haiku справится
+    # модели нет: communicator только постит в чат, LLM не зовёт.
     rate_limit_per_hour: 20  # не более N сообщений в канал/личку за час (Phase 3)
 
   developer:
@@ -69,10 +71,13 @@ agents:
     max_iterations_per_task: 80    # coding + правки по тестам — turns быстро уходят
 
   reviewer:
-    # Reviewer классифицирует MR-комменты через Haiku (Stage 6) — этот
-    # ключ читается, в отличие от orchestrator/researcher/qa/devops,
-    # где модель не используется напрямую.
+    # Reviewer классифицирует MR-комменты + делает саммари MR через Haiku.
+    # (orchestrator / researcher / qa / devops модель не зовут — им ключ не нужен.)
     model: lightweight
+
+  thread_responder:
+    # Отвечает на actionable-треды ревью и обсуждения через полный code-agent.
+    model: default
 
 # Ревью-политика.
 review_policy:
