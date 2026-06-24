@@ -203,7 +203,7 @@ class ThreadResponderAgent:
             user_prompt=prompt,
             working_dir=workspace,
             max_turns=self._max_turns,
-            model=self._config.agents.models.default,
+            model=self._config.agents.model_for("thread_responder"),
         )
         request.extras["mcp_servers"] = mcp_servers
         request.extras["allowed_tool_names"] = allowed

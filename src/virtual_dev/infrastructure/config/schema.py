@@ -215,6 +215,22 @@ class AgentsCfg(_StrictModel):
     escalation: EscalationCfg = Field(default_factory=EscalationCfg)
     clarification: ClarificationCfg = Field(default_factory=ClarificationCfg)
 
+    def model_for(self, agent_key: str) -> str:
+        """Resolve an agent's configured ``model`` reference to a concrete id.
+
+        ``agents.<key>.model`` is a *reference*: ``"default"`` / ``"lightweight"``
+        map into :class:`ModelsCfg`; any other value is treated as a literal
+        model id and returned verbatim. An agent with no config entry (or an
+        empty ``model``) falls back to ``default``.
+        """
+        cfg = self.agents.get(agent_key)
+        ref = (cfg.model if cfg else None) or "default"
+        if ref == "default":
+            return self.models.default
+        if ref == "lightweight":
+            return self.models.lightweight
+        return ref
+
 
 # --- mappings.yaml ---
 

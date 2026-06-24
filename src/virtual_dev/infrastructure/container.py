@@ -353,18 +353,12 @@ def build_container(config_dir: Path | str = "config") -> Container:
     # Phase 4: Reviewer also routes actionable GitLab MR comments through
     # the ThreadResponder (and Dev for iterations) so feedback in GitLab
     # gets a response in GitLab, mirroring the MM-thread flow.
-    # Reviewer's classifier uses the lightweight (Haiku) model by
-    # default. ``agents.reviewer.model`` lets operators override per
-    # deployment — symbolic names ("default" / "lightweight") resolve
-    # to the configured model, anything else is taken verbatim.
-    reviewer_cfg = config.agents.agents.get("reviewer")
-    reviewer_model_ref = (reviewer_cfg.model if reviewer_cfg else "lightweight") or "lightweight"
-    if reviewer_model_ref == "default":
-        reviewer_model = config.agents.models.default
-    elif reviewer_model_ref == "lightweight":
-        reviewer_model = config.agents.models.lightweight
-    else:
-        reviewer_model = reviewer_model_ref
+    # Reviewer's comment-classifier + MR-summarizer go through
+    # ``agents.reviewer.model`` (lightweight/Haiku in the shipped config).
+    # model_for() maps the symbolic ref ("default"/"lightweight") to a
+    # concrete id, or returns a literal id verbatim. Same resolver the
+    # code-agent agents (analyst/developer/thread_responder) now use.
+    reviewer_model = config.agents.model_for("reviewer")
     review_comment_classifier = ReviewCommentClassifier(
         llm=llm,
         model=reviewer_model,

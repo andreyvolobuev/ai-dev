@@ -489,7 +489,7 @@ class DevAgent:
             user_prompt=user_prompt,
             working_dir=workspace_path,
             max_turns=self._max_turns,
-            model=self._config.agents.models.default,
+            model=self._config.agents.model_for("developer"),
         )
         request.extras["mcp_servers"] = mcp_servers
         request.extras["allowed_tool_names"] = allowed_tool_names
@@ -630,7 +630,7 @@ class DevAgent:
             user_prompt=user_prompt,
             working_dir=workspace_path,
             max_turns=self._max_turns,
-            model=self._config.agents.models.default,
+            model=self._config.agents.model_for("developer"),
         )
         request.extras["mcp_servers"] = mcp_servers
         request.extras["allowed_tool_names"] = allowed_tool_names

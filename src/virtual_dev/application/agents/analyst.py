@@ -206,6 +206,7 @@ class AnalystAgent:
             ),
         )
 
+        model = self._config.agents.model_for("analyst")
         request = CodeAgentRequest(
             agent_key=self.agent_key,
             system_prompt=self._prompts.render(
@@ -217,7 +218,7 @@ class AnalystAgent:
             user_prompt=prompt,
             working_dir=str(cwd) if cwd else None,
             max_turns=self._max_turns,
-            model=self._config.agents.models.default,
+            model=model,
         )
         request.extras["mcp_servers"] = mcp_servers
         request.extras["allowed_tool_names"] = allowed
@@ -231,7 +232,7 @@ class AnalystAgent:
                 target_repo=target_repo,
                 cost_usd=result.cost_usd,
                 turns=result.turns,
-                model=self._config.agents.models.default,
+                model=model,
                 agent_key=self.agent_key,
             )
         return AnalystRunResult(
