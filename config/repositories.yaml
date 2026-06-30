@@ -26,7 +26,7 @@ repositories:
   - key: bellingshausen
     url: git@gitlab.2gis.ru:sd-data-mining/bellingshausen.git
     # local_path — машино-зависимо; задаётся в config/local.yaml (gitignored).
-    description: "Монорепа (бэкенд + фронтенд)."
+    description: "Монорепа парсеров/API (Flask + FastAPI + воркеры), Python 3.13 + React/Vite фронт."
     jira_components: ["Krusenstern"]
     default_branch: master
     agents:
@@ -36,42 +36,49 @@ repositories:
     primary_language: python
     frontend_stack: react
     tests_cmd: "pytest"
-    lint_cmd: "ruff check ."
+    lint_cmd: "make local-style"
     ci_provider: gitlab_ci
 
-  # --- Остальные подключим позже, когда bellingshausen поедет. Шаблоны закомментированы. ---
+  - key: rainbow
+    url: git@gitlab.2gis.ru:sd-data-mining/rainbow.git
+    description: "Парсинг открытых источников и всё, что с этим связано (мульти-сервисный Python-монореп)."
+    jira_components: ["Rainbow"]
+    default_branch: master
+    agents: { backend: true, frontend: false, devops: false }
+    primary_language: python
+    tests_cmd: "pytest"
+    lint_cmd: "make lint"
+    ci_provider: gitlab_ci
 
-  # - key: rainbow
-  #   url: git@gitlab.2gis.ru:sd-data-mining/rainbow.git
-  #   description: "..."
-  #   jira_components: []
-  #   default_branch: master
-  #   agents: { backend: true, frontend: false, devops: false }
-  #   primary_language: python
-  #   tests_cmd: "pytest"
-  #   lint_cmd: "ruff check ."
-  #   ci_provider: gitlab_ci
+  - key: pts_aggregator
+    url: git@gitlab.2gis.ru:sd-data-mining/pts-aggregator.git
+    description: "Агрегатор расписаний общественного транспорта: GTFS→БД, постобработка, кормит Fiji (Celery)."
+    jira_components: ["PTS"]
+    default_branch: master
+    agents: { backend: true, frontend: false, devops: false }
+    primary_language: python
+    tests_cmd: "pytest"
+    lint_cmd: "flake8"
+    ci_provider: gitlab_ci
 
-  # - key: pts_aggregator
-  #   url: git@gitlab.2gis.ru:sd-data-mining/pts-aggregator.git
-  #   ...
+  - key: greeder
+    url: git@gitlab.2gis.ru:sd-data-mining/greeder.git
+    agents: { backend: true, frontend: false, devops: false }
+    description: "Обогащение карточек 2ГИС госданными (ФНС, бухотчётность) — Python-сервис (aiohttp)."
+    jira_components: ["Greeder"]
+    default_branch: master
+    primary_language: python
+    tests_cmd: "./dev.sh unit"
+    lint_cmd: "./dev.sh lint"
+    ci_provider: gitlab_ci
 
-  # - key: greeder
-  #   url: git@gitlab.2gis.ru:sd-data-mining/greeder.git
-  #   ...
-
-  # - key: alertilka_backend
-  #   url: git@gitlab.2gis.ru:sd-data-mining/alertilka/alertilka-backend.git
-  #   agents: { backend: true, frontend: false, devops: false }
-  #   ...
-
-  # - key: alertilka_deploy
-  #   url: git@gitlab.2gis.ru:sd-data-mining/alertilka/alertilka-deploy.git
-  #   agents: { backend: false, frontend: false, devops: true }
-  #   ...
-
-  # - key: alertilka_ui
-  #   url: git@gitlab.2gis.ru:sd-data-mining/alertilka/alertilka-ui.git
-  #   agents: { backend: false, frontend: true, devops: false }
-  #   frontend_stack: ???
-  #   ...
+  - key: alertilka_backend
+    url: git@gitlab.2gis.ru:sd-data-mining/alertilka/alertilka-backend.git
+    agents: { backend: true, frontend: false, devops: false }
+    description: "Бэкенд Alertilka на FastAPI (API, alert-manager, garbage-collector)."
+    jira_components: ["Alertilka"]
+    default_branch: master
+    primary_language: python
+    tests_cmd: "pytest"
+    lint_cmd: "make ci-checks"
+    ci_provider: gitlab_ci
