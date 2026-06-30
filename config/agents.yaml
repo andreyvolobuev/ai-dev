@@ -15,7 +15,8 @@
 # спама в MM каналах (Phase 3).
 
 models:
-  default: "claude-sonnet-4-6"
+  default: "claude-opus-4-8"
+  # default: "claude-sonnet-4-6"
   lightweight: "claude-haiku-4-5-20251001"
 
 # JQL, по которому Orchestrator забирает задачи из Jira.
