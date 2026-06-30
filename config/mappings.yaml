@@ -9,9 +9,11 @@ email_to_mattermost:
   # "ivan.ivanov@2gis.ru": "ivanov"
   # "petr.petrov@2gis.ru": "petrov"
 
-# jira-компонент → repo key (из repositories.yaml).
-# Если тикет помечен компонентом — сразу понимаем, какой репо.
-# Если не помечен — Analyst попробует догадаться из текста.
+# jira-компонент → repo key (из repositories.yaml). ТОЧЕЧНЫЙ OVERRIDE над
+# repositories.yaml → jira_components: основной список компонентов держим
+# рядом с репо в repositories.yaml, а сюда добавляем только исключения.
+# Матч точный и регистрозависимый (имя компонента как в Jira).
+# Если компонент нигде не найден — Analyst попробует догадаться из текста.
 component_to_repo:
   # "Bellingshausen API": bellingshausen
   # "Rainbow": rainbow

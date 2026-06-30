@@ -10,7 +10,7 @@
 #   url                — SSH или HTTPS URL GitLab-репо.
 #   local_path         — (опц.) путь к уже склонированному репо. Если не задан — клонируем в WORKSPACES_DIR/<key>.
 #   description        — для дашборда.
-#   jira_components    — список jira-компонентов, которые роутятся в этот репо. Используется Analyst-агентом.
+#   jira_components    — jira-компоненты, которые роутятся в этот репо (читает Analyst). Точечно переопределяется в config/mappings.yaml → component_to_repo.
 #   default_branch     — базовая ветка для MR (обычно main / master / develop).
 #   agents             — кто работает с этим репо:
 #       backend:   true|false

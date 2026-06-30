@@ -18,7 +18,6 @@ TaskOrchestrator → analyst replan``. Now: ONE agent, ONE driver.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -773,10 +772,9 @@ class AnalystInbox:
         return await self._communicator.resolve_user_id(username=handle)
 
     def _guess_target_repo(self, task_row: TaskRow) -> str | None:
-        mapping: Mapping[str, str] = self._config.mappings.component_to_repo
-        for component in task_row.components_json or []:
-            if component in mapping:
-                return mapping[component]
+        repo = self._config.repo_for_components(task_row.components_json)
+        if repo is not None:
+            return repo
         if task_row.target_repo_key:
             return task_row.target_repo_key
         if len(self._config.repositories) == 1:

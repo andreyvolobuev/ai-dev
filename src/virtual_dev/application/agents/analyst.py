@@ -652,10 +652,9 @@ class AnalystAgent:
     # --- helpers ---
 
     def _guess_target_repo(self, task_row: TaskRow) -> str | None:
-        mapping = self._config.mappings.component_to_repo
-        for component in task_row.components_json or []:
-            if component in mapping:
-                return mapping[component]
+        repo = self._config.repo_for_components(task_row.components_json)
+        if repo is not None:
+            return repo
         if len(self._config.repositories) == 1:
             return self._config.repositories[0].key
         return None

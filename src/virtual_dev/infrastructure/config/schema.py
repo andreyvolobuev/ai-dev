@@ -261,3 +261,22 @@ class AppConfig(_StrictModel):
             if repo.key == key:
                 return repo
         return None
+
+    def repo_for_components(self, components: list[str] | None) -> str | None:
+        """Resolve a ticket's Jira components to a repo key.
+
+        Per component (first match wins): an explicit
+        ``mappings.component_to_repo`` entry overrides; otherwise the repo
+        whose ``repositories.yaml`` ``jira_components`` lists that component.
+        Matching is exact and case-sensitive (component names come straight
+        from Jira). Returns None when nothing matches — callers apply their
+        own fallbacks (single-repo, target_repo_key, Analyst guess).
+        """
+        override = self.mappings.component_to_repo
+        for component in components or []:
+            if component in override:
+                return override[component]
+            for repo in self.repositories:
+                if component in repo.jira_components:
+                    return repo.key
+        return None
