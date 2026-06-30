@@ -80,11 +80,13 @@ class Settings(BaseSettings):
     workspaces_dir: str = "./workspaces"
 
     # --- Bot identity used when committing / opening MRs.
-    # Push is done with the GitLab token above (same account as the user),
-    # but the commit author is always the bot — so humans see at a glance
-    # who wrote the code.
-    dev_git_author_name: str = "Virtual Dev"
-    dev_git_author_email: str = "virtual-dev@datamining.2gis.ru"
+    # Commits are authored with this name + email. GitLab attributes a commit
+    # to the account whose VERIFIED email matches dev_git_author_email — so
+    # DEV_GIT_AUTHOR_EMAIL must be the email registered on the bot's own GitLab
+    # account (Аида / @uk.datamining.aidev). If it points at another account's
+    # email, commits show up under that account (e.g. Uk.DM.GitLab.Bot).
+    dev_git_author_name: str = "Аида Нейронова"
+    dev_git_author_email: str = "uk.datamining.aidev@2gis.ru"
     dev_branch_prefix: str = "ai-dev"
     dev_mr_draft: bool = False  # open MRs as open; set DEV_MR_DRAFT=true for draft
 
