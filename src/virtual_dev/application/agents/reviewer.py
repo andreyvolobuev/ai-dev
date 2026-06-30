@@ -351,31 +351,20 @@ class ReviewerAgent:
             )
 
     async def _announce_iteration_done(self, row: MergeRequestRow) -> None:
-        """Post the post-CI-green ack to wherever the iteration was
-        triggered: MM thread (default) or a top-level GitLab MR comment."""
-        sha = row.iteration_pending_ci_sha or ""
-        if row.iteration_ack_target == "gitlab":
-            try:
-                text = self._config.notifications.mattermost.gitlab_reply_iteration_done.format(
-                    commit_sha_short=sha[:12], branch=row.source_branch,
-                )
-            except (KeyError, IndexError):
-                text = self._config.notifications.mattermost.gitlab_reply_iteration_done
-            assert self._vcs is not None
-            try:
-                await self._vcs.add_mr_comment(row.repo_key, row.iid, text)
-                logger.info(
-                    "Reviewer: posted GitLab iteration-done ack for {}!{} sha={}",
-                    row.repo_key, row.iid, sha[:12],
-                )
-            except Exception:
-                logger.exception("Reviewer: failed to post GitLab iteration ack")
-            return
+        """Post the post-CI-green status ack to the MM review thread.
 
-        # Default: Mattermost thread.
+        Status pings ("внесла правки, CI зелёный — можно смотреть") go to
+        Mattermost only, never as a GitLab note. GitLab gets only inline
+        replies to the specific review thread where a question was asked.
+        """
+        sha = row.iteration_pending_ci_sha or ""
         channel_id = row.review_thread_channel_id
         root_id = row.review_thread_root_id
         if not channel_id or not root_id:
+            logger.info(
+                "Reviewer: no MM review thread for {}!{}; skipping iteration ack",
+                row.repo_key, row.iid,
+            )
             return
         try:
             text = self._config.notifications.mattermost.thread_reply_iteration_done.format(
@@ -564,11 +553,11 @@ class ReviewerAgent:
                 logger.exception("Reviewer: GitLab iteration crashed")
                 return False
             if result.commit_sha:
-                # Mark as pending CI confirmation, with ack-target=gitlab
-                # so the green-CI ack lands as a GitLab MR comment, not
-                # in the MM thread.
+                # Mark as pending CI confirmation. The green-CI status ack
+                # always lands in the MM review thread, never as a GitLab
+                # note (GitLab gets only inline replies to review threads).
                 await self._mark_iteration_pending(
-                    row.id, sha=result.commit_sha, ack_target="gitlab",
+                    row.id, sha=result.commit_sha, ack_target="mm",
                 )
                 stats.gitlab_iterations_dispatched += 1
                 logger.info(
