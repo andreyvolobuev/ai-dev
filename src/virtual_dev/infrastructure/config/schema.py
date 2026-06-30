@@ -128,9 +128,6 @@ class MmTemplatesCfg(_StrictModel):
     thread_reply_iteration_crashed: str = ""
     thread_reply_iteration_done: str = ""
     thread_reply_iteration_no_changes: str = ""
-    # Used when the review feedback came in a GitLab MR comment instead
-    # of a Mattermost thread — bot answers in the same medium.
-    gitlab_reply_iteration_done: str = ""
     # Lead-escalation DMs. Two flavours:
     # * stuck — agent ran out of angles and asks the lead for help
     #   (ticket stays in "In Progress").
