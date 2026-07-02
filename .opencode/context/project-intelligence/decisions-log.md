@@ -1,4 +1,4 @@
-<!-- Context: project-intelligence/decisions | Priority: high | Version: 1.0 | Updated: 2026-07-01 -->
+<!-- Context: project-intelligence/decisions | Priority: high | Version: 1.1 | Updated: 2026-07-02 -->
 
 # Decisions Log
 
@@ -10,7 +10,7 @@
 
 **Context**: Нужно было выбрать, как использовать LLM. Anthropic API требует бюджет ($/токен), API-ключ, контроль лимитов. Claude Max — flat-rate подписка без per-token биллинга.
 
-**Decision**: Работаем через Claude Max подписку пользователя. `claude-agent-sdk` (PyPI) → subprocess `claude` CLI → залогиненная сессия. API-ключ не используем.
+**Decision**: Работаем через Claude Max подписку пользователя. `claude-agent-sdk` (PyPI) → subprocess `claude` CLI → залогиненная сессия. API-ключ не используем. Основная модель — Opus 4.8 (`claude-opus-4-8`), лёгкая — Haiku 4.5 (`claude-haiku-4-5-20251001`).
 
 **Rationale**: У Max нет лимитов на токены — только rate-limit на количество сообщений в 5-часовое окно. Это радикально упрощает архитектуру: не нужно tracking бюджета, throttling по cost, alarm'ов по превышению. Единственный лимит — `max_turns` (защита от runaway).
 
@@ -62,7 +62,7 @@
 
 **Context**: Reviewer должен классифицировать комментарии в MR: апрув, вопрос, change request, флейм.
 
-**Decision**: Пока эвристики (`classify_comment` → `approval_hint`/`question`/`change_request`/`chatter`). Phase 5 заменит на LLM-классификацию.
+**Decision**: Пока эвристики (`ReviewCommentClassifier`: `approval_hint`/`question`/`change_request`/`chatter`). Phase 5 заменит на LLM-классификацию.
 
 **Impact**: + Просто и дёшево. − Ошибается на сложных/саркастичных комментариях.
 
@@ -107,16 +107,16 @@
 
 ---
 
-## Decision: Clarification Flow — Дерево Вопросов с Coalescing
+## Decision: AnalystConversation — Flat Log + Coalescing вместо дерева вопросов
 
-**Date**: 2026-04 (Phase 3.7-3.8)
+**Date**: 2026-06 (Phase 5.0)
 **Status**: Decided
 
-**Context**: Нужен механизм, чтобы бот уточнял требования до того как писать код. Старый `ClarifierService` (один DM = один ответ) не работал с итеративными уточнениями.
+**Context**: Старый clarification flow (дерево Question/Answer/Classification) был избыточен: 6 типов классификации, 3 отдельных LLM-агента (AnswerClassifier, CounterQuestionAnswerer, StakeholderResolver), сложная state machine. На практике аналисту нужно просто: спросить → получить ответ → перепланировать.
 
-**Decision**: Дерево вопросов (Question → Answer → Classification → Action). 6 типов классификации ответов. Coalescing: буферизируем fragments пока человек пишет, классифицируем после 600s idle. Loop guards: max_chain_depth=4, cycle detection, max_age=48h, max_subquestions=10.
+**Decision**: Плоский append-only лог (`ConversationStep`) + буферизированные фрагменты (`ConversationFragment`). Coalescing: ждём 180s тишины после последнего фрагмента → merge → HUMAN_REPLIED step → перезапуск аналиста с полной историей. Никакой классификации ответов, никаких деревьев. Circuit breaker: `max_planner_calls_per_goal=8`, `max_goal_age_hours=48`.
 
-**Impact**: + Естественный диалог (бот не перебивает). + Защита от runaway. + После ответов → перепланирование.
+**Impact**: + Радикально проще (один AnalystInbox вместо 3 агентов). + Меньше LLM-вызовов (классификация не нужна). − Нет структурного анализа ответов (пока не требовалось).
 
 ---
 

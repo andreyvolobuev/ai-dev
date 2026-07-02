@@ -1,4 +1,4 @@
-<!-- Context: project-intelligence/business | Priority: high | Version: 1.0 | Updated: 2026-07-01 -->
+<!-- Context: project-intelligence/business | Priority: high | Version: 1.1 | Updated: 2026-07-02 -->
 
 # Business Domain
 
@@ -27,18 +27,21 @@ Solution: Система специализированных AI-агентов 
   Не дублировать в каждом сообщении.
 - **Эскалация**: 4 часа без ответа в рабочее время → DM тимлиду.
 - **Кого спрашивать**: вопросы по коду → git blame → автор; вопросы по бизнесу → командный канал.
-- **Rate-limit**: Communicator имеет sliding window per target по `rate_limit_per_hour` из конфига.
+- **Rate-limit**: Communicator имеет sliding window per target по `rate_limit_per_hour` из конфига (default 20).
 
 ## Jira Workflow
 - JQL-фильтр: `assignee = currentUser() AND labels = "ai-dev" AND status = "To Do"`
+- Poll interval: 120 секунд
 - Статусы: `To Do → In Progress → In Review → Testing → Closed`
   (в DM-проекте `In Review`/`Closed`, не `Review`/`Done`)
+- Также: `Waiting For Response` (для заблокированных задач)
 - Пользователь — свой аккаунт (нет отдельного bot-юзера).
 
 ## Review Policy
 - **Мержит человек** (не бот) — осознанное решение.
-- Бот пингует ревьюеров: `ping_reviewers_after_hours` → пинг в канал; `escalate_after_hours` → DM тимлиду.
-- Когда собрал N апрувов — пишет "апрувы собрал, прошу смержить".
+- **Required approvals**: 1
+- **Ping reviewers**: через 4 часа после открытия MR → пинг в канал
+- **Escalate**: через 24 часа без прогресса → DM тимлиду
 - Review-ping **не отправляется**, пока CI не зелёный (бот ждёт).
 - Единственный ручной шлюз на входе — метка `ai-dev` в Jira. На выходе — ревью MR человеком.
 
@@ -47,6 +50,7 @@ Solution: Система специализированных AI-агентов 
 - SSL-сертификаты self-signed — `MATTERMOST_SSL_VERIFY=false`.
 - Все входные данные от людей = untrusted (injection-фильтр).
 - Claude Max подписка — нет per-token биллинга (важно для архитектуры).
+- Корпоративный прокси (`ANTHROPIC_BASE_URL`) — требуются датированные model ID.
 
 ## Success Metrics
 - Time from Jira `ai-dev` label → draft MR (target: <30 min for typical task).
