@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     # DSN format: postgresql+asyncpg://user:pass@host:5432/dbname
     # For local dev with docker-compose: see docker-compose.yaml
     # Tests use sqlite+aiosqlite:///:memory: directly (not via settings).
-    db_dsn: str = "postgresql+asyncpg://sd_bots:qwerty123@localhost:5432/virtual_dev"
+    db_dsn: str = "postgresql+asyncpg://sd_bots:qwerty123@localhost:5432/ai_dev"
     workspaces_dir: str = "./workspaces"
 
     # --- Bot identity used when committing / opening MRs.
