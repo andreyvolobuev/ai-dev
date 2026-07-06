@@ -54,8 +54,12 @@ class TaskRow(Base):
 
     priority: Mapped[str] = mapped_column(String(16), default="medium")
     external_status: Mapped[str] = mapped_column(String(64), default="")
-    created_at_external: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    updated_at_external: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at_external: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    updated_at_external: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Our view of the task
     internal_status: Mapped[str] = mapped_column(String(32), default="discovered", index=True)
@@ -63,25 +67,35 @@ class TaskRow(Base):
     dor_satisfied: Mapped[bool] = mapped_column(default=False)
 
     # Bookkeeping
-    discovered_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
 
     # Phase 5.0: the analyst's session state per ticket. ``awaiting_*``
     # fields are filled when the analyst dispatches an ASK and is
     # waiting on a human reply; the listener routes reply fragments
     # by ``awaiting_post_id`` / ``awaiting_channel_id``.
     awaiting_post_id: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, index=True,
+        String(64),
+        nullable=True,
+        index=True,
     )
     awaiting_user_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     awaiting_username: Mapped[str | None] = mapped_column(String(128), nullable=True)
     awaiting_channel_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     awaiting_dedupe_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    last_fragment_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_fragment_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     coalesce_window_seconds: Mapped[int] = mapped_column(Integer, default=60)
     analyst_iteration_count: Mapped[int] = mapped_column(Integer, default=0)
-    last_analyst_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    analyst_deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_analyst_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    analyst_deadline_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class MergeRequestRow(Base):
@@ -121,10 +135,16 @@ class MergeRequestRow(Base):
     # thread until the reply lands, then drop it. Prevents "fixed it but
     # never replied, yet marked the comment done".
     pending_comment_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
-    last_activity_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_activity_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_pipeline_notified_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    last_escalation_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    ping_reviewers_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_escalation_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    ping_reviewers_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Whether we've already posted "please review" to the team channel for
     # this MR. Sent once when the MR transitions out of draft.
     review_ping_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -142,7 +162,9 @@ class MergeRequestRow(Base):
     # MM post id of the "I gave up after N attempts" DM to the team-lead.
     # A `/restart` reply in this post's thread resets the autofix counter
     # for this MR (the lead nudging the bot to try again).
-    autofix_escalation_root_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    autofix_escalation_root_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     # Set by both MM-driven and autofix iteration paths after a successful
     # push. The Reviewer poll ack-posts to the thread when CI for this sha
     # turns green, then clears the field. Means: "we have an unannounced
@@ -152,8 +174,10 @@ class MergeRequestRow(Base):
     # 'gitlab' for a top-level MR comment. Set when iteration is
     # triggered, cleared together with iteration_pending_ci_sha.
     iteration_ack_target: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
 
 
 class AgentMessageRow(Base):
@@ -186,11 +210,13 @@ class AgentMessageRow(Base):
     topic: Mapped[str] = mapped_column(String(128), index=True)
     payload_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
     correlation_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
-    consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
+    )
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Lease deadline. NULL = unclaimed; future = in flight; past = lease
     # expired (reaper resets to NULL on next poll).
-    claimed_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class BusSubscriptionRow(Base):
@@ -205,9 +231,11 @@ class BusSubscriptionRow(Base):
     __tablename__ = "bus_subscriptions"
 
     agent_key: Mapped[str] = mapped_column(String(128), primary_key=True)
-    registered_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(
-        DateTime, default=_utcnow, onupdate=_utcnow,
+        DateTime(timezone=True),
+        default=_utcnow,
+        onupdate=_utcnow,
     )
 
 
@@ -244,7 +272,9 @@ class PlanRow(Base):
     model: Mapped[str] = mapped_column(String(128), default="")
     agent_key: Mapped[str] = mapped_column(String(128), default="", index=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
+    )
 
 
 class MrHistoryRow(Base):
@@ -266,14 +296,16 @@ class MrHistoryRow(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     author_username: Mapped[str] = mapped_column(String(128), default="")
     web_url: Mapped[str] = mapped_column(String(1024), default="")
-    merged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    merged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     embed_model: Mapped[str] = mapped_column(String(256))
     embed_dim: Mapped[int] = mapped_column(Integer)
-    embed_norm: Mapped[float] = mapped_column(Float)   # precomputed L2 norm
+    embed_norm: Mapped[float] = mapped_column(Float)  # precomputed L2 norm
     embedding_blob: Mapped[bytes] = mapped_column(LargeBinary)
 
-    indexed_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    indexed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
+    )
 
 
 class AnalystConversationStepRow(Base):
@@ -294,7 +326,7 @@ class AnalystConversationStepRow(Base):
     task_id: Mapped[int] = mapped_column(Integer, index=True)
     seq: Mapped[int] = mapped_column(Integer)
     kind: Mapped[str] = mapped_column(String(32), index=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     text: Mapped[str] = mapped_column(Text, default="")
     metadata_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
 
@@ -325,7 +357,7 @@ class AnalystConversationFragmentRow(Base):
     # the analyst sees only the text body and misses screenshots /
     # PDFs the reporter attached as the actual answer.
     files_json: Mapped[list[dict[str, object]]] = mapped_column(JSON, default=list)
-    received_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     flushed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
@@ -341,4 +373,6 @@ class EventRow(Base):
     subject: Mapped[str] = mapped_column(String(256), default="")
     body: Mapped[str] = mapped_column(Text, default="")
     payload_json: Mapped[dict[str, object]] = mapped_column(JSON, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
+    )
