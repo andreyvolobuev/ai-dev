@@ -27,6 +27,7 @@ COPY src ./src
 COPY config ./config
 COPY migrations ./migrations
 COPY alembic.ini ./
+COPY README.md ./
 
 RUN uv sync --frozen --no-dev
 
