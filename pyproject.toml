@@ -40,7 +40,9 @@ dependencies = [
 
     # DB
     "sqlalchemy>=2.0",
-    "aiosqlite>=0.20",
+    "aiosqlite>=0.20",  # used by tests (in-memory SQLite)
+    "asyncpg>=0.30",    # production async driver for PostgreSQL
+    "psycopg2-binary>=2.9",  # sync driver for Alembic migrations
     "alembic>=1.14",
     "greenlet>=3.0",    # required by SQLAlchemy async on aarch64-darwin
 

@@ -80,7 +80,9 @@ class RecoveryService:
         return published
 
     async def _find_stuck(
-        self, session: AsyncSession, cutoff: datetime,
+        self,
+        session: AsyncSession,
+        cutoff: datetime,
     ) -> list[TaskRow]:
         # Naive cutoff stored as naive UTC matches how SQLite reads
         # back the column (see SqliteMessageBus._naive() for the same
@@ -124,7 +126,9 @@ class RecoveryService:
         return True
 
     async def _active_plan(
-        self, session: AsyncSession, task: TaskRow,
+        self,
+        session: AsyncSession,
+        task: TaskRow,
     ) -> PlanRow | None:
         stmt = (
             select(PlanRow)
@@ -139,7 +143,9 @@ class RecoveryService:
         return (await session.execute(stmt)).scalar_one_or_none()
 
     async def _has_open_mr(
-        self, session: AsyncSession, external_id: str,
+        self,
+        session: AsyncSession,
+        external_id: str,
     ) -> bool:
         stmt = (
             select(MergeRequestRow)

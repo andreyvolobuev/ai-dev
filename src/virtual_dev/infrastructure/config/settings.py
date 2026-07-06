@@ -8,8 +8,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class _ChatProvider:
     MATTERMOST = "mattermost"
-    SLACK = "slack"          # placeholder — adapter not yet implemented
-    TELEGRAM = "telegram"    # placeholder — adapter not yet implemented
+    SLACK = "slack"  # placeholder — adapter not yet implemented
+    TELEGRAM = "telegram"  # placeholder — adapter not yet implemented
 
 
 class Settings(BaseSettings):
@@ -76,7 +76,10 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
 
     # --- Runtime ---
-    db_url: str = "sqlite+aiosqlite:///./data/virtual_dev.db"
+    # DSN format: postgresql+asyncpg://user:pass@host:5432/dbname
+    # For local dev with docker-compose: see docker-compose.yaml
+    # Tests use sqlite+aiosqlite:///:memory: directly (not via settings).
+    db_dsn: str = "postgresql+asyncpg://sd_bots:qwerty123@localhost:5432/virtual_dev"
     workspaces_dir: str = "./workspaces"
 
     # --- Bot identity used when committing / opening MRs.

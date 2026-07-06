@@ -3,7 +3,9 @@
 The DB URL comes from ``alembic.ini``'s ``sqlalchemy.url`` option which
 ``build_alembic_config()`` populates at runtime (always in sync-driver
 form). PRAGMA tuning (WAL, busy_timeout, FK) is reapplied on each
-connection so migrations behave the same way as the live engine.
+SQLite connection so migrations behave the same way as the live engine.
+PostgreSQL doesn't need PRAGMAs; ``render_as_batch`` is SQLite-only
+(batch mode for ALTER TABLE).
 
 ``virtual_dev`` is importable because ``alembic.ini`` sets
 ``prepend_sys_path = .`` and we run from the repo root.
@@ -55,7 +57,10 @@ def run_migrations_online() -> None:
     )
 
     url = (config.get_main_option("sqlalchemy.url") or "").lower()
-    if url.startswith("sqlite"):
+    is_sqlite = url.startswith("sqlite")
+
+    if is_sqlite:
+
         @event.listens_for(connectable, "connect")
         def _set_pragma(dbapi_connection: Any, _record: Any) -> None:
             _attach_sqlite_pragma(dbapi_connection)
@@ -65,7 +70,7 @@ def run_migrations_online() -> None:
             connection=connection,
             target_metadata=target_metadata,
             compare_type=True,
-            render_as_batch=True,  # SQLite needs ALTER via batch mode
+            render_as_batch=is_sqlite,  # SQLite needs ALTER via batch mode
         )
         with context.begin_transaction():
             context.run_migrations()

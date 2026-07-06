@@ -33,9 +33,9 @@ def _to_sync_url(db_url: str) -> str:
     """Strip async drivers; Alembic only speaks sync.
 
     ``sqlite+aiosqlite:///./data/foo.db`` -> ``sqlite:///./data/foo.db``
-    Other drivers pass through unchanged.
+    ``postgresql+asyncpg://user:pass@host/db`` -> ``postgresql://user:pass@host/db``
     """
-    return db_url.replace("+aiosqlite", "", 1)
+    return db_url.replace("+aiosqlite", "", 1).replace("+asyncpg", "", 1)
 
 
 def build_alembic_config(db_url: str) -> Config:
