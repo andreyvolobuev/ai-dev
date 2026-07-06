@@ -221,7 +221,10 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         # Apply Alembic migrations to head before starting any workers.
         # Idempotent — safe to run on every startup; runs in a worker
         # thread so the event loop isn't blocked.
-        await container.init_db()
+        try:
+            await container.init_db()
+        except Exception:
+            logger.exception("DB migration failed — starting without migrations")
 
         background: list[asyncio.Task[None]] = []
         # Log sink: drains AgentTrace into loguru DEBUG so a prod log
