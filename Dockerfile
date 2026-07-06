@@ -31,4 +31,4 @@ COPY README.md ./
 
 RUN uv sync --frozen --no-dev
 
-CMD ["uv", "run", "--no-dev", "virtual-dev", "run", "--host", "0.0.0.0"]
+CMD ["uv", "run", "--no-dev", "virtual-dev", "run"]

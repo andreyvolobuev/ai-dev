@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     dev_branch_prefix: str = "ai-dev"
     dev_mr_draft: bool = False  # open MRs as open; set DEV_MR_DRAFT=true for draft
 
-    web_host: str = "127.0.0.1"
+    web_host: str = "0.0.0.0"
     web_port: int = 8080
     # Bearer token required for destructive dashboard endpoints (currently
     # POST /kill). When empty, those endpoints are allowed only from
