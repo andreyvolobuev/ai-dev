@@ -117,6 +117,7 @@ class Orchestrator:
         tasks = await self._task_tracker.fetch_tasks(jql)
         stats.fetched = len(tasks)
         logger.info("Fetched {} tasks via JQL", stats.fetched)
+        logger.debug("Simple debug in orchestrator")
         if self._health is not None:
             self._health.mark_success("jira_fetch")
 
