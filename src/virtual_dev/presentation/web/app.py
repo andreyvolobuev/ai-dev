@@ -221,8 +221,14 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         # Apply Alembic migrations to head before starting any workers.
         # Idempotent — safe to run on every startup; runs in a worker
         # thread so the event loop isn't blocked.
+        # Timeout guard: psycopg2 can hang indefinitely when the DB is
+        # unreachable (no connect_timeout in DSN). We cancel after 30s so
+        # uvicorn still binds and the readinessProbe can reflect the real
+        # state, rather than keeping the port closed until Helm times out.
         try:
-            await container.init_db()
+            await asyncio.wait_for(container.init_db(), timeout=30.0)
+        except TimeoutError:
+            logger.error("DB migration timed out (30 s) — starting without migrations")
         except Exception:
             logger.exception("DB migration failed — starting without migrations")
 
@@ -486,6 +492,10 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             await mm_listener.stop()
         logger.warning("Kill-switch pressed via web")
         return {"status": "stopping"}
+
+    @app.get("/health")
+    async def health() -> str:
+        return "ok"
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
