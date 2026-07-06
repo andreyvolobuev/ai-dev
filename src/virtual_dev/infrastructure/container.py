@@ -19,7 +19,7 @@ from virtual_dev.adapters.code_agent import ClaudeAgentSdkCodeAgent
 from virtual_dev.adapters.embedder import FastembedEmbedder
 from virtual_dev.adapters.knowledge_base import ConfluenceKb
 from virtual_dev.adapters.llm import ClaudeAgentSdkLlm
-from virtual_dev.adapters.message_bus import SqliteMessageBus
+from virtual_dev.adapters.message_bus import SqlAlchemyMessageBus
 from virtual_dev.adapters.mr_history import LocalMrHistory
 from virtual_dev.adapters.secrets import EnvSecrets
 from virtual_dev.adapters.task_tracker import JiraTaskTracker
@@ -94,7 +94,7 @@ class Container:
     communicator: CommunicatorService
     rules_loader: RulesLoader
     prompts_loader: PromptsLoader
-    dev_agents: dict[str, DevAgent]   # repo_key → DevAgent (backend specialisation)
+    dev_agents: dict[str, DevAgent]  # repo_key → DevAgent (backend specialisation)
     reviewer: ReviewerAgent
     devops: DevOpsAgent
     thread_responder: ThreadResponderAgent
@@ -119,8 +119,8 @@ class Container:
         """
         import asyncio
 
-        await asyncio.to_thread(upgrade_to_head, self.settings.db_url)
-        logger.info("DB migrated to head at {}", self.settings.db_url)
+        await asyncio.to_thread(upgrade_to_head, self.settings.db_dsn)
+        logger.info("DB migrated to head at {}", self.settings.db_dsn)
 
     async def dispose(self) -> None:
         await self.engine.dispose()
@@ -183,18 +183,22 @@ def build_container(config_dir: Path | str = "config") -> Container:
     config = load_config(config_dir)
     apply_settings_overrides(config, settings)
 
-    engine = make_engine(settings.db_url)
+    engine = make_engine(settings.db_dsn)
     session_factory = make_session_factory(engine)
 
     secrets = EnvSecrets()
-    message_bus: MessageBusPort = SqliteMessageBus(session_factory)
+    dialect_name = "postgresql" if not settings.db_dsn.startswith("sqlite") else "sqlite"
+    message_bus: MessageBusPort = SqlAlchemyMessageBus(
+        session_factory,
+        dialect_name=dialect_name,
+    )
 
     task_tracker: TaskTrackerPort | None = None
     if settings.jira_url and settings.jira_token:
         task_tracker = JiraTaskTracker(
             url=settings.jira_url,
             token=settings.jira_token,
-            user=settings.jira_user,   # kept for reference; not used for Bearer auth
+            user=settings.jira_user,  # kept for reference; not used for Bearer auth
         )
     else:
         logger.warning(
@@ -242,7 +246,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
             # — that's expected for bot tokens, so we log a single
             # actionable line instead of a scary traceback.
             try:
-                client = vcs._client   # type: ignore[attr-defined]
+                client = vcs._client  # type: ignore[attr-defined]
                 client.auth()
                 gitlab_bot_username = (
                     str(client.user.username) if client.user else None  # type: ignore[union-attr]
@@ -364,6 +368,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         model=reviewer_model,
     )
     from virtual_dev.application.services.mr_summarizer import MrSummarizer
+
     mr_summarizer = MrSummarizer(llm=llm, model=reviewer_model)
     health = HealthTracker()
     reviewer = ReviewerAgent(

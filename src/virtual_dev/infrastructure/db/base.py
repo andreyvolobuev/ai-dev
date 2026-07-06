@@ -1,4 +1,9 @@
-"""SQLAlchemy base + engine/session factories."""
+"""SQLAlchemy base + engine/session factories.
+
+Supports both PostgreSQL (production, via ``asyncpg``) and SQLite
+(tests, via ``aiosqlite``). SQLite-specific PRAGMAs are applied
+conditionally; PostgreSQL gets sensible pool defaults.
+"""
 
 from __future__ import annotations
 
@@ -21,8 +26,17 @@ class Base(DeclarativeBase):
 
 
 def make_engine(db_url: str, *, echo: bool = False) -> AsyncEngine:
-    engine = create_async_engine(db_url, echo=echo, future=True)
-    if db_url.startswith("sqlite"):
+    """Create an async engine tuned for the dialect in ``db_url``.
+
+    SQLite gets WAL + busy_timeout pragmas to avoid ``SQLITE_BUSY``
+    under concurrent workers. PostgreSQL gets a connection pool sized
+    for the bot's workload (~8 concurrent workers).
+    """
+    is_sqlite = db_url.startswith("sqlite")
+
+    if is_sqlite:
+        engine = create_async_engine(db_url, echo=echo, future=True)
+
         # Default journal_mode (DELETE) blocks readers on every write; with
         # ~8 workers polling the same DB this manifests as SQLITE_BUSY.
         # WAL lets readers proceed during writes, busy_timeout retries
@@ -35,6 +49,16 @@ def make_engine(db_url: str, *, echo: bool = False) -> AsyncEngine:
             cursor.execute("PRAGMA busy_timeout=5000")
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.close()
+    else:
+        engine = create_async_engine(
+            db_url,
+            echo=echo,
+            future=True,
+            pool_size=10,
+            max_overflow=5,
+            pool_pre_ping=True,
+        )
+
     return engine
 
 

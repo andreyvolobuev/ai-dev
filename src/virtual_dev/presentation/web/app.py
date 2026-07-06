@@ -52,7 +52,8 @@ _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
 async def _forward_trace(
-    ws: WebSocket, subscription: AsyncIterator[AgentTraceEvent],
+    ws: WebSocket,
+    subscription: AsyncIterator[AgentTraceEvent],
 ) -> None:
     """Forward AgentTrace events to a websocket as JSON. Stop quietly
     on disconnect or cancellation — the route's finally-block cleans up
@@ -68,7 +69,9 @@ async def _forward_trace(
 
 
 async def _drain_background_tasks(
-    tasks: list[asyncio.Task[None]], *, timeout: float = 10.0,
+    tasks: list[asyncio.Task[None]],
+    *,
+    timeout: float = 10.0,
 ) -> None:
     """Drain ``tasks`` under a single overall timeout.
 
@@ -215,6 +218,11 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        # Apply Alembic migrations to head before starting any workers.
+        # Idempotent — safe to run on every startup; runs in a worker
+        # thread so the event loop isn't blocked.
+        await container.init_db()
+
         background: list[asyncio.Task[None]] = []
         # Log sink: drains AgentTrace into loguru DEBUG so a prod log
         # at level=DEBUG mirrors the test-analyst UI feed (one line per

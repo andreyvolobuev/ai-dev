@@ -1,0 +1,37 @@
+# Secrets and local state
+.env
+.env.local
+
+# Runtime data — never baked into the image
+data/
+workspaces/
+.tmp/
+
+# Dev / test artefacts
+tests/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# VCS
+.git/
+.gitignore
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.opencode/
