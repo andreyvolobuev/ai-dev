@@ -14,6 +14,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONWARNINGS="ignore:Unverified HTTPS request" \
     WEB_HOST=0.0.0.0
 
+# The container runs as root, and the spawned `claude` CLI is invoked with
+# --dangerously-skip-permissions (permission_mode="bypassPermissions"). Claude
+# Code blocks that flag under uid 0 unless it's told the environment is already
+# isolated. The pod IS that sandbox, so assert it explicitly.
+ENV IS_SANDBOX=1
+
 RUN pip install --no-cache-dir uv==0.9.5
 
 WORKDIR ${WORKDIR_PATH}
