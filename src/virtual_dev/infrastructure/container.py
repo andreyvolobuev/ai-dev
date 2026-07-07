@@ -120,7 +120,7 @@ class Container:
         import asyncio
 
         await asyncio.to_thread(upgrade_to_head, self.settings.db_dsn)
-        logger.info("DB migrated to head at {}", self.settings.db_dsn)
+        logger.info("DB migrated to head")
 
     async def dispose(self) -> None:
         await self.engine.dispose()

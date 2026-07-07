@@ -11,8 +11,7 @@ FROM docker-hub.2gis.ru/${PYTHON_REPOSITORY}-${PYTHON_VERSION}-ubuntu-${UBUNTU_R
 
 ENV WORKDIR_PATH=/app
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONWARNINGS="ignore:Unverified HTTPS request" \
-    WEB_HOST=0.0.0.0
+    PYTHONWARNINGS="ignore:Unverified HTTPS request"
 
 # The container runs as root, and the spawned `claude` CLI is invoked with
 # --dangerously-skip-permissions (permission_mode="bypassPermissions"). Claude
