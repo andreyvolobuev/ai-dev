@@ -189,6 +189,41 @@ def test_https_push_url_embeds_token_and_host(tmp_path: Path) -> None:
     )
 
 
+def test_clone_url_is_token_free_https_for_ssh_remote(tmp_path: Path) -> None:
+    """Clone must go over HTTPS (the bot has a PAT, not an SSH key) and must
+    NOT embed the token in the URL — auth comes from the credential helper, so
+    origin stays token-free in .git/config."""
+    cfg = AppConfig(
+        repositories=[RepositoryCfg(
+            key="demo",
+            url="git@gitlab.example.com:group/sub/demo.git",
+            default_branch="main",
+        )],
+        agents=AgentsCfg(),
+        mappings=MappingsCfg(),
+    )
+    vcs = GitLabVcs(
+        config=cfg,
+        gitlab_url="https://gitlab.example.com/",
+        gitlab_token="glpat-FAKE-TOKEN",
+        workspaces_dir=tmp_path / "workspaces",
+        identity=GitIdentity(name="Virtual Dev", email="vdev@example"),
+    )
+
+    url = vcs._clone_url("demo")
+    assert url == "https://gitlab.example.com/group/sub/demo.git"
+    assert "glpat-FAKE-TOKEN" not in url
+    assert not url.startswith("git@")
+
+
+def test_clone_url_passthrough_for_local_remote(tmp_path: Path) -> None:
+    """A non-GitLab remote (test fixture using a local dir as upstream) is
+    returned unchanged so the credential helper is never consulted for it."""
+    upstream = tmp_path / "upstream"
+    vcs = _vcs(tmp_path, _cfg("demo", upstream))
+    assert vcs._clone_url("demo") == str(upstream)
+
+
 @pytest.mark.asyncio
 async def test_push_uses_https_url_with_token_not_ssh_origin(tmp_path: Path) -> None:
     """The current pipeline-attribution bug: ``git push origin <branch>``

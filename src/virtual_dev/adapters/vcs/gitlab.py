@@ -20,6 +20,7 @@ mutation, no surprise when the user runs git in the same shell.
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -129,8 +130,11 @@ class GitLabVcs(VcsPort):
             return str(dest)
 
         dest.parent.mkdir(parents=True, exist_ok=True)
-        logger.info("Cloning {} into {}", repo_cfg.url, dest)
-        await self._run_git(None, "clone", repo_cfg.url, str(dest))
+        clone_url = self._clone_url(repo_key)
+        logger.info("Cloning {} into {}", clone_url, dest)
+        # Initial clone of a large monorepo can take minutes; give it far more
+        # headroom than the default per-git-op timeout.
+        await self._run_git(None, "clone", clone_url, str(dest), timeout=1800)
         return str(dest)
 
     async def _has_uncommitted_changes_at(self, path: Path) -> bool:
@@ -664,18 +668,60 @@ class GitLabVcs(VcsPort):
             path = path[:-4]
         return path
 
+    def _clone_url(self, repo_key: str) -> str:
+        """HTTPS clone/fetch URL with NO embedded token.
+
+        The bot has a GitLab PAT but no SSH key, so cloning the SSH form
+        (``git@host:group/project.git`` from ``repositories.yaml``) would fail
+        with ``Permission denied (publickey)``. We clone over HTTPS instead and
+        let the credential helper in :meth:`_git_sync` supply the PAT — that way
+        origin stays token-free (``https://host/group/project.git``) and every
+        later fetch/reset/push authenticates the same way.
+
+        Non-GitLab remotes (test fixtures that use a local dir as "upstream")
+        are returned unchanged so the helper is never consulted for them.
+        """
+        repo_url = self._repo(repo_key).url
+        if not repo_url.startswith(("git@", "https://", "http://")):
+            return repo_url
+        from urllib.parse import urlparse
+
+        host = urlparse(self._gitlab_url).hostname or ""
+        if not host:
+            raise VcsError(
+                f"cannot derive HTTPS host from gitlab_url {self._gitlab_url!r}"
+            )
+        return f"https://{host}/{self._project_path(repo_key)}.git"
+
     async def _ensure_local(self, repo_key: str) -> Path:
         path = Path(await self.ensure_clone(repo_key))
         return path
 
-    async def _run_git(self, cwd: Path | None, *args: str) -> str:
-        return await asyncio.to_thread(self._git_sync, cwd, list(args), False)
+    async def _run_git(
+        self, cwd: Path | None, *args: str, timeout: int = 300
+    ) -> str:
+        return await asyncio.to_thread(self._git_sync, cwd, list(args), False, timeout)
 
     async def _run_git_with_identity(self, cwd: Path | None, *args: str) -> str:
-        return await asyncio.to_thread(self._git_sync, cwd, list(args), True)
+        return await asyncio.to_thread(self._git_sync, cwd, list(args), True, 300)
 
-    def _git_sync(self, cwd: Path | None, args: list[str], with_identity: bool) -> str:
+    def _git_sync(
+        self, cwd: Path | None, args: list[str], with_identity: bool, timeout: int = 300
+    ) -> str:
         cmd = ["git"]
+        # Authenticate HTTPS remote ops (clone/fetch/push) as the bot's PAT
+        # without persisting it in .git/config or leaking it into argv/logs:
+        # a one-line credential helper reads the token from the child env
+        # (GL_PAT). We first clear any inherited helper so only ours answers.
+        # git consults it ONLY on an HTTP auth challenge, so this is a no-op for
+        # local ops and for SSH remotes (e.g. a user's local_path checkout).
+        cmd += [
+            "-c", "credential.helper=",
+            "-c", (
+                'credential.helper=!f() { test "$1" = get && '
+                'printf "username=oauth2\\npassword=%s\\n" "$GL_PAT"; }; f'
+            ),
+        ]
         if with_identity:
             cmd += [
                 "-c", f"user.name={self._identity.name}",
@@ -683,6 +729,14 @@ class GitLabVcs(VcsPort):
             ]
         cmd += args
         logger.debug("git {}", " ".join(shlex.quote(a) for a in args))
+        # GL_PAT feeds the credential helper above; GIT_TERMINAL_PROMPT=0 makes
+        # git fail fast instead of blocking on a username/password prompt when
+        # auth is missing or wrong.
+        env = {
+            **os.environ,
+            "GL_PAT": self._gitlab_token,
+            "GIT_TERMINAL_PROMPT": "0",
+        }
         try:
             proc = subprocess.run(
                 cmd,
@@ -690,7 +744,8 @@ class GitLabVcs(VcsPort):
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=timeout,
+                env=env,
             )
         except FileNotFoundError as exc:
             raise VcsError("git CLI not found on PATH") from exc

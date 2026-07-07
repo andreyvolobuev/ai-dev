@@ -110,6 +110,42 @@ async def _drain_background_tasks(
         )
 
 
+async def _prewarm_repo_clones(container: Container) -> None:
+    """Clone every configured repo into ``workspaces/`` on startup.
+
+    The Analyst is read-only and never clones on its own; the Researcher tools
+    it relies on (``read_file`` / ``search_code``) read straight from the local
+    checkout. On a fresh deploy that checkout doesn't exist yet — nothing
+    populates it until a Dev-agent runs — so the Analyst would plan blind. We
+    pre-clone here so it has real code from the first task.
+
+    Runs as a background task, NOT awaited before uvicorn binds: cloning large
+    monorepos can take minutes and blocking startup would trip the readiness
+    probe. Clones run concurrently; each failure is logged and skipped, and the
+    Analyst degrades gracefully (API-only) for any repo not yet cloned.
+    """
+    vcs = container.vcs
+    if vcs is None:
+        return
+    repo_keys = [r.key for r in container.config.repositories]
+    if not repo_keys:
+        return
+
+    async def _clone_one(repo_key: str) -> None:
+        try:
+            path = await vcs.ensure_clone(repo_key)
+            logger.info("Pre-cloned {} → {}", repo_key, path)
+        except Exception as exc:
+            logger.warning(
+                "Pre-clone of {} failed — Analyst runs API-degraded for it "
+                "until the next attempt succeeds: {}",
+                repo_key, exc,
+            )
+
+    logger.info("Pre-cloning {} repo(s) into workspaces/…", len(repo_keys))
+    await asyncio.gather(*(_clone_one(k) for k in repo_keys))
+
+
 def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI:
     templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
@@ -242,6 +278,12 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             name="agent-trace-log-sink",
         ))
         if start_scheduler:
+            # Populate workspaces/ so the Analyst sees real code from task #1.
+            # Background, non-blocking: must not delay uvicorn binding.
+            if container.vcs is not None:
+                background.append(asyncio.create_task(
+                    _prewarm_repo_clones(container), name="prewarm-clones",
+                ))
             background.append(asyncio.create_task(orchestrator.run_forever(), name="orchestrator"))
             background.append(asyncio.create_task(analyst_runner.run_forever(), name="analyst-runner"))
             for runner in dev_runners:
