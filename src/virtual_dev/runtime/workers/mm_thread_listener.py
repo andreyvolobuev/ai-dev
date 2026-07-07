@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from virtual_dev.application.agents import DevAgent, ResponderAction, ThreadResponderAgent
 from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
 from virtual_dev.application.services.communicator import CommunicatorService
+from virtual_dev.application.services.ticket_reset import reset_ticket_state
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
 from virtual_dev.domain.ports.chat import ChatPort
@@ -365,6 +366,14 @@ class MmThreadListener:
             self._inflight_posts.discard(event.id)
 
     async def _dispatch_inner(self, event: ChatMessage) -> None:
+        # Team-lead DM command: `/reset <TICKET>` wipes the bot's stored state
+        # for a ticket so it re-processes from scratch (does NOT touch Jira or
+        # GitLab). Checked before any routing so it can't be mistaken for a
+        # reply to the analyst's pending question.
+        if self._is_reset_command(event.text):
+            await self._handle_reset_command(event)
+            return
+
         # Team-lead command: a reply in the autofix give-up DM thread.
         # `/restart` there resets this MR's auto-fix counter so the bot
         # tries again. Checked first because the escalation root is a
@@ -667,6 +676,80 @@ class MmThreadListener:
         case-insensitive. A literal command, not NL classification."""
         tokens = (text or "").strip().lower().split()
         return bool(tokens) and tokens[0] == "/restart"
+
+    @staticmethod
+    def _is_reset_command(text: str) -> bool:
+        """True when the message starts with the `/reset` command — first
+        token, case-insensitive. A literal command, not NL classification."""
+        tokens = (text or "").strip().lower().split()
+        return bool(tokens) and tokens[0] == "/reset"
+
+    async def _resolve_lead_user_id(self) -> str | None:
+        """Mattermost user id of the configured team-lead (ESCALATION_USER),
+        or None when unset / unresolvable. Mirrors the reviewer/devops path."""
+        handle = (self._config.agents.escalation.mattermost_user or "").strip()
+        if not handle or handle == "your.name":
+            return None
+        return await self._communicator.resolve_user_id(username=handle)
+
+    async def _handle_reset_command(self, event: ChatMessage) -> None:
+        """`/reset <TICKET>` from the team-lead: wipe the bot's DB state for
+        the ticket so it starts fresh. Restricted to the team-lead because it
+        is destructive. Jira/GitLab are untouched."""
+        lead_id = await self._resolve_lead_user_id()
+        if lead_id is None or event.author_id != lead_id:
+            logger.warning(
+                "MmThreadListener: /reset from non-lead {!r} ignored",
+                event.author_id,
+            )
+            await self._reply_in_dm(event, "Команда /reset доступна только тимлиду.")
+            return
+
+        tokens = (event.text or "").strip().split()
+        if len(tokens) < 2:
+            await self._reply_in_dm(event, "Формат: `/reset DM-1234`")
+            return
+        ticket = tokens[1].strip().upper()
+
+        async with session_scope(self._session_factory) as session:
+            summary = await reset_ticket_state(
+                session, tracker="jira", external_id=ticket,
+            )
+
+        if not summary.found:
+            await self._reply_in_dm(
+                event, f"Тикет {ticket} в базе не найден — чистить нечего.",
+            )
+            return
+
+        logger.info(
+            "MmThreadListener: /reset by lead cleared {} row(s) for {} "
+            "(task={}, plans={}, mrs={}, conv={})",
+            summary.total, ticket, summary.tasks, summary.plans,
+            summary.merge_requests,
+            summary.conversation_steps + summary.conversation_fragments,
+        )
+        await self._reply_in_dm(
+            event,
+            f"Готово, очистила состояние {ticket}: задача {summary.tasks}, "
+            f"план(ы) {summary.plans}, MR {summary.merge_requests}, "
+            f"память диалога "
+            f"{summary.conversation_steps + summary.conversation_fragments}. "
+            f"Возьму заново, когда тикет вернётся в «To Do».",
+        )
+
+    async def _reply_in_dm(self, event: ChatMessage, text: str) -> None:
+        """Reply to a DM command in-thread and mark it processed."""
+        await self._post_reply(
+            event.channel_id, event.thread_root_id or event.id, text,
+        )
+        try:
+            await self._chat.add_reaction(event.id, _PROCESSED_REACTION)
+        except Exception:
+            logger.warning(
+                "MmThreadListener: add_reaction failed for command post {}",
+                event.id,
+            )
 
     async def _handle_autofix_restart(
         self, row: MergeRequestRow, event: ChatMessage,
