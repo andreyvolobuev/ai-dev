@@ -81,6 +81,10 @@ class Settings(BaseSettings):
     # Tests use sqlite+aiosqlite:///:memory: directly (not via settings).
     db_dsn: str = "postgresql+asyncpg://sd_bots:qwerty123@localhost:5432/ai_dev"
     workspaces_dir: str = "./workspaces"
+    # Wall-clock ceiling for one Claude Agent SDK run (analyst/dev
+    # iteration). max_turns bounds turn count, not time — a wedged CLI
+    # would otherwise hang its worker forever.
+    code_agent_run_timeout_seconds: int = 3600
     # Sentence-embedding model for MR-history similarity search. Empty →
     # the fastembed adapter's default (multilingual MiniLM, 384 dim).
     # NB: changing the model invalidates stored vectors — mr_history

@@ -59,6 +59,7 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
         env: dict[str, str] | None = None,
         rate_limit_max_retries: int = 2,
         rate_limit_initial_backoff_seconds: int = 60,
+        run_timeout_seconds: int = 3600,
         trace: AgentTrace | None = None,
     ) -> None:
         self._default_model = default_model
@@ -70,6 +71,10 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
         self._env = env or {}
         self._rate_limit_max_retries = max(0, rate_limit_max_retries)
         self._rate_limit_initial_backoff = max(1, rate_limit_initial_backoff_seconds)
+        # Wall-clock ceiling per run. max_turns bounds turn COUNT, not
+        # time — a wedged CLI (stalled gateway read, deadlocked pipe)
+        # would otherwise hang the owning worker forever.
+        self._run_timeout = max(60, run_timeout_seconds)
         # Optional debug-trace channel — UI subscribers see every
         # tool_use, every TextBlock, and the system+user prompts.
         # In production code-paths trace=None and the cost is zero.
@@ -133,49 +138,60 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
 
         tool_use_count = 0
         try:
-            async for event in query(prompt=request.user_prompt, options=options):
-                if isinstance(event, AssistantMessage):
-                    for block in event.content:
-                        if isinstance(block, TextBlock):
-                            final_text_parts.append(block.text)
-                            await emit_if(self._trace, AgentTraceEvent(
-                                type="llm_text",
-                                agent_key=request.agent_key,
-                                payload={"text": block.text},
-                            ))
-                        elif isinstance(block, ToolUseBlock):
-                            tool_use_count += 1
-                            logger.info(
-                                "[{}] tool_use #{}: {} {}",
+            async with asyncio.timeout(self._run_timeout):
+                async for event in query(prompt=request.user_prompt, options=options):
+                    if isinstance(event, AssistantMessage):
+                        for block in event.content:
+                            if isinstance(block, TextBlock):
+                                final_text_parts.append(block.text)
+                                await emit_if(self._trace, AgentTraceEvent(
+                                    type="llm_text",
+                                    agent_key=request.agent_key,
+                                    payload={"text": block.text},
+                                ))
+                            elif isinstance(block, ToolUseBlock):
+                                tool_use_count += 1
+                                logger.info(
+                                    "[{}] tool_use #{}: {} {}",
+                                    request.agent_key,
+                                    tool_use_count,
+                                    block.name,
+                                    _tool_input_preview(block.input),
+                                )
+                                await emit_if(self._trace, AgentTraceEvent(
+                                    type="tool_use",
+                                    agent_key=request.agent_key,
+                                    payload={
+                                        "n": tool_use_count,
+                                        "name": block.name,
+                                        "input": _tool_input_for_trace(block.input),
+                                    },
+                                ))
+                    elif isinstance(event, ResultMessage):
+                        got_result = True
+                        cost_usd = float(event.total_cost_usd or 0.0)
+                        turns = int(event.num_turns or 0)
+                        stop_reason = event.stop_reason or ("error" if event.is_error else "end_turn")
+                        usage = cast(dict[str, Any], event.usage or {})
+                        input_tokens = int(usage.get("input_tokens") or 0)
+                        output_tokens = int(usage.get("output_tokens") or 0)
+                        if event.is_error:
+                            is_error = True
+                            logger.warning(
+                                "Claude Agent SDK reported error for agent={} stop={}",
                                 request.agent_key,
-                                tool_use_count,
-                                block.name,
-                                _tool_input_preview(block.input),
+                                stop_reason,
                             )
-                            await emit_if(self._trace, AgentTraceEvent(
-                                type="tool_use",
-                                agent_key=request.agent_key,
-                                payload={
-                                    "n": tool_use_count,
-                                    "name": block.name,
-                                    "input": _tool_input_for_trace(block.input),
-                                },
-                            ))
-                elif isinstance(event, ResultMessage):
-                    got_result = True
-                    cost_usd = float(event.total_cost_usd or 0.0)
-                    turns = int(event.num_turns or 0)
-                    stop_reason = event.stop_reason or ("error" if event.is_error else "end_turn")
-                    usage = cast(dict[str, Any], event.usage or {})
-                    input_tokens = int(usage.get("input_tokens") or 0)
-                    output_tokens = int(usage.get("output_tokens") or 0)
-                    if event.is_error:
-                        is_error = True
-                        logger.warning(
-                            "Claude Agent SDK reported error for agent={} stop={}",
-                            request.agent_key,
-                            stop_reason,
-                        )
+        except TimeoutError:
+            # Wall-clock ceiling hit: the CLI wedged (stalled gateway
+            # read, deadlocked pipe). asyncio.timeout cancelled the SDK's
+            # stream, which terminates its subprocess. Re-raise loudly —
+            # the caller marks the run failed and the bus redelivers.
+            logger.error(
+                "claude CLI run for agent={} exceeded {}s wall-clock — aborted",
+                request.agent_key, self._run_timeout,
+            )
+            raise
         except Exception as exc:
             # When the CLI hits max_turns mid-tool-use, it emits a final
             # ResultMessage and THEN exits with code 1 — which the SDK surfaces

@@ -299,6 +299,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
     code_agent: CodeAgentPort = ClaudeAgentSdkCodeAgent(
         default_model=config.agents.models.default,
         env=claude_env,
+        run_timeout_seconds=settings.code_agent_run_timeout_seconds,
         trace=trace,
     )
     llm: LlmPort = ClaudeAgentSdkLlm(env=claude_env)
