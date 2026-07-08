@@ -18,6 +18,9 @@ from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
 
 Handler = Callable[[AgentMessage], Awaitable[None]]
 
+_RESUBSCRIBE_INITIAL_BACKOFF = 5.0
+_RESUBSCRIBE_MAX_BACKOFF = 300.0
+
 
 @dataclass
 class AgentRunnerStats:
@@ -57,36 +60,70 @@ class AgentRunner:
         if self._running:
             raise RuntimeError(f"AgentRunner[{self._agent_key}] is already running")
         self._running = True
-        logger.info("AgentRunner[{}] subscribing to bus", self._agent_key)
+        backoff = _RESUBSCRIBE_INITIAL_BACKOFF
         try:
-            subscription = await self._bus.subscribe(self._agent_key)
-            pending = asyncio.create_task(_anext(subscription))
-            stopper = asyncio.create_task(self._stop_event.wait())
-            try:
-                while not self._stop_event.is_set():
-                    done, _ = await asyncio.wait(
-                        {pending, stopper},
-                        return_when=asyncio.FIRST_COMPLETED,
+            while not self._stop_event.is_set():
+                processed_before = self.stats.processed
+                try:
+                    await self._consume_until_stopped()
+                    break  # stop requested or subscription iterator ended
+                except Exception:
+                    # A transient bus error ("database is locked", dropped
+                    # connection) must NOT kill the runner: the Analyst and
+                    # every Dev are driven by this loop, and nothing else
+                    # re-delivers their messages within this process.
+                    if self.stats.processed > processed_before:
+                        backoff = _RESUBSCRIBE_INITIAL_BACKOFF
+                    logger.exception(
+                        "AgentRunner[{}] subscription crashed — "
+                        "resubscribing in {:.0f}s",
+                        self._agent_key, backoff,
                     )
-                    if stopper in done:
+                    if await self._wait_stop(timeout=backoff):
                         break
-                    if pending in done:
-                        try:
-                            message = pending.result()
-                        except StopAsyncIteration:
-                            break
-                        if await self._dispatch(message):
-                            await self._bus.ack(message)
-                        pending = asyncio.create_task(_anext(subscription))
-            finally:
-                for task in (pending, stopper):
-                    if not task.done():
-                        task.cancel()
-                        with _suppress_cancel():
-                            await task
+                    backoff = min(backoff * 2, _RESUBSCRIBE_MAX_BACKOFF)
         finally:
             self._running = False
             logger.info("AgentRunner[{}] stopped", self._agent_key)
+
+    async def _consume_until_stopped(self) -> None:
+        """One subscription lifetime: consume until stop or iterator end.
+
+        Raises on bus errors — run_forever resubscribes with backoff."""
+        logger.info("AgentRunner[{}] subscribing to bus", self._agent_key)
+        subscription = await self._bus.subscribe(self._agent_key)
+        pending = asyncio.create_task(_anext(subscription))
+        stopper = asyncio.create_task(self._stop_event.wait())
+        try:
+            while not self._stop_event.is_set():
+                done, _ = await asyncio.wait(
+                    {pending, stopper},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stopper in done:
+                    break
+                if pending in done:
+                    try:
+                        message = pending.result()
+                    except StopAsyncIteration:
+                        break
+                    if await self._dispatch(message):
+                        await self._bus.ack(message)
+                    pending = asyncio.create_task(_anext(subscription))
+        finally:
+            for task in (pending, stopper):
+                if not task.done():
+                    task.cancel()
+                    with _suppress_cancel():
+                        await task
+
+    async def _wait_stop(self, timeout: float) -> bool:
+        """Sleep up to ``timeout``; True if stop was requested meanwhile."""
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=timeout)
+            return True
+        except TimeoutError:
+            return False
 
     async def _dispatch(self, message: AgentMessage) -> bool:
         """Run the registered handler. Returns True iff the handler ran

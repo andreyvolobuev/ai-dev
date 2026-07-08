@@ -184,3 +184,59 @@ async def test_runner_does_not_ack_when_handler_raises() -> None:
 
     assert runner.stats.failed == 1
     assert bus.acked == []
+
+
+@pytest.mark.asyncio
+async def test_runner_resubscribes_after_bus_iterator_crash() -> None:
+    """A transient bus error inside the subscription iterator must not
+    kill the runner — it resubscribes and keeps consuming."""
+    handled: list[str] = []
+
+    class _FlakyBus:
+        def __init__(self) -> None:
+            self.subscribe_calls = 0
+            self.acked: list[AgentMessage] = []
+
+        async def publish(self, message: AgentMessage) -> None:  # pragma: no cover
+            raise AssertionError("not used")
+
+        async def subscribe(self, agent_key: str):  # type: ignore[no-untyped-def]
+            self.subscribe_calls += 1
+            first = self.subscribe_calls == 1
+
+            async def _gen():
+                if first:
+                    raise RuntimeError("database is locked")
+                yield AgentMessage(
+                    id="m1", from_agent="orchestrator", to_agent="analyst",
+                    topic="task.discovered", payload={},
+                )
+
+            return _gen()
+
+        async def ack(self, message: AgentMessage) -> None:
+            self.acked.append(message)
+
+    async def handler(msg: AgentMessage) -> None:
+        handled.append(msg.id)
+
+    bus = _FlakyBus()
+    runner = AgentRunner(
+        agent_key="analyst", message_bus=bus,
+        handlers={"task.discovered": handler},
+    )
+    run = asyncio.create_task(runner.run_forever())
+    # First subscription crashes; the runner backs off (5s) — fast-forward
+    # by waiting on real time is too slow, so poke the stop-wait through
+    # a shortened backoff via monkeypatching would be invasive; instead
+    # just wait past the initial 5s backoff bounded by a 8s ceiling.
+    for _ in range(80):
+        if handled:
+            break
+        await asyncio.sleep(0.1)
+    await runner.stop()
+    await asyncio.wait_for(run, timeout=5)
+
+    assert handled == ["m1"]
+    assert bus.subscribe_calls >= 2
+    assert [m.id for m in bus.acked] == ["m1"]
