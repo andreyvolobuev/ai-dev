@@ -57,6 +57,14 @@ class HybridChat(ChatPort):
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
         await self._writes.add_reaction(post_id, emoji_name)
 
+    async def direct_channel_id(self, user_id: str) -> str | None:
+        # Like the user-directory lookups: test-local channels win, the
+        # real workspace is the fallback.
+        local = await self._writes.direct_channel_id(user_id)
+        if local is not None:
+            return local
+        return await self._reads.direct_channel_id(user_id)
+
     def subscribe(self) -> AsyncIterator[ChatMessage]:
         return self._writes.subscribe()
 

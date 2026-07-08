@@ -165,6 +165,10 @@ class InMemoryChat(ChatPort):
         self._known_users[username] = user
         return user
 
+    async def direct_channel_id(self, user_id: str) -> str | None:
+        # Mirrors send_direct's channel-id convention.
+        return f"dm-{user_id}"
+
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
         self._reactions.setdefault(post_id, []).append(emoji_name)
         await emit_if(self._trace, AgentTraceEvent(

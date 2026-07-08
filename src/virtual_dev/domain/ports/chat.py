@@ -51,6 +51,13 @@ class ChatPort(ABC):
         """
         return []
 
+    async def direct_channel_id(self, user_id: str) -> str | None:
+        """Channel id of the bot↔user DM, or ``None`` when the adapter
+        can't resolve it. Used by the MM catch-up sweep to replay lead
+        DM commands (e.g. ``/reset``) missed while the WS was down.
+        Default ``None`` so fakes that never need it can ignore it."""
+        return None
+
     @abstractmethod
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
         """Add an emoji reaction (by name, e.g. ``white_check_mark``) to a post.

@@ -71,6 +71,12 @@ class MmListenerStats:
 # bounded for very busy channels after a long downtime.
 _CATCHUP_MAX_LOOKBACK = timedelta(days=7)
 
+# How far back the catch-up sweep looks in the lead's DM channel for
+# missed commands (/reset). Deliberately narrower than the general
+# lookback: replaying week-old destructive commands after a long outage
+# is worse than asking the lead to repeat one.
+_DM_COMMAND_LOOKBACK = timedelta(hours=24)
+
 
 class MmThreadListener:
     """Drives the ChatPort.subscribe() async iterator in the background."""
@@ -99,6 +105,10 @@ class MmThreadListener:
         self._settings = settings
         self._vcs = vcs
         self._analyst_inbox = analyst_inbox
+        # Lead DM channel for command replay — resolved lazily, cached
+        # only on success (see _lead_dm_channel_id).
+        self._lead_dm_channel: str | None = None
+        self._lead_dm_resolved = False
         self._stop_event = asyncio.Event()
         self._running = False
         # Reconnect cadence after subscribe() crashes. Defaults are
@@ -336,6 +346,17 @@ class MmThreadListener:
             if existing is None or anchor < existing:
                 out[ch] = anchor
 
+        # Lead DM commands (/reset). Without this cursor a command sent
+        # while the WS was down is lost forever — the lead expects the
+        # bot to obey once it's back, so the DM channel must be swept
+        # too. Idempotency: _dispatch_inner skips ✅-marked commands.
+        lead_dm = await self._lead_dm_channel_id()
+        if lead_dm:
+            cursor = now - _DM_COMMAND_LOOKBACK
+            existing = out.get(lead_dm)
+            if existing is None or cursor < existing:
+                out[lead_dm] = cursor
+
         return out
 
     # ----------------------------------------------------- main dispatch
@@ -371,6 +392,13 @@ class MmThreadListener:
         # GitLab). Checked before any routing so it can't be mistaken for a
         # reply to the analyst's pending question.
         if self._is_reset_command(event.text):
+            # Idempotency for catch-up replay: a ✅-marked command was
+            # already executed (wiping twice re-clears freshly rebuilt
+            # state, so this guard matters more here than for replies).
+            if event.id and self._chat is not None:
+                fresh = await self._chat.get_post(event.id)
+                if fresh is not None and _PROCESSED_REACTION in fresh.bot_reactions:
+                    return
             await self._handle_reset_command(event)
             return
 
@@ -683,6 +711,28 @@ class MmThreadListener:
         token, case-insensitive. A literal command, not NL classification."""
         tokens = (text or "").strip().lower().split()
         return bool(tokens) and tokens[0] == "/reset"
+
+    async def _lead_dm_channel_id(self) -> str | None:
+        """DM channel between bot and team-lead, cached per process.
+
+        Failures are NOT cached — the next catch-up tick retries, so a
+        transient MM error at startup doesn't disable command replay for
+        the whole process lifetime."""
+        if self._lead_dm_resolved:
+            return self._lead_dm_channel
+        if self._chat is None:
+            return None
+        try:
+            lead_id = await self._resolve_lead_user_id()
+            channel = (
+                await self._chat.direct_channel_id(lead_id) if lead_id else None
+            )
+        except Exception:
+            logger.warning("MmThreadListener: resolving lead DM channel failed")
+            return None
+        self._lead_dm_channel = channel
+        self._lead_dm_resolved = True
+        return channel
 
     async def _resolve_lead_user_id(self) -> str | None:
         """Mattermost user id of the configured team-lead (ESCALATION_USER),

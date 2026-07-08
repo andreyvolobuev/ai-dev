@@ -363,6 +363,21 @@ class MattermostChat(ChatPort):
 
         return await asyncio.to_thread(_run)
 
+    async def direct_channel_id(self, user_id: str) -> str | None:
+        def _run() -> str | None:
+            self._ensure_login()
+            bot_id = self._bot_user_id()
+            # Idempotent on the MM side: returns the existing DM channel
+            # if one already exists for this user pair.
+            channel = self._driver.channels.create_direct_message_channel(
+                options=[bot_id, user_id]
+            )
+            if not isinstance(channel, dict) or not channel.get("id"):
+                return None
+            return str(channel["id"])
+
+        return await asyncio.to_thread(_run)
+
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
         """Stick an emoji reaction (as the bot user) on a post."""
         def _run() -> None:

@@ -82,6 +82,9 @@ class _CatchupChat(ChatPort):
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
         self.reactions.setdefault(post_id, []).append(emoji_name)
 
+    async def direct_channel_id(self, user_id: str) -> str | None:
+        return f"dm-{user_id}"
+
     async def get_post(self, post_id: str) -> ChatMessage | None:
         bot_reactions = list(self.reactions.get(post_id, []))
         return ChatMessage(
@@ -189,6 +192,7 @@ def _listener(
     session_factory: async_sessionmaker[AsyncSession],
     chat: ChatPort,
     inbox: AnalystInbox | None,
+    config: AppConfig | None = None,
 ) -> MmThreadListener:
     return MmThreadListener(
         chat=chat,
@@ -198,7 +202,7 @@ def _listener(
         responder=None,                               # type: ignore[arg-type]
         dev_agents={},
         session_factory=session_factory,
-        config=_config(),
+        config=config or _config(),
         settings=Settings(),
         analyst_inbox=inbox,
     )
@@ -357,3 +361,65 @@ async def test_run_forever_restarts_after_subscribe_crash(
     assert chat.subscribe_calls >= 2
     assert listener.stats.subscription_restarts >= 1
     assert listener.stats.errors >= 1
+
+
+# ============================================================
+#            Lead DM command replay (/reset survival)
+# ============================================================
+
+
+def _lead_config() -> AppConfig:
+    cfg = _config()
+    cfg.agents.escalation.mattermost_user = "lead"
+    return cfg
+
+
+def _reset_post(post_id: str, *, hours_ago: float = 1.0) -> ChatMessage:
+    return ChatMessage(
+        id=post_id, channel_id="dm-uid-lead", author_id="uid-lead",
+        text="/reset DM-1",
+        timestamp=datetime.now(timezone.utc) - timedelta(hours=hours_ago),
+        trusted=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_catchup_replays_missed_reset_command(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A /reset sent while the WS was down must be executed by the next
+    catch-up sweep: the lead gave a command and expects it obeyed."""
+    task_row = await _seed_task_awaiting(session_factory)
+    chat = _CatchupChat(catchup_posts={"dm-uid-lead": [_reset_post("cmd-1")]})
+    listener = _listener(
+        session_factory, chat, _make_inbox(session_factory, chat),
+        config=_lead_config(),
+    )
+
+    await listener.catch_up()
+
+    async with session_scope(session_factory) as session:
+        remaining = await session.get(TaskRow, task_row.id)
+        assert remaining is None
+    assert _PROCESSED_REACTION in chat.reactions.get("cmd-1", [])
+
+
+@pytest.mark.asyncio
+async def test_catchup_skips_already_processed_reset_command(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A ✅-marked /reset was already executed — replaying it must NOT
+    wipe the ticket's freshly rebuilt state again."""
+    task_row = await _seed_task_awaiting(session_factory)
+    chat = _CatchupChat(catchup_posts={"dm-uid-lead": [_reset_post("cmd-2")]})
+    chat.reactions["cmd-2"] = [_PROCESSED_REACTION]
+    listener = _listener(
+        session_factory, chat, _make_inbox(session_factory, chat),
+        config=_lead_config(),
+    )
+
+    await listener.catch_up()
+
+    async with session_scope(session_factory) as session:
+        remaining = await session.get(TaskRow, task_row.id)
+        assert remaining is not None
