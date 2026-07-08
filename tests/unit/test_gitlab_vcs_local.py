@@ -175,10 +175,10 @@ async def test_ensure_clone_repairs_interrupted_clone(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ensure_clone_is_shallow_but_sees_all_branches(tmp_path: Path) -> None:
-    """Clones are --depth=1 (agents only need the current tree, and full
-    monorepo history takes many minutes to download) but --no-single-branch,
-    so fetch/checkout of non-default branches keeps working.
+async def test_ensure_clone_is_shallow_single_branch(tmp_path: Path) -> None:
+    """Clones are --depth=1 --single-branch: the bot only needs the default
+    branch's current tree (it branches off locally and pushes). Other
+    branches are fetched on demand — see the checkout test below.
 
     The upstream must be a file:// URL — git silently ignores --depth for
     plain local-path clones."""
@@ -198,7 +198,32 @@ async def test_ensure_clone_is_shallow_but_sees_all_branches(tmp_path: Path) -> 
     assert depth.stdout.strip() == "1"
     feature = subprocess.run(["git", "rev-parse", "--verify", "origin/feature"],
                              cwd=path, capture_output=True, text=True)
-    assert feature.returncode == 0
+    assert feature.returncode != 0
+
+
+@pytest.mark.asyncio
+async def test_checkout_existing_branch_fetches_outside_single_branch_refspec(
+    tmp_path: Path,
+) -> None:
+    """After a restart the bot's MR branch is not in the --single-branch
+    clone — checkout_existing_branch must fetch it explicitly and check out
+    the right tree."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _init_remote_repo(upstream)
+    subprocess.run(["git", "checkout", "-qb", "ai-dev/DM-1-fix"], cwd=upstream, check=True)
+    (upstream / "fix.txt").write_text("the fix")
+    subprocess.run(["git", "add", "-A"], cwd=upstream, check=True)
+    subprocess.run(["git", "-c", "user.email=o@x", "-c", "user.name=o",
+                    "commit", "-qm", "fix"], cwd=upstream, check=True)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=upstream, check=True)
+    vcs = _vcs(tmp_path, _cfg("demo", f"file://{upstream}"))
+
+    workspace = Path(await vcs.ensure_clone("demo"))
+    await vcs.checkout_existing_branch("demo", "ai-dev/DM-1-fix")
+
+    assert (workspace / "fix.txt").read_text() == "the fix"
+    assert await vcs.current_branch("demo") == "ai-dev/DM-1-fix"
 
 
 @pytest.mark.asyncio

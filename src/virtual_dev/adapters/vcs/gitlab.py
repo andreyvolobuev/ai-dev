@@ -171,15 +171,15 @@ class GitLabVcs(VcsPort):
                 await asyncio.to_thread(shutil.rmtree, tmp)
             clone_url = self._clone_url(repo_key)
             logger.info("Cloning {} into {}", clone_url, dest)
-            # Shallow: agents only need the current tree, and full monorepo
-            # history takes many minutes to download. --no-single-branch keeps
-            # the default fetch refspec covering ALL branches (plain --depth
-            # implies --single-branch, which would break fetch/checkout of MR
-            # branches). Later fetches stay connected to the shallow boundary,
-            # so merges of origin/<base> into bot branches still find their
-            # merge base.
+            # Shallow AND single-branch: the bot only ever starts from the
+            # default branch's current tree — it branches off locally and
+            # pushes. Other branches (e.g. its own MR branch after a restart)
+            # are fetched on demand by _fetch_branch. Later fetches of the
+            # default branch stay connected to the shallow boundary, so merges
+            # of origin/<base> into branches created this process still find
+            # their merge base.
             await self._run_git(
-                None, "clone", "--depth", "1", "--no-single-branch",
+                None, "clone", "--depth", "1", "--single-branch",
                 clone_url, str(tmp), timeout=1800,
             )
             tmp.rename(dest)
@@ -197,21 +197,43 @@ class GitLabVcs(VcsPort):
         output = await self._run_git(path, "status", "--porcelain")
         return bool(output.strip())
 
+    async def _ensure_origin_ref(self, path: Path, branch: str) -> None:
+        """Make ``origin/<branch>`` exist and point at the remote's tip.
+
+        Clones are --single-branch, so a plain ``git fetch`` only covers the
+        default branch. It runs first because it keeps the default branch's
+        history connected to our shallow boundary (merges into branches
+        created this process keep finding their merge base). Any other branch
+        (the bot's own MR branch after a restart, a non-default base) is then
+        fetched explicitly — ``--depth 1``, tip only: an old branch's history
+        doesn't connect to our shallow boundary, so a full fetch would pull
+        it in whole.
+        """
+        await self._run_git(path, "fetch", "--prune", "origin")
+        try:
+            await self._run_git(path, "rev-parse", "--verify", f"origin/{branch}")
+        except VcsError:
+            await self._run_git(
+                path, "fetch", "--depth", "1", "origin",
+                f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+            )
+
     async def fetch_and_checkout(self, repo_key: str, branch: str) -> None:
         async with self._lock(repo_key):
             path = await self._ensure_local(repo_key)
-            await self._run_git(path, "fetch", "--prune", "origin")
             # Remote branch may not exist; fall back to local branch if so.
             try:
+                await self._ensure_origin_ref(path, branch)
                 await self._run_git(path, "checkout", "-B", branch, f"origin/{branch}")
             except VcsError:
                 await self._run_git(path, "checkout", branch)
+                return
             await self._run_git(path, "reset", "--hard", f"origin/{branch}")
 
     async def checkout_existing_branch(self, repo_key: str, branch: str) -> None:
         async with self._lock(repo_key):
             path = await self._ensure_local(repo_key)
-            await self._run_git(path, "fetch", "--prune", "origin")
+            await self._ensure_origin_ref(path, branch)
             # -B ensures we move/recreate the local branch to the remote's tip
             # *without* losing the remote's commits — it's `checkout -b` if the
             # branch doesn't exist locally, `reset --hard origin/...` effectively
@@ -231,7 +253,7 @@ class GitLabVcs(VcsPort):
         """
         async with self._lock(repo_key):
             path = await self._ensure_local(repo_key)
-            await self._run_git(path, "fetch", "--prune", "origin")
+            await self._ensure_origin_ref(path, base)
             try:
                 await self._run_git_with_identity(
                     path, "merge", "--no-edit", f"origin/{base}",
@@ -253,7 +275,7 @@ class GitLabVcs(VcsPort):
     async def create_branch(self, repo_key: str, branch: str, base: str) -> None:
         async with self._lock(repo_key):
             path = await self._ensure_local(repo_key)
-            await self._run_git(path, "fetch", "--prune", "origin")
+            await self._ensure_origin_ref(path, base)
             # Refresh base before branching off.
             try:
                 await self._run_git(path, "checkout", "-B", base, f"origin/{base}")
@@ -385,6 +407,15 @@ class GitLabVcs(VcsPort):
                     # The bot's flow re-derives the URL on each push so
                     # upstream tracking isn't needed.
                     await self._run_git(path, *push_args)
+                    # Keep the remote-tracking ref in sync ourselves: pushes
+                    # go to a one-off URL (not the ``origin`` remote), and the
+                    # --single-branch fetch refspec wouldn't map the branch
+                    # anyway — without this, commit_all keeps seeing the
+                    # already-pushed HEAD as "ahead of origin".
+                    await self._run_git(
+                        path, "update-ref",
+                        f"refs/remotes/origin/{branch}", branch,
+                    )
                     if attempt > 1:
                         logger.info("git push succeeded on attempt {}/3", attempt)
                     return
