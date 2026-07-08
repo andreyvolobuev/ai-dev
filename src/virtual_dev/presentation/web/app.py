@@ -273,10 +273,15 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         # at level=DEBUG mirrors the test-analyst UI feed (one line per
         # tool_use / llm_text / agent_started / orchestrator event,
         # tagged with the analyst-run correlation id).
-        background.append(asyncio.create_task(
+        # Kept in its own variable too: it only exits on cancellation, so
+        # the shutdown path must cancel it BEFORE the drain — otherwise
+        # the drain's gather never completes and every shutdown eats the
+        # full 10s timeout even when all real workers exited instantly.
+        trace_sink_task = asyncio.create_task(
             consume_trace_to_logs(container.trace),
             name="agent-trace-log-sink",
-        ))
+        )
+        background.append(trace_sink_task)
         if start_scheduler:
             # Populate workspaces/ so the Analyst sees real code from task #1.
             # Background, non-blocking: must not delay uvicorn binding.
@@ -334,6 +339,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             if mm_catchup_poller is not None:
                 stop_signals.append(mm_catchup_poller.stop())
             await asyncio.gather(*stop_signals, return_exceptions=True)
+            trace_sink_task.cancel()
             await _drain_background_tasks(background, timeout=10.0)
             await container.dispose()
 
@@ -501,7 +507,11 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
 
     def _require_admin(request: Request) -> None:
         """Guard destructive endpoints. Bearer token if configured, else
-        loopback-only."""
+        loopback-only — and only when the server itself is BOUND to
+        loopback. A peer-address check alone is spoofable by any
+        co-located reverse proxy (nginx/ingress forwards arrive from
+        127.0.0.1), so on a routable bind the token is mandatory, as
+        promised in settings.py's ADMIN_TOKEN docs."""
         admin_token = (container.settings.admin_token or "").strip()
         if admin_token:
             header = request.headers.get("authorization", "")
@@ -512,8 +522,12 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
                     detail="missing or invalid admin token",
                 )
             return
+        bound_host = (container.settings.web_host or "").strip()
         client_host = request.client.host if request.client else ""
-        if client_host not in ("127.0.0.1", "::1", "localhost"):
+        if (
+            bound_host not in ("127.0.0.1", "::1", "localhost")
+            or client_host not in ("127.0.0.1", "::1")
+        ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=(
@@ -530,6 +544,13 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             await runner.stop()
         await reviewer_poller.stop()
         await devops_poller.stop()
+        # The full worker roster — the kill-switch previously missed these
+        # three, so "killed" bots kept sweeping recovery (re-publishing
+        # plan.ready!), coalescing answers, and polling MM.
+        await coalescer_poller.stop()
+        await recovery_poller.stop()
+        if mm_catchup_poller is not None:
+            await mm_catchup_poller.stop()
         if mm_listener is not None:
             await mm_listener.stop()
         logger.warning("Kill-switch pressed via web")
