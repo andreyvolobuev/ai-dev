@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,6 +91,20 @@ class GitLabVcs(VcsPort):
         # otherwise race on the same working tree (one's checkout / commit
         # / push trampling another).
         self._repo_locks: dict[str, asyncio.Lock] = {}
+        # Separate lock family for ensure_clone: it runs both bare (pre-warm,
+        # Dev-agent) and nested inside a _repo_locks holder, so it can't
+        # reuse those locks without deadlocking.
+        self._clone_locks: dict[str, asyncio.Lock] = {}
+        # Repos whose on-disk checkout already passed the HEAD sanity check
+        # this process — skip re-running `git rev-parse` on every call.
+        self._clone_verified: set[str] = set()
+
+    def _clone_lock(self, repo_key: str) -> asyncio.Lock:
+        lock = self._clone_locks.get(repo_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._clone_locks[repo_key] = lock
+        return lock
 
     def _lock(self, repo_key: str) -> asyncio.Lock:
         lock = self._repo_locks.get(repo_key)
@@ -126,16 +141,49 @@ class GitLabVcs(VcsPort):
                 self._verified_local_path.add(repo_key)
             return str(dest)
 
-        if (dest / ".git").is_dir():
+        # Serialized per repo (separate from _repo_locks, which callers such
+        # as fetch_and_checkout already hold around this call — asyncio.Lock
+        # is not reentrant): the startup pre-warm and a Dev-agent run may
+        # request the same clone concurrently.
+        async with self._clone_lock(repo_key):
+            if (dest / ".git").is_dir():
+                if repo_key in self._clone_verified:
+                    return str(dest)
+                if await self._head_resolvable(dest):
+                    self._clone_verified.add(repo_key)
+                    return str(dest)
+                # A `.git` with no resolvable HEAD is an interrupted clone
+                # (process killed mid-download). Left in place it looks
+                # "ready" forever while the tree stays empty.
+                logger.warning(
+                    "Workspace for {} at {} is a broken half-clone — wiping and re-cloning",
+                    repo_key, dest,
+                )
+                await asyncio.to_thread(shutil.rmtree, dest)
+
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            # Clone into a hidden sibling and rename into place only when
+            # complete, so `dest` either doesn't exist or is a full checkout —
+            # read-only agents polling workspaces/ never see (and never poke
+            # git at) a half-populated tree.
+            tmp = dest.parent / f".{dest.name}.cloning"
+            if tmp.exists():
+                await asyncio.to_thread(shutil.rmtree, tmp)
+            clone_url = self._clone_url(repo_key)
+            logger.info("Cloning {} into {}", clone_url, dest)
+            # Initial clone of a large monorepo can take minutes; give it far
+            # more headroom than the default per-git-op timeout.
+            await self._run_git(None, "clone", clone_url, str(tmp), timeout=1800)
+            tmp.rename(dest)
+            self._clone_verified.add(repo_key)
             return str(dest)
 
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        clone_url = self._clone_url(repo_key)
-        logger.info("Cloning {} into {}", clone_url, dest)
-        # Initial clone of a large monorepo can take minutes; give it far more
-        # headroom than the default per-git-op timeout.
-        await self._run_git(None, "clone", clone_url, str(dest), timeout=1800)
-        return str(dest)
+    async def _head_resolvable(self, path: Path) -> bool:
+        try:
+            await self._run_git(path, "rev-parse", "--verify", "HEAD")
+            return True
+        except VcsError:
+            return False
 
     async def _has_uncommitted_changes_at(self, path: Path) -> bool:
         output = await self._run_git(path, "status", "--porcelain")

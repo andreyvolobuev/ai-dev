@@ -147,6 +147,48 @@ async def test_fetch_and_checkout_resets_working_tree(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_ensure_clone_repairs_interrupted_clone(tmp_path: Path) -> None:
+    """A leftover half-clone (``.git`` exists but HEAD is unresolvable —
+    the process was killed mid-clone) must be wiped and re-cloned, not
+    returned as a "ready" empty checkout the Analyst then reads blind."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _init_remote_repo(upstream)
+    (upstream / "marker.txt").write_text("hello")
+    subprocess.run(["git", "-c", "user.email=o@x", "-c", "user.name=o",
+                    "add", "-A"], cwd=upstream, check=True)
+    subprocess.run(["git", "-c", "user.email=o@x", "-c", "user.name=o",
+                    "commit", "-qm", "add marker"], cwd=upstream, check=True)
+    vcs = _vcs(tmp_path, _cfg("demo", upstream))
+
+    # Simulate an interrupted `git clone`: .git exists, but no HEAD commit
+    # and an empty working tree.
+    broken = tmp_path / "workspaces" / "demo"
+    (broken / ".git").mkdir(parents=True)
+    (broken / ".git" / "config").write_text("[core]\n")
+
+    path = Path(await vcs.ensure_clone("demo"))
+    assert (path / "marker.txt").read_text() == "hello"
+    head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"],
+                          cwd=path, capture_output=True, text=True)
+    assert head.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_clone_leaves_no_workspace_dir(tmp_path: Path) -> None:
+    """A failed clone must not leave a partial workspace behind: while the
+    clone is running (and after it fails) the destination path must not
+    exist, so read-only agents never see a half-populated tree."""
+    vcs = _vcs(tmp_path, _cfg("demo", tmp_path / "nowhere"))
+    with pytest.raises(VcsError):
+        await vcs.ensure_clone("demo")
+    workspace = tmp_path / "workspaces" / "demo"
+    assert not workspace.exists()
+    leftovers = list((tmp_path / "workspaces").glob("*demo*"))
+    assert leftovers == []
+
+
+@pytest.mark.asyncio
 async def test_unknown_repo_is_loud(tmp_path: Path) -> None:
     vcs = _vcs(tmp_path, _cfg("demo", tmp_path / "nowhere"))
     with pytest.raises(VcsError):
