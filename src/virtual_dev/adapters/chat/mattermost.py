@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import ssl
+import threading
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timezone
 from typing import Any, cast
@@ -178,11 +179,16 @@ class MattermostChat(ChatPort):
         self._bot_username = bot_username
         self._logged_in = False
         self._bot_id_cached: str = ""
+        # Public methods run in asyncio.to_thread workers, so first-use
+        # login can race: two threads both see _logged_in=False and both
+        # mutate the shared driver's auth state mid-flight.
+        self._login_lock = threading.Lock()
 
     def _ensure_login(self) -> None:
-        if not self._logged_in:
-            self._driver.login()
-            self._logged_in = True
+        with self._login_lock:
+            if not self._logged_in:
+                self._driver.login()
+                self._logged_in = True
 
     def _bot_user_id(self) -> str:
         """Return the authenticated user's id (our bot token → bot account)."""
