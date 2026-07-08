@@ -104,11 +104,20 @@ class _ServerAuthSSLWebsocket(Websocket):
                 while self._alive:
                     try:
                         await self._start_loop(websocket, event_handler)
-                    except websockets.ConnectionClosedError:
+                    except websockets.ConnectionClosed:
+                        # Base class: covers both the error flavour and a
+                        # graceful ConnectionClosedOK (server restart) —
+                        # the latter used to fall through to the outer
+                        # handler and be miscounted as a connect failure.
                         ws_log.info("MM WS message loop closed; will reconnect")
                         break
                 if not self.options.get("keepalive") or not self._alive:
                     break
+                # Mid-stream drop after a successful auth: pause before
+                # reconnecting. Without this a server that accepts+auths
+                # then immediately drops (LB draining, flaky proxy) spins
+                # a zero-delay reconnect/auth storm.
+                await asyncio.sleep(base_delay)
             except Exception as exc:
                 consecutive_failures += 1
                 # Exponential backoff capped at 5 minutes — prevents the corp
