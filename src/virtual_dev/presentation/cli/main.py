@@ -264,26 +264,28 @@ def dev_task(
         from virtual_dev.domain.ports.message_bus import AgentMessage
         from virtual_dev.application.agents.orchestrator import TOPIC_PLAN_READY
 
-        ok = await _ensure_task_in_db(container, tracker, external_id)
-        if not ok:
-            console.print(
-                f"[red]Task {external_id} not found in DB and Jira is not configured "
-                f"— run `virtual-dev poll-once` first or set Jira credentials.[/red]"
-            )
-            return
+        try:
+            ok = await _ensure_task_in_db(container, tracker, external_id)
+            if not ok:
+                console.print(
+                    f"[red]Task {external_id} not found in DB and Jira is not configured "
+                    f"— run `virtual-dev poll-once` first or set Jira credentials.[/red]"
+                )
+                return
 
-        await inbox.handle(AgentMessage(
-            id="cli",
-            from_agent="cli",
-            to_agent=dev.agent_key,
-            topic=TOPIC_PLAN_READY,
-            payload={
-                "tracker": tracker,
-                "external_id": external_id,
-                "repo_key": repo,
-            },
-        ))
-        await container.dispose()
+            await inbox.handle(AgentMessage(
+                id="cli",
+                from_agent="cli",
+                to_agent=dev.agent_key,
+                topic=TOPIC_PLAN_READY,
+                payload={
+                    "tracker": tracker,
+                    "external_id": external_id,
+                    "repo_key": repo,
+                },
+            ))
+        finally:
+            await container.dispose()
 
     asyncio.run(_run())
     console.print(f"[green]Dev-agent done for {tracker}:{external_id}[/green]")
@@ -335,22 +337,24 @@ def plan_task(
     async def _run() -> None:
         from virtual_dev.domain.ports.message_bus import AgentMessage
 
-        ok = await _ensure_task_in_db(container, tracker, external_id)
-        if not ok:
-            console.print(
-                f"[red]Task {external_id} not found in DB and Jira is not configured "
-                f"— run `virtual-dev poll-once` first or set Jira credentials.[/red]"
-            )
-            return
+        try:
+            ok = await _ensure_task_in_db(container, tracker, external_id)
+            if not ok:
+                console.print(
+                    f"[red]Task {external_id} not found in DB and Jira is not configured "
+                    f"— run `virtual-dev poll-once` first or set Jira credentials.[/red]"
+                )
+                return
 
-        await inbox.handle(AgentMessage(
-            id="cli",
-            from_agent="cli",
-            to_agent="analyst",
-            topic="task.discovered",
-            payload={"tracker": tracker, "external_id": external_id},
-        ))
-        await container.dispose()
+            await inbox.handle(AgentMessage(
+                id="cli",
+                from_agent="cli",
+                to_agent="analyst",
+                topic="task.discovered",
+                payload={"tracker": tracker, "external_id": external_id},
+            ))
+        finally:
+            await container.dispose()
 
     asyncio.run(_run())
     console.print(f"[green]Analyst done for {tracker}:{external_id}[/green]")

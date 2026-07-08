@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     # Tests use sqlite+aiosqlite:///:memory: directly (not via settings).
     db_dsn: str = "postgresql+asyncpg://sd_bots:qwerty123@localhost:5432/ai_dev"
     workspaces_dir: str = "./workspaces"
+    # Sentence-embedding model for MR-history similarity search. Empty →
+    # the fastembed adapter's default (multilingual MiniLM, 384 dim).
+    # NB: changing the model invalidates stored vectors — mr_history
+    # filters by model_name, so old rows just stop matching.
+    embedder_model: str = ""
 
     # --- Bot identity used when committing / opening MRs.
     # Commits are authored with this name + email. GitLab attributes a commit

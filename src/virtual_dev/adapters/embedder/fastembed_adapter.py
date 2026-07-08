@@ -52,7 +52,10 @@ class FastembedEmbedder(EmbedderPort):
         assert self._model is not None
         # TextEmbedding.embed is a generator; materialise it.
         vectors = [list(v) for v in self._model.embed(list(texts))]  # type: ignore[attr-defined]
-        if self._dim == 0 and vectors:
+        if vectors:
+            # Always trust the real vector length: a wrong _DIMENSIONS
+            # entry would otherwise never self-correct, and mr_history
+            # allocates its similarity matrix from `dimension`.
             self._dim = len(vectors[0])
         return vectors
 

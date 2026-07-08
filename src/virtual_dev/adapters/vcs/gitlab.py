@@ -507,13 +507,18 @@ class GitLabVcs(VcsPort):
             raise last_exc
 
     async def current_branch(self, repo_key: str) -> str:
-        path = await self._ensure_local(repo_key)
-        return (await self._run_git(path, "rev-parse", "--abbrev-ref", "HEAD")).strip()
+        # Same per-repo lock as the mutating ops: `git status`/`rev-parse`
+        # refresh the index under .git/index.lock, so an unlocked read
+        # racing a lock-holding commit_all fails with "index.lock exists".
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            return (await self._run_git(path, "rev-parse", "--abbrev-ref", "HEAD")).strip()
 
     async def has_uncommitted_changes(self, repo_key: str) -> bool:
-        path = await self._ensure_local(repo_key)
-        output = await self._run_git(path, "status", "--porcelain")
-        return bool(output.strip())
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            output = await self._run_git(path, "status", "--porcelain")
+            return bool(output.strip())
 
     # --- Remote API ---
 

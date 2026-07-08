@@ -281,7 +281,11 @@ def build_container(config_dir: Path | str = "config") -> Container:
 
     # Embedder is always constructed (the ONNX model is loaded lazily on first
     # embed call, so we pay no price if nobody indexes MRs).
-    embedder: EmbedderPort = FastembedEmbedder()
+    embedder: EmbedderPort = (
+        FastembedEmbedder(model_name=settings.embedder_model)
+        if settings.embedder_model
+        else FastembedEmbedder()
+    )
     mr_history: MrHistoryPort | None = None
     if vcs is not None:
         mr_history = LocalMrHistory(
