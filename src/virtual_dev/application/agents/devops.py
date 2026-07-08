@@ -132,6 +132,13 @@ class DevOpsAgent:
         if attempts >= max_attempts:
             if not row.pipeline_autofix_escalated:
                 escalation_root_id = await self._escalate_via_dm(row, jobs, attempts)
+                if escalation_root_id is None:
+                    # DM suppressed (quiet hours / rate limit / send error).
+                    # Do NOT claim the escalation slot — mirroring the
+                    # Reviewer — or the lead is never told and the MR is
+                    # abandoned with no /restart thread to recover it.
+                    await self._persist_pipeline_status(row.id, pipeline_status)
+                    return
                 stats.escalations_sent += 1
                 await self._persist_pipeline_status(
                     row.id, pipeline_status, mark_escalated=True,
