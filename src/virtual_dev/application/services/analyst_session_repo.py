@@ -13,6 +13,7 @@ session.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -173,19 +174,36 @@ class AnalystSessionRepository:
             row.awaiting_dedupe_key = dedupe_key
             row.last_fragment_at = None
 
-    async def clear_awaiting(self, task_id: int) -> None:
+    async def clear_awaiting(self, task_id: int) -> bool:
+        """Null the awaiting_* fields; returns False (and clears nothing)
+        when an unflushed fragment exists.
+
+        The guard closes a coalescer race: a fragment appended between
+        the coalesce snapshot and this call would otherwise be stranded —
+        with ``last_fragment_at`` nulled, ``find_idle_awaiting`` never
+        picks the task up again and the user's reply is silently lost.
+        Refusing to clear lets the next flush_idle tick coalesce it."""
         async with session_scope(self._session_factory) as session:
+            pending = (await session.execute(
+                select(AnalystConversationFragmentRow.id).where(
+                    AnalystConversationFragmentRow.task_id == task_id,
+                    AnalystConversationFragmentRow.flushed.is_(False),
+                ).limit(1)
+            )).scalar_one_or_none()
+            if pending is not None:
+                return False
             row = (await session.execute(
                 select(TaskRow).where(TaskRow.id == task_id)
             )).scalar_one_or_none()
             if row is None:
-                return
+                return False
             row.awaiting_post_id = None
             row.awaiting_user_id = None
             row.awaiting_username = None
             row.awaiting_channel_id = None
             row.awaiting_dedupe_key = None
             row.last_fragment_at = None
+            return True
 
     async def increment_iteration(
         self,
@@ -341,15 +359,22 @@ class AnalystSessionRepository:
             )
             return list((await session.execute(stmt)).scalars().all())
 
-    async def mark_fragments_flushed(self, task_id: int) -> None:
+    async def mark_fragments_flushed(
+        self, task_id: int, fragment_ids: Sequence[int] | None = None,
+    ) -> None:
+        """Mark fragments flushed. Pass the ids of the coalesced snapshot —
+        flushing "everything unflushed" would swallow a fragment that
+        arrived after the snapshot without it ever reaching the analyst."""
         async with session_scope(self._session_factory) as session:
-            rows = list((await session.execute(
-                select(AnalystConversationFragmentRow)
-                .where(
-                    AnalystConversationFragmentRow.task_id == task_id,
-                    AnalystConversationFragmentRow.flushed.is_(False),
+            stmt = select(AnalystConversationFragmentRow).where(
+                AnalystConversationFragmentRow.task_id == task_id,
+                AnalystConversationFragmentRow.flushed.is_(False),
+            )
+            if fragment_ids is not None:
+                stmt = stmt.where(
+                    AnalystConversationFragmentRow.id.in_(list(fragment_ids))
                 )
-            )).scalars().all())
+            rows = list((await session.execute(stmt)).scalars().all())
             for row in rows:
                 row.flushed = True
 

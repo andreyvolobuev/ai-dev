@@ -303,10 +303,22 @@ class AnalystInbox:
                 "thread_root_id": task_row.awaiting_post_id if replied_in_thread else None,
             },
         )
-        await self._sessions.mark_fragments_flushed(task_row.id)
+        await self._sessions.mark_fragments_flushed(
+            task_row.id, [f.id for f in fragments],
+        )
         if last_post_id:
             await self._communicator.add_reaction(last_post_id, "white_check_mark")
-        await self._sessions.clear_awaiting(task_row.id)
+        if not await self._sessions.clear_awaiting(task_row.id):
+            # A fragment landed after our snapshot (user typed one more
+            # message during the flush). Awaiting stays armed, so the next
+            # flush_idle tick coalesces the late fragment into a second
+            # HUMAN_REPLIED step — run the analyst then, with the full
+            # answer, instead of now with a partial one.
+            logger.info(
+                "AnalystInbox: late fragment for task {} — deferring resume",
+                task_row.id,
+            )
+            return
         refreshed = await self._sessions.get_task(task_row.id)
         if refreshed is not None:
             await self._run_step(refreshed)

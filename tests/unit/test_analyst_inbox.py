@@ -427,3 +427,99 @@ async def test_inbox_routes_fragment_to_correct_task(
     # Non-existent post → None.
     miss = await inbox.find_task_by_thread("post-X")
     assert miss is None
+
+
+@pytest.mark.asyncio
+async def test_late_fragment_during_flush_is_not_lost(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A fragment that lands between the coalesce snapshot and
+    clear_awaiting (user typed one more message during the flush) must
+    NOT be silently dropped: the resume is deferred and the next
+    flush_idle tick delivers BOTH replies to the analyst."""
+    await _seed_task_row(session_factory)
+    chat = _FakeChat()
+    analyst = _ScriptedAnalyst([
+        AnalystRunResult(
+            effects=[AnalystEffect(
+                kind="ask_dispatched",
+                payload={
+                    "asked_post_id": "post-1",
+                    "channel_id": "dm-uid-alice",
+                    "target_user_id": "uid-alice",
+                    "target_username": "alice",
+                    "asked_text": "?",
+                    "dedupe_key": None,
+                },
+            )],
+            cost_usd=0.0, turns=1, stopped_reason="end_turn",
+            plan=None,
+        ),
+        AnalystRunResult(
+            effects=[AnalystEffect(
+                kind="plan_submitted",
+                payload={"summary": "got it", "status": "ready", "target_repo_key": "x"},
+            )],
+            cost_usd=0.0, turns=1, stopped_reason="end_turn",
+            plan=_ready_plan(),
+        ),
+    ])
+    inbox = _make_inbox(session_factory, chat, analyst)
+    await inbox.handle(_msg())
+
+    from sqlalchemy import select
+
+    async with session_factory() as session:
+        task_row = (await session.execute(
+            select(TaskRow).where(TaskRow.external_id == "DM-42")
+        )).scalar_one()
+
+    def _reply(post_id: str, text: str) -> ChatMessage:
+        return ChatMessage(
+            id=post_id, channel_id="dm-uid-alice", author_id="uid-alice",
+            text=text, timestamp=datetime.now(timezone.utc),
+            thread_root_id="post-1", trusted=False,
+        )
+
+    await inbox.append_fragment(task_row.id, _reply("reply-1", "first half"))
+
+    # Simulate the race: the ✅-reaction network call is when the user's
+    # second message arrives.
+    original_add_reaction = chat.add_reaction
+
+    async def _racy_add_reaction(post_id: str, emoji_name: str) -> None:
+        await inbox.append_fragment(task_row.id, _reply("reply-2", "second half"))
+        await original_add_reaction(post_id, emoji_name)
+
+    chat.add_reaction = _racy_add_reaction  # type: ignore[method-assign]
+
+    async with session_scope(session_factory) as session:
+        row = (await session.execute(
+            select(TaskRow).where(TaskRow.id == task_row.id)
+        )).scalar_one()
+        row.last_fragment_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+
+    await inbox.flush_idle()
+
+    # Resume deferred: analyst NOT run yet, awaiting still armed.
+    assert len(analyst.calls) == 1
+    async with session_factory() as session:
+        row = (await session.execute(
+            select(TaskRow).where(TaskRow.id == task_row.id)
+        )).scalar_one()
+        assert row.awaiting_post_id == "post-1"
+
+    # Next tick: window past again → late fragment coalesces, analyst runs.
+    chat.add_reaction = original_add_reaction  # type: ignore[method-assign]
+    async with session_scope(session_factory) as session:
+        row = (await session.execute(
+            select(TaskRow).where(TaskRow.id == task_row.id)
+        )).scalar_one()
+        row.last_fragment_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+
+    await inbox.flush_idle()
+
+    assert len(analyst.calls) == 2
+    replied = [s for s in analyst.calls[1].history if s.kind.value == "human_replied"]
+    texts = " || ".join(s.text or "" for s in replied)
+    assert "first half" in texts and "second half" in texts
