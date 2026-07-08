@@ -32,7 +32,7 @@ def _init_remote_repo(path: Path) -> None:
                    cwd=path, check=True)
 
 
-def _cfg(repo_key: str, upstream: Path) -> AppConfig:
+def _cfg(repo_key: str, upstream: Path | str) -> AppConfig:
     return AppConfig(
         repositories=[RepositoryCfg(
             key=repo_key,
@@ -172,6 +172,33 @@ async def test_ensure_clone_repairs_interrupted_clone(tmp_path: Path) -> None:
     head = subprocess.run(["git", "rev-parse", "--verify", "HEAD"],
                           cwd=path, capture_output=True, text=True)
     assert head.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_ensure_clone_is_shallow_but_sees_all_branches(tmp_path: Path) -> None:
+    """Clones are --depth=1 (agents only need the current tree, and full
+    monorepo history takes many minutes to download) but --no-single-branch,
+    so fetch/checkout of non-default branches keeps working.
+
+    The upstream must be a file:// URL — git silently ignores --depth for
+    plain local-path clones."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _init_remote_repo(upstream)
+    subprocess.run(["git", "-c", "user.email=o@x", "-c", "user.name=o",
+                    "commit", "--allow-empty", "-qm", "second"],
+                   cwd=upstream, check=True)
+    subprocess.run(["git", "branch", "feature"], cwd=upstream, check=True)
+    vcs = _vcs(tmp_path, _cfg("demo", f"file://{upstream}"))
+
+    path = Path(await vcs.ensure_clone("demo"))
+
+    depth = subprocess.run(["git", "rev-list", "--count", "HEAD"],
+                           cwd=path, capture_output=True, text=True, check=True)
+    assert depth.stdout.strip() == "1"
+    feature = subprocess.run(["git", "rev-parse", "--verify", "origin/feature"],
+                             cwd=path, capture_output=True, text=True)
+    assert feature.returncode == 0
 
 
 @pytest.mark.asyncio

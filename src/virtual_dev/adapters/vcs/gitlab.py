@@ -171,9 +171,17 @@ class GitLabVcs(VcsPort):
                 await asyncio.to_thread(shutil.rmtree, tmp)
             clone_url = self._clone_url(repo_key)
             logger.info("Cloning {} into {}", clone_url, dest)
-            # Initial clone of a large monorepo can take minutes; give it far
-            # more headroom than the default per-git-op timeout.
-            await self._run_git(None, "clone", clone_url, str(tmp), timeout=1800)
+            # Shallow: agents only need the current tree, and full monorepo
+            # history takes many minutes to download. --no-single-branch keeps
+            # the default fetch refspec covering ALL branches (plain --depth
+            # implies --single-branch, which would break fetch/checkout of MR
+            # branches). Later fetches stay connected to the shallow boundary,
+            # so merges of origin/<base> into bot branches still find their
+            # merge base.
+            await self._run_git(
+                None, "clone", "--depth", "1", "--no-single-branch",
+                clone_url, str(tmp), timeout=1800,
+            )
             tmp.rename(dest)
             self._clone_verified.add(repo_key)
             return str(dest)
