@@ -32,6 +32,32 @@ from virtual_dev.domain.models.chat import ChatFile, ChatMessage, ChatUser
 from virtual_dev.domain.ports.chat import ChatPort
 
 
+def _build_wss_context(verify: bool | str) -> ssl.SSLContext:
+    """SERVER_AUTH context for the outgoing WSS connection.
+
+    ``verify=True`` loads certifi's CA bundle — the same trust store the
+    driver's HTTP side (requests) verifies against — because the
+    interpreter's default verify paths can be empty (python.org macOS
+    builds without "Install Certificates.command"), which fails every
+    handshake with "unable to get local issuer certificate" while HTTP
+    keeps working. A string is a CA-file path; ``False`` disables
+    verification entirely.
+    """
+    if isinstance(verify, str):
+        return ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cafile=verify)
+    if verify is False:
+        context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+        # Python ≥3.12 enforces: setting verify_mode=CERT_NONE while
+        # check_hostname is True raises ValueError. So clear
+        # check_hostname FIRST, then drop verify_mode.
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+    import certifi
+
+    return ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cafile=certifi.where())
+
+
 class _ServerAuthSSLWebsocket(Websocket):
     """``Websocket`` with the SSL context fixed for client-side WSS.
 
@@ -50,16 +76,7 @@ class _ServerAuthSSLWebsocket(Websocket):
 
         context: ssl.SSLContext | None
         if self.options["scheme"] == "https":
-            verify = self.options.get("verify", True)
-            context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
-            if verify is False:
-                # Python ≥3.12 enforces: setting verify_mode=CERT_NONE while
-                # check_hostname is True raises ValueError. So clear
-                # check_hostname FIRST, then drop verify_mode.
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-            elif isinstance(verify, str):
-                context.load_verify_locations(cafile=verify)
+            context = _build_wss_context(self.options.get("verify", True))
         else:
             context = None
 
