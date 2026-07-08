@@ -227,6 +227,32 @@ async def test_checkout_existing_branch_fetches_outside_single_branch_refspec(
 
 
 @pytest.mark.asyncio
+async def test_ensure_clone_reaps_dead_owners_tmp_dirs(tmp_path: Path) -> None:
+    """Leftover `.<repo>.cloning.<pid>` dirs from crashed/killed instances
+    must be removed; a dir whose pid is alive (concurrent process mid-clone)
+    must be left alone."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _init_remote_repo(upstream)
+    vcs = _vcs(tmp_path, _cfg("demo", upstream))
+
+    workspaces = tmp_path / "workspaces"
+    dead = workspaces / ".demo.cloning.999999999"
+    dead.mkdir(parents=True)
+    (dead / "partial.txt").write_text("junk")
+    legacy = workspaces / ".demo.cloning"  # pre-pid-suffix layout
+    legacy.mkdir()
+    live_pid = workspaces / ".demo.cloning.1"  # pid 1 is always alive
+    live_pid.mkdir()
+
+    await vcs.ensure_clone("demo")
+
+    assert not dead.exists()
+    assert not legacy.exists()
+    assert live_pid.exists()
+
+
+@pytest.mark.asyncio
 async def test_failed_clone_leaves_no_workspace_dir(tmp_path: Path) -> None:
     """A failed clone must not leave a partial workspace behind: while the
     clone is running (and after it fails) the destination path must not

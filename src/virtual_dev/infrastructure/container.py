@@ -123,6 +123,13 @@ class Container:
         logger.info("DB migrated to head success")
 
     async def dispose(self) -> None:
+        # Kill in-flight git subprocesses first: a SIGTERM'd bot otherwise
+        # leaves orphaned clones writing into workspaces/ after exit.
+        terminate = getattr(self.vcs, "terminate_pending_git", None)
+        if terminate is not None:
+            import asyncio
+
+            await asyncio.to_thread(terminate)
         await self.engine.dispose()
 
     # Host-only forms (for the link extractor).

@@ -24,6 +24,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -49,6 +50,16 @@ class GitIdentity:
 
     name: str
     email: str
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 class VcsError(RuntimeError):
@@ -98,6 +109,12 @@ class GitLabVcs(VcsPort):
         # Repos whose on-disk checkout already passed the HEAD sanity check
         # this process — skip re-running `git rev-parse` on every call.
         self._clone_verified: set[str] = set()
+        # Live git subprocesses (guarded by the threading lock — _git_sync
+        # runs in worker threads). terminate_pending_git() kills them on
+        # shutdown: a SIGTERM'd bot otherwise leaves clone/fetch children
+        # running, and an orphaned clone keeps writing into workspaces/.
+        self._procs_guard = threading.Lock()
+        self._live_git_procs: set[subprocess.Popen[str]] = set()
 
     def _clone_lock(self, repo_key: str) -> asyncio.Lock:
         lock = self._clone_locks.get(repo_key)
@@ -165,8 +182,11 @@ class GitLabVcs(VcsPort):
             # Clone into a hidden sibling and rename into place only when
             # complete, so `dest` either doesn't exist or is a full checkout —
             # read-only agents polling workspaces/ never see (and never poke
-            # git at) a half-populated tree.
-            tmp = dest.parent / f".{dest.name}.cloning"
+            # git at) a half-populated tree. The dir name embeds our pid so a
+            # restarted bot never writes into (or deletes) a path an orphaned
+            # clone from a killed instance is still filling.
+            tmp = dest.parent / f".{dest.name}.cloning.{os.getpid()}"
+            await asyncio.to_thread(self._reap_stale_clone_tmps, dest)
             if tmp.exists():
                 await asyncio.to_thread(shutil.rmtree, tmp)
             clone_url = self._clone_url(repo_key)
@@ -192,6 +212,50 @@ class GitLabVcs(VcsPort):
             return True
         except VcsError:
             return False
+
+    def _reap_stale_clone_tmps(self, dest: Path) -> None:
+        """Remove `.<repo>.cloning.<pid>` leftovers whose owner is dead.
+
+        A SIGKILL'd bot can't clean up after itself; without this, every
+        crash leaks a partial clone on disk. Dirs whose pid is still alive
+        are left alone — that's a concurrent process mid-clone.
+        """
+        candidates = list(dest.parent.glob(f".{dest.name}.cloning.*"))
+        # Pre-pid-suffix layout — no owner to check, always stale by now.
+        legacy = dest.parent / f".{dest.name}.cloning"
+        if legacy.exists():
+            candidates.append(legacy)
+        for stale in candidates:
+            pid_part = stale.name.rsplit(".", 1)[-1]
+            if pid_part.isdigit() and _pid_alive(int(pid_part)):
+                continue
+            logger.info("Removing stale clone tmp {}", stale)
+            try:
+                shutil.rmtree(stale)
+            except OSError:
+                # Racing writer (an unowned orphan still filling the dir) —
+                # skip; our own tmp path is different so the clone is
+                # unaffected.
+                logger.warning("Could not remove stale clone tmp {}", stale)
+
+    def terminate_pending_git(self) -> None:
+        """Terminate live git subprocesses; called on bot shutdown.
+
+        SIGTERM lets `git clone` run its own cleanup (it removes the
+        destination it was filling). Anything still alive after the grace
+        period is killed.
+        """
+        with self._procs_guard:
+            procs = [p for p in self._live_git_procs if p.poll() is None]
+        for proc in procs:
+            proc.terminate()
+        for proc in procs:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if procs:
+            logger.info("Terminated {} in-flight git subprocess(es)", len(procs))
 
     async def _has_uncommitted_changes_at(self, path: Path) -> bool:
         output = await self._run_git(path, "status", "--porcelain")
@@ -825,26 +889,36 @@ class GitLabVcs(VcsPort):
             "GIT_TERMINAL_PROMPT": "0",
         }
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=str(cwd) if cwd else None,
-                check=False,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 env=env,
             )
         except FileNotFoundError as exc:
             raise VcsError("git CLI not found on PATH") from exc
+        # Register so terminate_pending_git() can reach in-flight children on
+        # shutdown — otherwise a SIGTERM'd bot leaves clones running orphaned.
+        with self._procs_guard:
+            self._live_git_procs.add(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            proc.communicate()
             raise VcsError(f"git {args[0]} timed out") from exc
+        finally:
+            with self._procs_guard:
+                self._live_git_procs.discard(proc)
 
         if proc.returncode != 0:
-            stderr = (proc.stderr or "").strip()
+            stderr = (stderr or "").strip()
             raise VcsError(
                 f"git {args[0]} failed (exit={proc.returncode}): {stderr or '(no stderr)'}"
             )
-        return proc.stdout or ""
+        return stdout or ""
 
 
 # --- helpers: gitlab object → domain model ---
