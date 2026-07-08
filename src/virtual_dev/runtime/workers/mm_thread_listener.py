@@ -756,10 +756,30 @@ class MmThreadListener:
             return
 
         tokens = (event.text or "").strip().split()
-        if len(tokens) < 2:
-            await self._reply_in_dm(event, "Формат: `/reset DM-1234`")
+        flags = {t.lower() for t in tokens[2:]}
+        if len(tokens) < 2 or tokens[1].startswith("--"):
+            await self._reply_in_dm(
+                event, "Формат: `/reset DM-1234` (опционально `--with-mr` — "
+                       "закрыть открытый MR бота и удалить его ветку в GitLab)",
+            )
             return
         ticket = tokens[1].strip().upper()
+        with_mr = "--with-mr" in flags
+
+        # Snapshot the bot's open MRs BEFORE the wipe — the reset deletes
+        # the projections we need (repo_key/iid/branch) to close them.
+        open_mrs: list[tuple[str, int, str]] = []
+        if with_mr:
+            async with self._session_factory() as session:
+                rows = (await session.execute(
+                    select(MergeRequestRow).where(
+                        MergeRequestRow.task_external_id == ticket,
+                        MergeRequestRow.status.in_(["open", "draft"]),
+                    )
+                )).scalars().all()
+                open_mrs = [
+                    (r.repo_key, r.iid, r.source_branch or "") for r in rows
+                ]
 
         async with session_scope(self._session_factory) as session:
             summary = await reset_ticket_state(
@@ -772,21 +792,60 @@ class MmThreadListener:
             )
             return
 
+        mr_report = ""
+        if with_mr:
+            mr_report = await self._close_reset_mrs(ticket, open_mrs)
+
         logger.info(
             "MmThreadListener: /reset by lead cleared {} row(s) for {} "
-            "(task={}, plans={}, mrs={}, conv={})",
+            "(task={}, plans={}, mrs={}, conv={}, bus={})",
             summary.total, ticket, summary.tasks, summary.plans,
             summary.merge_requests,
             summary.conversation_steps + summary.conversation_fragments,
+            summary.bus_messages,
         )
         await self._reply_in_dm(
             event,
             f"Готово, очистила состояние {ticket}: задача {summary.tasks}, "
             f"план(ы) {summary.plans}, MR {summary.merge_requests}, "
             f"память диалога "
-            f"{summary.conversation_steps + summary.conversation_fragments}. "
+            f"{summary.conversation_steps + summary.conversation_fragments}."
+            f"{mr_report} "
             f"Возьму заново, когда тикет вернётся в «To Do».",
         )
+
+    async def _close_reset_mrs(
+        self, ticket: str, open_mrs: list[tuple[str, int, str]],
+    ) -> str:
+        """Close the bot's open MRs (and delete their branches) in GitLab
+        after a `--with-mr` reset. Best-effort per MR; returns a report
+        fragment for the DM reply."""
+        if self._vcs is None:
+            return " GitLab не подключён — MR/ветки не тронула."
+        if not open_mrs:
+            return " Открытых MR в GitLab не было."
+        closed: list[str] = []
+        failed: list[str] = []
+        for repo_key, iid, branch in open_mrs:
+            try:
+                await self._vcs.close_merge_request(repo_key, iid)
+                if branch:
+                    await self._vcs.delete_remote_branch(repo_key, branch)
+                closed.append(f"{repo_key}!{iid}")
+            except Exception:
+                logger.exception(
+                    "MmThreadListener: /reset --with-mr failed to close {}!{} for {}",
+                    repo_key, iid, ticket,
+                )
+                failed.append(f"{repo_key}!{iid}")
+        parts = []
+        if closed:
+            parts.append(f"Закрыла MR и удалила ветки: {', '.join(closed)}.")
+        if failed:
+            parts.append(
+                f"Не смогла закрыть: {', '.join(failed)} — посмотри руками."
+            )
+        return " " + " ".join(parts)
 
     async def _reply_in_dm(self, event: ChatMessage, text: str) -> None:
         """Reply to a DM command in-thread and mark it processed."""

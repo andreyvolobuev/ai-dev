@@ -15,16 +15,19 @@ deleted.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import Delete, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from virtual_dev.infrastructure.db.models import (
+    AgentMessageRow,
     AnalystConversationFragmentRow,
     AnalystConversationStepRow,
     MergeRequestRow,
     PlanRow,
     TaskRow,
+    TicketResetRow,
 )
 
 
@@ -39,6 +42,7 @@ class ResetSummary:
     conversation_fragments: int = 0
     plans: int = 0
     merge_requests: int = 0
+    bus_messages: int = 0
 
     @property
     def total(self) -> int:
@@ -48,6 +52,7 @@ class ResetSummary:
             + self.conversation_fragments
             + self.plans
             + self.merge_requests
+            + self.bus_messages
         )
 
 
@@ -90,7 +95,40 @@ async def reset_ticket_state(
         TaskRow.external_id == external_id,
     ))
 
-    found = bool(tasks or steps or frags or plans or mrs)
+    # Un-consumed bus messages for this ticket would otherwise fire
+    # later against the wiped state. payload_json is a JSON column, so
+    # match in Python — the unconsumed inbox is small.
+    pending = list((await session.execute(
+        select(AgentMessageRow).where(AgentMessageRow.consumed_at.is_(None))
+    )).scalars().all())
+    bus = 0
+    for msg in pending:
+        payload = msg.payload_json or {}
+        if str(payload.get("external_id") or "") != external_id:
+            continue
+        if str(payload.get("tracker") or tracker) != tracker:
+            continue
+        await session.delete(msg)
+        bus += 1
+
+    # Leave the marker LAST so a run in flight during this reset — which
+    # started before `now` — discards its late writes (save_plan / dev
+    # push+MR check the marker against their own start time).
+    now = datetime.now(timezone.utc)
+    marker = (await session.execute(
+        select(TicketResetRow).where(
+            TicketResetRow.tracker == tracker,
+            TicketResetRow.external_id == external_id,
+        )
+    )).scalar_one_or_none()
+    if marker is None:
+        session.add(TicketResetRow(
+            tracker=tracker, external_id=external_id, reset_at=now,
+        ))
+    else:
+        marker.reset_at = now
+
+    found = bool(tasks or steps or frags or plans or mrs or bus)
     return ResetSummary(
         found=found,
         tasks=tasks,
@@ -98,7 +136,32 @@ async def reset_ticket_state(
         conversation_fragments=frags,
         plans=plans,
         merge_requests=mrs,
+        bus_messages=bus,
     )
+
+
+async def was_reset_since(
+    session: AsyncSession, *, tracker: str, external_id: str, since: datetime,
+) -> bool:
+    """True when a ``/reset`` for the ticket happened after ``since``.
+
+    Long-running agent code calls this with its own start time right
+    before persisting results — a positive answer means the lead wiped
+    the ticket mid-run and the run's output must be discarded."""
+    marker = (await session.execute(
+        select(TicketResetRow).where(
+            TicketResetRow.tracker == tracker,
+            TicketResetRow.external_id == external_id,
+        )
+    )).scalar_one_or_none()
+    if marker is None:
+        return False
+    reset_at = marker.reset_at
+    if reset_at.tzinfo is None:
+        reset_at = reset_at.replace(tzinfo=timezone.utc)
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    return reset_at >= since
 
 
 async def _delete(session: AsyncSession, stmt: Delete) -> int:

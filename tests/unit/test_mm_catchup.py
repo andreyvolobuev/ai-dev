@@ -423,3 +423,63 @@ async def test_catchup_skips_already_processed_reset_command(
     async with session_scope(session_factory) as session:
         remaining = await session.get(TaskRow, task_row.id)
         assert remaining is not None
+
+
+@pytest.mark.asyncio
+async def test_reset_with_mr_closes_gitlab_mr_and_branch(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`/reset DM-1 --with-mr` closes the bot's open MR in GitLab and
+    deletes its remote branch (old artifacts otherwise block the re-run:
+    same branch name → rejected push, same source branch → MR refused)."""
+    from virtual_dev.infrastructure.db import MergeRequestRow
+
+    task_row = await _seed_task_awaiting(session_factory)
+    async with session_scope(session_factory) as session:
+        session.add(MergeRequestRow(
+            repo_key="x", iid=7, external_id="7",
+            task_external_id="DM-1", title="mr", source_branch="ai-dev/dm-1",
+            target_branch="master", author_username="bot", web_url="http://x",
+            status="open",
+        ))
+
+    class _ResetVcs:
+        def __init__(self) -> None:
+            self.closed: list[tuple[str, int]] = []
+            self.deleted_branches: list[tuple[str, str]] = []
+
+        async def close_merge_request(self, repo_key: str, iid: int) -> None:
+            self.closed.append((repo_key, iid))
+
+        async def delete_remote_branch(self, repo_key: str, branch: str) -> None:
+            self.deleted_branches.append((repo_key, branch))
+
+    vcs = _ResetVcs()
+    reset_post = ChatMessage(
+        id="cmd-mr", channel_id="dm-uid-lead", author_id="uid-lead",
+        text="/reset DM-1 --with-mr",
+        timestamp=datetime.now(timezone.utc) - timedelta(hours=1),
+        trusted=False,
+    )
+    chat = _CatchupChat(catchup_posts={"dm-uid-lead": [reset_post]})
+    listener = MmThreadListener(
+        chat=chat,
+        communicator=CommunicatorService(
+            chat, InjectionFilter(), respect_working_hours=False,
+        ),
+        responder=None,                               # type: ignore[arg-type]
+        dev_agents={},
+        session_factory=session_factory,
+        config=_lead_config(),
+        settings=Settings(),
+        vcs=vcs,                                      # type: ignore[arg-type]
+        analyst_inbox=None,
+    )
+
+    await listener.catch_up()
+
+    assert vcs.closed == [("x", 7)]
+    assert vcs.deleted_branches == [("x", "ai-dev/dm-1")]
+    async with session_factory() as session:
+        remaining = await session.get(TaskRow, task_row.id)
+        assert remaining is None

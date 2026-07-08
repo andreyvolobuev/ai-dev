@@ -16,6 +16,7 @@ from virtual_dev.infrastructure.db.models import (
     MrHistoryRow,
     PlanRow,
     TaskRow,
+    TicketResetRow,
 )
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "MrHistoryRow",
     "PlanRow",
     "TaskRow",
+    "TicketResetRow",
     "make_engine",
     "make_session_factory",
     "session_scope",

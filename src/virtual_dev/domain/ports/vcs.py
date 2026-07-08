@@ -137,6 +137,16 @@ class VcsPort(ABC):
     async def merge(self, repo_key: str, iid: int) -> None:
         """Merge an MR. In production rarely used by the bot — humans merge."""
 
+    async def close_merge_request(self, repo_key: str, iid: int) -> None:
+        """Close an open MR without merging. Used by `/reset --with-mr`.
+        Non-abstract so test fakes that never close MRs can ignore it."""
+        raise NotImplementedError
+
+    async def delete_remote_branch(self, repo_key: str, branch: str) -> None:
+        """Delete a branch on the remote. Used by `/reset --with-mr`.
+        Non-abstract so test fakes that never delete branches can ignore it."""
+        raise NotImplementedError
+
     @abstractmethod
     async def get_mr_approvals(self, repo_key: str, iid: int) -> ApprovalInfo:
         """Return the current approval state for an MR."""

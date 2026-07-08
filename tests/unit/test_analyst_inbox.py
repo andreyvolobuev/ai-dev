@@ -523,3 +523,46 @@ async def test_late_fragment_during_flush_is_not_lost(
     replied = [s for s in analyst.calls[1].history if s.kind.value == "human_replied"]
     texts = " || ".join(s.text or "" for s in replied)
     assert "first half" in texts and "second half" in texts
+
+
+@pytest.mark.asyncio
+async def test_run_results_discarded_when_ticket_reset_mid_run(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """/reset landing while the analyst is thinking: the finished run's
+    plan must NOT be saved — save_plan keys on external_id and would
+    resurrect the wiped ticket."""
+    from sqlalchemy import select as sa_select
+
+    from virtual_dev.application.services.ticket_reset import reset_ticket_state
+    from virtual_dev.infrastructure.db import PlanRow
+
+    await _seed_task_row(session_factory)
+    chat = _FakeChat()
+
+    class _ResetMidRunAnalyst(_ScriptedAnalyst):
+        async def run(self, inp: AnalystRunInput) -> AnalystRunResult:
+            async with session_scope(self._sf) as session:
+                await reset_ticket_state(
+                    session, tracker="jira", external_id="DM-42",
+                )
+            return await super().run(inp)
+
+    analyst = _ResetMidRunAnalyst([
+        AnalystRunResult(
+            effects=[AnalystEffect(
+                kind="plan_submitted",
+                payload={"summary": "late", "status": "ready", "target_repo_key": "x"},
+            )],
+            cost_usd=0.0, turns=1, stopped_reason="end_turn",
+            plan=_ready_plan(),
+        ),
+    ])
+    inbox = _make_inbox(session_factory, chat, analyst)
+    await inbox.handle(_msg())
+
+    async with session_factory() as session:
+        plans = (await session.execute(
+            sa_select(PlanRow).where(PlanRow.task_external_id == "DM-42")
+        )).scalars().all()
+    assert plans == []

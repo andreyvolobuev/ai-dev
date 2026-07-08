@@ -361,6 +361,27 @@ class AnalystConversationFragmentRow(Base):
     flushed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
+class TicketResetRow(Base):
+    """Marker left by the team-lead's ``/reset <TICKET>`` command.
+
+    A run (analyst/dev) that STARTED before ``reset_at`` must discard its
+    late writes — without this, a run in flight during the reset would
+    re-create plan/MR rows after the wipe and the ticket would not start
+    from scratch. Upserted on every reset (one row per ticket, latest
+    reset wins); never deleted — writers compare ``reset_at`` against
+    their own start time."""
+
+    __tablename__ = "ticket_resets"
+    __table_args__ = (
+        UniqueConstraint("tracker", "external_id", name="uq_ticket_resets_ticket"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tracker: Mapped[str] = mapped_column(String(32))
+    external_id: Mapped[str] = mapped_column(String(64), index=True)
+    reset_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
 class EventRow(Base):
     """Generic audit/event log (anything interesting that happened)."""
 

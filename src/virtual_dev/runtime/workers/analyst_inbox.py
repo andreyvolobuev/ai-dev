@@ -394,6 +394,7 @@ class AnalystInbox:
         target_repo = self._guess_target_repo(refreshed)
         repo_workspace = self._resolve_repo_workspace(refreshed, target_repo)
 
+        run_started = datetime.now(timezone.utc)
         try:
             run = await self._analyst.run(AnalystRunInput(
                 task_row=refreshed, history=history,
@@ -406,6 +407,17 @@ class AnalystInbox:
                 "AnalystInbox: analyst run crashed for task {}", refreshed.id,
             )
             await self._sessions.clear_started_at(refreshed.id)
+            return
+
+        # A /reset issued while the analyst was working wiped this
+        # ticket's state; persisting the run's step/effects (save_plan
+        # keys on external_id!) would resurrect it. Discard everything —
+        # the ticket restarts from scratch when it re-enters the JQL.
+        if await self._was_reset_since(refreshed, run_started):
+            logger.warning(
+                "AnalystInbox: task {} was /reset mid-run — discarding run results",
+                refreshed.external_id,
+            )
             return
 
         self.stats.runs += 1
@@ -765,6 +777,17 @@ class AnalystInbox:
         ))
 
     # ---------------------------------------------------------------- helpers
+    async def _was_reset_since(self, task_row: TaskRow, since: datetime) -> bool:
+        if self._session_factory is None:
+            return False
+        from virtual_dev.application.services.ticket_reset import was_reset_since
+
+        async with self._session_factory() as session:
+            return await was_reset_since(
+                session, tracker=task_row.tracker,
+                external_id=task_row.external_id, since=since,
+            )
+
     async def _set_internal_status(
         self, task_row_id: int, status: TaskStatus,
     ) -> None:

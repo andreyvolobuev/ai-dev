@@ -32,6 +32,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -41,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.adapters.vcs.gitlab import VcsError, VcsRogueCommitError
 from virtual_dev.application.services import PromptsLoader, ResearcherToolkit, RulesLoader
+from virtual_dev.application.services.ticket_reset import was_reset_since
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus
 from virtual_dev.domain.models.plan import Plan, PlanStatus
@@ -112,6 +114,7 @@ class DevSkipReason(str, Enum):
     NO_READY_PLAN = "no_ready_plan"
     NO_TARGET_REPO = "no_target_repo"
     ALREADY_HAS_MR = "already_has_mr"
+    RESET_DURING_RUN = "reset_during_run"
 
 
 class DevOutcome(str, Enum):
@@ -205,6 +208,7 @@ class DevAgent:
     # --- entry ---
 
     async def handle_plan(self, tracker: str, external_id: str) -> DevResult:
+        run_started = datetime.now(timezone.utc)
         task_row, plan_row = await self._load(tracker, external_id)
         existing_mr_iid = await self._existing_open_mr_iid(external_id)
 
@@ -316,6 +320,23 @@ class DevAgent:
                 submission=captured,
             )
 
+        # Last gate before external side effects: a /reset issued while
+        # the model was working means the lead wants this ticket wiped —
+        # pushing and opening an MR now would resurrect its state.
+        if await self._was_reset_since(tracker, external_id, run_started):
+            logger.warning(
+                "Dev[{}] discarding finished run for {} — ticket was /reset mid-run",
+                self._agent_key, external_id,
+            )
+            return DevResult(
+                outcome=DevOutcome.SKIPPED,
+                skip_reason=DevSkipReason.RESET_DURING_RUN,
+                branch_name=branch_name,
+                cost_usd=result.cost_usd,
+                iterations=result.turns,
+                stopped_reason=result.stopped_reason,
+            )
+
         await self._vcs.push(self._repo_key, branch_name)
 
         mr = await self._vcs.create_merge_request(
@@ -378,6 +399,7 @@ class DevAgent:
         the feedback text, and push a new commit. GitLab auto-updates
         the MR.
         """
+        run_started = datetime.now(timezone.utc)
         task_row, plan_row = await self._load(tracker, external_id)
         if task_row is None or plan_row is None:
             return DevResult(outcome=DevOutcome.FAILED)
@@ -452,6 +474,19 @@ class DevAgent:
                 iterations=result.turns,
                 stopped_reason=result.stopped_reason,
                 submission=captured,
+            )
+        if await self._was_reset_since(tracker, external_id, run_started):
+            logger.warning(
+                "Dev[{}] discarding iteration for {} — ticket was /reset mid-run",
+                self._agent_key, external_id,
+            )
+            return DevResult(
+                outcome=DevOutcome.SKIPPED,
+                skip_reason=DevSkipReason.RESET_DURING_RUN,
+                branch_name=branch_name,
+                cost_usd=result.cost_usd,
+                iterations=result.turns,
+                stopped_reason=result.stopped_reason,
             )
         await self._vcs.push(self._repo_key, branch_name)
         logger.info(
@@ -833,6 +868,14 @@ class DevAgent:
                 pipeline_url=mr.pipeline_url,
             )
             session.add(row)
+
+    async def _was_reset_since(
+        self, tracker: str, external_id: str, since: datetime,
+    ) -> bool:
+        async with self._session_factory() as session:
+            return await was_reset_since(
+                session, tracker=tracker, external_id=external_id, since=since,
+            )
 
     async def _set_internal_status(self, task_row_id: int, status: TaskStatus) -> None:
         async with session_scope(self._session_factory) as session:

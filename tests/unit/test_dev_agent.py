@@ -969,3 +969,53 @@ async def test_iteration_prompt_tells_dev_to_prefer_thread_on_conflict(
     assert "conflict" in lower or "disagree" in lower or "differ" in lower
     # And it must be told NOT to guess — set status=failed instead.
     assert "guess" in lower or "fabricate" in lower or "status=\"failed\"" in lower or "status='failed'" in lower
+
+
+@pytest.mark.asyncio
+async def test_dev_discards_run_when_ticket_reset_mid_run(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """/reset issued while the model works: the finished run must NOT
+    push or open an MR — that would resurrect the wiped ticket."""
+    from virtual_dev.application.agents.dev import DevSkipReason
+    from virtual_dev.application.services.ticket_reset import reset_ticket_state
+
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    class _ResetMidRunDev(_TestDev):
+        async def _call_model(self, request: CodeAgentRequest) -> tuple[dict[str, Any], CodeAgentResult]:
+            async with session_scope(self._session_factory) as session:
+                await reset_ticket_state(session, tracker="jira", external_id="DM-7")
+            return await super()._call_model(request)
+
+    vcs = _FakeVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=8, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    cfg = _cfg()
+    dev = _ResetMidRunDev(
+        agent_key="dev-bellingshausen-backend",
+        repo_key="bellingshausen",
+        specialisation="backend",
+        vcs=vcs,
+        code_agent=code_agent,
+        rules_loader=RulesLoader(Path("/nonexistent_rules")),
+        prompts_loader=PromptsLoader("/no-prompts-dir"),
+        session_factory=session_factory,
+        config=cfg,
+        settings=Settings(),
+        preset_submission={
+            "title": "t", "description": "d", "status": "success", "notes": "",
+        },
+        edits=["app/users.py"],
+    )
+    result = await dev.handle_plan("jira", "DM-7")
+
+    assert result.outcome is DevOutcome.SKIPPED
+    assert result.skip_reason is DevSkipReason.RESET_DURING_RUN
+    kinds = [c[0] for c in vcs.calls]
+    assert "push" not in kinds
+    assert "create_merge_request" not in kinds

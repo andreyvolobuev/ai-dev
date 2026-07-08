@@ -683,6 +683,22 @@ class GitLabVcs(VcsPort):
 
         await asyncio.to_thread(_run)
 
+    async def close_merge_request(self, repo_key: str, iid: int) -> None:
+        def _run() -> None:
+            project = self._client.projects.get(self._project_path(repo_key))
+            mr = project.mergerequests.get(iid)
+            mr.state_event = "close"
+            mr.save()
+
+        await asyncio.to_thread(_run)
+
+    async def delete_remote_branch(self, repo_key: str, branch: str) -> None:
+        def _run() -> None:
+            project = self._client.projects.get(self._project_path(repo_key))
+            project.branches.delete(branch)
+
+        await asyncio.to_thread(_run)
+
     async def get_mr_approvals(self, repo_key: str, iid: int) -> ApprovalInfo:
         def _run() -> ApprovalInfo:
             project = self._client.projects.get(self._project_path(repo_key))
