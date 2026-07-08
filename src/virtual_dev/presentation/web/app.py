@@ -226,7 +226,12 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
     recovery_poller = PollerWorker(
         name="recovery",
         interval_seconds=container.settings.recovery_sweep_interval_seconds,
-        ticks={"sweep": container.recovery_service.sweep_stuck_tasks},
+        ticks={
+            "sweep": container.recovery_service.sweep_stuck_tasks,
+            "sweep_undispatched": (
+                container.recovery_service.sweep_undispatched_tasks
+            ),
+        },
     )
 
     mm_listener: MmThreadListener | None = None

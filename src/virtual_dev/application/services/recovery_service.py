@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents.orchestrator import (
     TOPIC_PLAN_READY,
+    TOPIC_TASK_DISCOVERED,
     dev_agent_key,
 )
 from virtual_dev.domain.models.merge_request import MRStatus
@@ -76,6 +77,54 @@ class RecoveryService:
         if published:
             logger.info(
                 "RecoveryService: re-dispatched {} stuck task(s)", published,
+            )
+        return published
+
+    async def sweep_undispatched_tasks(self) -> int:
+        """Re-publish ``task.discovered`` for tasks stranded in DISCOVERED.
+
+        The orchestrator inserts+commits tasks first and publishes their
+        dispatch messages afterwards, non-transactionally. A publish
+        failure (or a kill between commit and publish) leaves the task in
+        DISCOVERED forever: the next poll's upsert sees it existing and
+        never re-dispatches. The Analyst flips status away from
+        DISCOVERED as soon as it picks the task up, so anything still
+        DISCOVERED after ``stuck_after`` is orphaned, not in-flight.
+        """
+        cutoff = _now() - self._stuck_after
+        cutoff_naive = cutoff.replace(tzinfo=None) if cutoff.tzinfo else cutoff
+        async with self._session_factory() as session:
+            stmt = select(TaskRow).where(
+                TaskRow.internal_status == TaskStatus.DISCOVERED.value,
+                TaskRow.updated_at <= cutoff_naive,
+            )
+            orphaned = list((await session.execute(stmt)).scalars().all())
+        published = 0
+        for task in orphaned:
+            try:
+                await self._bus.publish(AgentMessage(
+                    id=uuid.uuid4().hex,
+                    from_agent="recovery-sweep",
+                    to_agent="analyst",
+                    topic=TOPIC_TASK_DISCOVERED,
+                    payload={
+                        "tracker": task.tracker,
+                        "external_id": task.external_id,
+                    },
+                    correlation_id=(
+                        f"recovery-discover:{task.tracker}:{task.external_id}"
+                    ),
+                ))
+                published += 1
+            except Exception:
+                logger.exception(
+                    "RecoveryService: failed to republish task.discovered for {}",
+                    task.external_id,
+                )
+        if published:
+            logger.info(
+                "RecoveryService: re-dispatched {} orphaned DISCOVERED task(s)",
+                published,
             )
         return published
 

@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from virtual_dev.adapters.message_bus import InMemoryMessageBus
 from virtual_dev.application.agents.orchestrator import (
     TOPIC_PLAN_READY,
+    TOPIC_TASK_DISCOVERED,
     dev_agent_key,
 )
 from virtual_dev.application.services.recovery_service import RecoveryService
@@ -200,3 +201,52 @@ async def test_sweep_skips_tasks_in_other_statuses(
     )
     n = await svc.sweep_stuck_tasks()
     assert n == 0
+
+
+@pytest.mark.asyncio
+async def test_sweep_republishes_task_discovered_for_orphaned_tasks(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A task stranded in DISCOVERED (dispatch lost between the
+    orchestrator's commit and publish) is re-dispatched to the analyst."""
+    await _insert_task(
+        session_factory, external_id="DM-ORPHAN",
+        internal_status=TaskStatus.DISCOVERED.value,
+    )
+    bus = InMemoryMessageBus()
+    await bus.subscribe("analyst")
+
+    svc = RecoveryService(
+        session_factory=session_factory, message_bus=bus,
+        stuck_after=timedelta(minutes=30),
+    )
+    n = await svc.sweep_undispatched_tasks()
+    assert n == 1
+
+    sub = await bus.subscribe("analyst")
+    msg = await sub.__anext__()
+    assert msg.topic == TOPIC_TASK_DISCOVERED
+    assert msg.payload["external_id"] == "DM-ORPHAN"
+
+
+@pytest.mark.asyncio
+async def test_undispatched_sweep_skips_recent_and_non_discovered(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _insert_task(
+        session_factory, external_id="DM-FRESH",
+        internal_status=TaskStatus.DISCOVERED.value,
+        updated_at=datetime.now(timezone.utc),
+    )
+    await _insert_task(
+        session_factory, external_id="DM-PLANNING",
+        internal_status=TaskStatus.PLANNING.value,
+    )
+    bus = InMemoryMessageBus()
+    await bus.subscribe("analyst")
+
+    svc = RecoveryService(
+        session_factory=session_factory, message_bus=bus,
+        stuck_after=timedelta(minutes=30),
+    )
+    assert await svc.sweep_undispatched_tasks() == 0
