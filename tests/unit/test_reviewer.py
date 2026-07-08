@@ -1314,3 +1314,34 @@ async def test_pending_comment_retried_until_reply_delivered(
         )).scalar_one()
         assert row.pending_comment_ids == []
     assert [d for d, _ in posted] == ["disc-A"]
+
+
+@pytest.mark.asyncio
+async def test_new_comments_recovers_when_watermark_comment_deleted(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A reviewer deleted the comment last_seen points at. The cursor
+    scan must not skip everything forever — numeric fallback picks up
+    comments newer than the vanished watermark."""
+    row_id = await _insert_mr(session_factory, last_seen="100")
+    comments = [
+        ReviewComment(id="90", mr_id="42", author_username="alice",
+                      body="old, already answered"),
+        # "100" is gone — alice deleted it and posted "110" instead.
+        ReviewComment(id="110", mr_id="42", author_username="alice",
+                      body="please rename foo after all"),
+    ]
+    vcs = _StubVcs(comments={}, approvals={})
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev",
+    )
+    async with session_scope(session_factory) as session:
+        row = await session.get(MergeRequestRow, row_id)
+        assert row is not None
+        fresh = agent._new_comments(row, comments)
+    assert [c.id for c in fresh] == ["110"]

@@ -781,8 +781,31 @@ class ReviewerAgent:
         * GitLab system notes (``added 1 commit``, ``left review
           comments``, draft/ready toggles, etc. — ``system=True``).
         """
-        filtered: list[ReviewComment] = []
         seen_cutoff = row.last_seen_comment_id or ""
+        if seen_cutoff and all(c.id != seen_cutoff for c in comments):
+            # The watermark comment was deleted (reviewers can delete their
+            # own notes). The cutoff scan below would then skip EVERY
+            # comment forever and keep re-persisting the broken cursor —
+            # the MR silently stops being serviced. GitLab note ids are
+            # integers, so fall back to numeric ordering; if the id isn't
+            # numeric, treat everything as unseen (one-off double answer
+            # beats permanent blindness).
+            logger.warning(
+                "Reviewer: last_seen comment {} vanished from {}!{} — "
+                "recovering via numeric cursor",
+                seen_cutoff, row.repo_key, row.iid,
+            )
+            try:
+                cutoff_n = int(seen_cutoff)
+            except ValueError:
+                cutoff_n = None
+            return [
+                c for c in comments
+                if not c.system
+                and not self._is_bot_author(c.author_username)
+                and (cutoff_n is None or self._id_after(c.id, cutoff_n))
+            ]
+        filtered: list[ReviewComment] = []
         passed_cutoff = not seen_cutoff
         for comment in comments:
             if not passed_cutoff:
@@ -795,6 +818,13 @@ class ReviewerAgent:
                 continue
             filtered.append(comment)
         return filtered
+
+    @staticmethod
+    def _id_after(comment_id: str, cutoff: int) -> bool:
+        try:
+            return int(comment_id) > cutoff
+        except ValueError:
+            return True  # unparsable id — err on the "unseen" side
 
     def _is_bot_author(self, username: str) -> bool:
         if self._bot_username and username.lower() == self._bot_username.lower():
