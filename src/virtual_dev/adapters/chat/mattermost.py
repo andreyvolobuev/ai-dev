@@ -444,6 +444,16 @@ class MattermostChat(ChatPort):
             if not isinstance(raw, dict):
                 return []
             posts = cast(dict[str, dict[str, Any]], raw.get("posts") or {})
+            # MM ``since`` queries are not paginated — the server returns
+            # everything in one response, hard-capped at 1000 posts. At the
+            # cap the oldest part of the gap is silently missing; surface
+            # that instead of pretending the sweep was complete.
+            if len(posts) >= 1000:
+                logger.warning(
+                    "MattermostChat: since-query for {} returned {} posts — "
+                    "server cap reached, oldest posts in the gap may be lost",
+                    channel_id, len(posts),
+                )
             # MM returns ``order`` sorted newest-first; we want chronological
             # for the catch-up dispatch loop, and we filter strictly newer.
             entries: list[tuple[int, dict[str, Any]]] = []
@@ -468,6 +478,7 @@ class MattermostChat(ChatPort):
     async def get_post(self, post_id: str) -> ChatMessage | None:
         def _run() -> ChatMessage | None:
             self._ensure_login()
+            self._bot_user_id()  # warm the id cache so `trusted` is derivable
             try:
                 raw = self._driver.posts.get_post(post_id)
             except Exception:
@@ -571,11 +582,13 @@ class MattermostChat(ChatPort):
         root = raw.get("root_id") or None
         text = str(raw.get("message") or "")
         # Trust is False unless the post is authored by our own bot user.
-        trusted = bool(
-            self._bot_username
-            and raw.get("user_id")
-            and str(raw.get("props", {}).get("username", "")) == self._bot_username
-        )
+        # Compare author ids: ``props.username`` is only present on
+        # webhook/override posts, so matching it against the bot username
+        # left the bot's own regular posts marked untrusted in get_post /
+        # send_* return values. Empty cache (pre-login) → untrusted, the
+        # safe default.
+        author = str(raw.get("user_id") or "")
+        trusted = bool(author and self._bot_id_cached and author == self._bot_id_cached)
         return ChatMessage(
             id=str(raw.get("id") or ""),
             channel_id=str(raw.get("channel_id") or ""),
