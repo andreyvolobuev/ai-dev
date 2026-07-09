@@ -19,6 +19,13 @@ ENV PYTHONUNBUFFERED=1 \
 # isolated. The pod IS that sandbox, so assert it explicitly.
 ENV IS_SANDBOX=1
 
+# git is a hard runtime dependency: the bot clones/fetches/pushes target
+# repos into workspaces/ (GitLabVcs shells out to the git CLI). The base
+# python image doesn't ship it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir uv==0.9.5
 
 WORKDIR ${WORKDIR_PATH}
