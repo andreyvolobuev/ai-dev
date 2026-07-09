@@ -20,6 +20,7 @@ from pathlib import Path
 from virtual_dev.application.services.injection_filter import InjectionFilter
 from virtual_dev.domain.ports.knowledge_base import KnowledgeBasePort
 from virtual_dev.domain.ports.mr_history import MrHistoryPort
+from virtual_dev.domain.ports.vcs import VcsPort
 from virtual_dev.infrastructure.config import AppConfig
 
 
@@ -62,11 +63,14 @@ class ResearcherToolkit:
         knowledge_base: KnowledgeBasePort | None,
         injection_filter: InjectionFilter,
         mr_history: MrHistoryPort | None = None,
+        vcs: VcsPort | None = None,
     ) -> None:
         self._repos = _build_repo_handles(config, workspaces_dir)
         self._kb = knowledge_base
         self._filter = injection_filter
         self._mr_history = mr_history
+        self._vcs = vcs
+        self._config = config
 
     @property
     def repos(self) -> dict[str, RepoHandle]:
@@ -83,3 +87,11 @@ class ResearcherToolkit:
     @property
     def filter(self) -> InjectionFilter:
         return self._filter
+
+    @property
+    def vcs(self) -> VcsPort | None:
+        return self._vcs
+
+    @property
+    def config(self) -> AppConfig:
+        return self._config

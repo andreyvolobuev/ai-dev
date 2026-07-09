@@ -152,3 +152,59 @@ async def test_kb_search_returns_wrapped_results(tmp_path: Path) -> None:
     text = result["content"][0]["text"]
     assert "Pipeline architecture" in text
     assert "<untrusted_content" in text
+
+
+# ---------------------------------------------------------------- read_merge_request
+
+
+class _FakeMrVcs:
+    """Only the two VCS methods read_merge_request needs."""
+
+    async def get_merge_request(self, repo_key: str, iid: int):
+        from virtual_dev.domain.models.merge_request import MergeRequest
+
+        return MergeRequest(
+            id="1", iid=iid, project_id="1",
+            title="Fix GC batch size", description="Makes the GC configurable",
+            source_branch="ai-dev/dm-1", target_branch="master",
+            author_username="virtual-dev", web_url=f"https://gitlab/x/-/merge_requests/{iid}",
+        )
+
+    async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+        return "--- a/gc.py\n+++ b/gc.py\n+batch_size = 100"
+
+
+def _mr_toolkit(local_path: str) -> ResearcherToolkit:
+    return ResearcherToolkit(
+        config=_cfg(local_path),
+        workspaces_dir="/tmp",
+        knowledge_base=None,
+        injection_filter=InjectionFilter(),
+        vcs=_FakeMrVcs(),  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_merge_request_by_url(tmp_path: Path) -> None:
+    from virtual_dev.tools.read_merge_request import run as run_read_mr
+
+    toolkit = _mr_toolkit(str(tmp_path))
+    result = await run_read_mr(toolkit, {
+        "url": "https://example/demo/-/merge_requests/869",
+    })
+    text = result["content"][0]["text"]
+    assert "Fix GC batch size" in text
+    assert "batch_size = 100" in text
+    assert "<untrusted_content" in text
+
+
+@pytest.mark.asyncio
+async def test_read_merge_request_unknown_url_is_actionable(tmp_path: Path) -> None:
+    from virtual_dev.tools.read_merge_request import run as run_read_mr
+
+    toolkit = _mr_toolkit(str(tmp_path))
+    result = await run_read_mr(toolkit, {
+        "url": "https://gitlab.2gis.ru/other-group/unknown/-/merge_requests/1",
+    })
+    text = result["content"][0]["text"]
+    assert "repo_key" in text  # tells the model how to recover

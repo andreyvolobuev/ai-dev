@@ -72,6 +72,16 @@ async def run(settings, args: dict[str, Any]) -> dict[str, Any]:
     if not url:
         return error_text("Empty URL")
 
+    # GitLab MR web pages answer token-less HTML requests with a login
+    # redirect — fetching them yields nothing useful. Route the agent to
+    # the authenticated API tool instead of letting it dead-end here.
+    if "/-/merge_requests/" in url:
+        return error_text(
+            f"{url} is a GitLab merge request — use the `read_merge_request` "
+            f"tool (pass this url) instead of fetch_url; the web page only "
+            f"serves a login redirect."
+        )
+
     try:
         body = await asyncio.to_thread(
             download_url_bytes, url, settings, min_body_bytes=0,

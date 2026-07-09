@@ -130,12 +130,12 @@ def auth_headers_for(url: str, settings: Any) -> dict[str, str]:
 def is_trusted_internal_host(url: str, settings: Any) -> bool:
     """True if ``url`` is on a configured internal service.
 
-    Corporate VPN hosts (Confluence / Jira / Mattermost) routinely
-    resolve to RFC1918 — refusing them on private-IP grounds would
-    block the very services the operator wired creds for. Untrusted
-    hosts still go through the standard SSRF guard.
+    Corporate VPN hosts (Confluence / Jira / Mattermost / GitLab)
+    routinely resolve to RFC1918 — refusing them on private-IP grounds
+    would block the very services the operator wired creds for.
+    Untrusted hosts still go through the standard SSRF guard.
     """
-    for url_attr in ("confluence_url", "jira_url", "mattermost_url"):
+    for url_attr in ("confluence_url", "jira_url", "mattermost_url", "gitlab_url"):
         configured = (getattr(settings, url_attr, "") or "").strip()
         if configured and url_is_on_host(url, configured):
             return True

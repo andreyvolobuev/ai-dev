@@ -311,6 +311,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         knowledge_base=knowledge_base,
         injection_filter=injection_filter,
         mr_history=mr_history,
+        vcs=vcs,
     )
     communicator_cfg = config.agents.agents.get("communicator")
     communicator_rate = (
