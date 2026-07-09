@@ -57,6 +57,10 @@ def _naive(dt: datetime) -> datetime:
     return dt.replace(tzinfo=None) if dt.tzinfo else dt
 
 
+def _aware_utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 class SqlAlchemyMessageBus(MessageBusPort):
     """Durable message bus backed by SQLAlchemy (PostgreSQL or SQLite)."""
 
@@ -74,6 +78,15 @@ class SqlAlchemyMessageBus(MessageBusPort):
         self._poll_interval = poll_interval_seconds
         self._lease = timedelta(seconds=lease_seconds)
         self._now = clock or _utcnow
+        # Postgres columns are timestamptz and MUST see timezone-aware
+        # values end to end: asyncpg localises a NAIVE bind using the
+        # client machine's timezone (silent mis-compares off UTC hosts),
+        # and the ORM evaluator can't compare a naive criteria value with
+        # the aware attributes it loads (prod TypeError on lease reclaim).
+        # SQLite is the mirror image — its DateTime stores naive, so
+        # aware values break there. One dialect-aware converter for every
+        # datetime that touches the bus tables.
+        self._db_ts = _aware_utc if dialect_name == "postgresql" else _naive
         # In-memory snapshot of subscribers registered in *this* process,
         # populated synchronously by ``subscribe()`` so a broadcast that
         # follows subscribe() in the same task hits the right consumers
@@ -97,7 +110,7 @@ class SqlAlchemyMessageBus(MessageBusPort):
         else:
             targets = [message.to_agent]
 
-        created_at = _naive(message.created_at or self._now())
+        created_at = self._db_ts(message.created_at or self._now())
         async with self._session_factory() as session:
             for target in targets:
                 row = AgentMessageRow(
@@ -141,7 +154,7 @@ class SqlAlchemyMessageBus(MessageBusPort):
             await session.execute(
                 update(AgentMessageRow)
                 .where(AgentMessageRow.id == message._row_id)
-                .values(consumed_at=_naive(self._now()))
+                .values(consumed_at=self._db_ts(self._now()))
             )
             await session.commit()
 
@@ -156,7 +169,7 @@ class SqlAlchemyMessageBus(MessageBusPort):
     async def _register_subscriber(self, agent_key: str) -> None:
         """Idempotent INSERT OR REPLACE — refreshes ``last_seen_at``."""
         try:
-            now = _naive(self._now())
+            now = self._db_ts(self._now())
             async with self._session_factory() as session:
                 insert_fn = self._dialect_insert()
                 stmt = insert_fn(BusSubscriptionRow).values(
@@ -190,7 +203,7 @@ class SqlAlchemyMessageBus(MessageBusPort):
             return msg
 
     async def _claim_within(self, session: AsyncSession, agent_key: str) -> AgentMessage | None:
-        now = _naive(self._now())
+        now = self._db_ts(self._now())
         # "Free" = not consumed and either never claimed or lease expired.
         free = AgentMessageRow.consumed_at.is_(None) & or_(
             AgentMessageRow.claimed_until.is_(None),
@@ -219,6 +232,10 @@ class SqlAlchemyMessageBus(MessageBusPort):
                 ),
             )
             .values(claimed_until=now + self._lease)
+            # No Python-side session synchronisation: the evaluator would
+            # compare the loaded row's (dialect-dependent) attribute with
+            # our criteria value, and we never reuse the stale object.
+            .execution_options(synchronize_session=False)
         )
         if result.rowcount == 0:
             return None
