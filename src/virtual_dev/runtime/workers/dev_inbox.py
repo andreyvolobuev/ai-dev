@@ -18,6 +18,7 @@ from loguru import logger
 
 from virtual_dev.application.agents import DevAgent, DevOutcome
 from virtual_dev.application.agents.dev import CodeAgentPermanentError
+from virtual_dev.application.services import CommunicatorService
 from virtual_dev.domain.ports.message_bus import AgentMessage
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 from virtual_dev.infrastructure.config import AppConfig
@@ -53,11 +54,32 @@ class DevInbox:
         task_tracker: TaskTrackerPort | None,
         config: AppConfig,
         post_to_tracker: bool = True,
+        communicator: CommunicatorService | None = None,
     ) -> None:
         self._dev = dev_agent
         self._task_tracker = task_tracker
         self._config = config
         self._post_to_tracker = post_to_tracker
+        self._communicator = communicator
+
+    async def _dm_lead(self, text: str) -> None:
+        """Terminal failures must reach the lead in MM, not just a Jira
+        comment nobody watches. Best-effort — never fails the caller."""
+        if self._communicator is None:
+            return
+        handle = (self._config.agents.escalation.mattermost_user or "").strip()
+        if not handle or handle == "your.name":
+            logger.warning(
+                "DevInbox: escalation.mattermost_user is not set — "
+                "cannot DM the lead about a terminal failure",
+            )
+            return
+        try:
+            user_id = await self._communicator.resolve_user_id(username=handle)
+            if user_id:
+                await self._communicator.send_dm(user_id, text)
+        except Exception:
+            logger.exception("DevInbox: lead escalation DM failed")
 
     async def handle(self, message: AgentMessage) -> None:
         tracker = str(message.payload.get("tracker") or "")
@@ -75,6 +97,11 @@ class DevInbox:
             # can act (typically: clean a dirty local_path checkout).
             logger.warning(
                 "DevInbox: permanent failure for {}: {}", external_id, exc,
+            )
+            await self._dm_lead(
+                f"Не смогла доделать {external_id}: {exc}\n\n"
+                f"Само не починится — нужно вмешательство "
+                f"(подробности в комментарии к тикету).",
             )
             if self._post_to_tracker and self._task_tracker is not None:
                 try:

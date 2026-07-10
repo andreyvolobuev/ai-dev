@@ -411,6 +411,8 @@ def build_container(config_dir: Path | str = "config") -> Container:
     recovery_service = RecoveryService(
         session_factory=session_factory,
         message_bus=message_bus,
+        communicator=communicator,
+        escalation_user=config.agents.escalation.mattermost_user,
     )
 
     return Container(

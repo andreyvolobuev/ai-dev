@@ -33,6 +33,7 @@ from virtual_dev.application.agents.orchestrator import (
 from virtual_dev.domain.models.merge_request import MRStatus
 from virtual_dev.domain.models.plan import PlanStatus
 from virtual_dev.domain.models.task import TaskStatus
+from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
 from virtual_dev.infrastructure.db import (
     MergeRequestRow,
@@ -58,12 +59,30 @@ class RecoveryService:
         stuck_after: timedelta = _DEFAULT_STUCK_AFTER,
         dev_specialisation: str = "backend",
         max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+        communicator: CommunicatorService | None = None,
+        escalation_user: str = "",
     ) -> None:
         self._session_factory = session_factory
         self._bus = message_bus
         self._stuck_after = stuck_after
         self._dev_specialisation = dev_specialisation
         self._max_attempts = max_attempts
+        self._communicator = communicator
+        self._escalation_user = escalation_user.strip()
+
+    async def _dm_lead(self, text: str) -> None:
+        """Cap-exceeded is a terminal state a human must see in MM,
+        not just in the logs. Best-effort."""
+        if self._communicator is None or not self._escalation_user:
+            return
+        try:
+            user_id = await self._communicator.resolve_user_id(
+                username=self._escalation_user,
+            )
+            if user_id:
+                await self._communicator.send_dm(user_id, text)
+        except Exception:
+            logger.exception("RecoveryService: lead escalation DM failed")
 
     async def _claim_attempt(self, task_id: int) -> bool:
         """Increment the task's recovery counter; False when the cap is
@@ -75,11 +94,18 @@ class RecoveryService:
                 return False
             if task.recovery_attempts >= self._max_attempts:
                 task.internal_status = TaskStatus.FAILED.value
+                external_id = task.external_id
                 await session.commit()
                 logger.error(
                     "RecoveryService: task {} exceeded {} recovery attempts — "
                     "flipping to FAILED; operator action needed",
-                    task.external_id, self._max_attempts,
+                    external_id, self._max_attempts,
+                )
+                await self._dm_lead(
+                    f"Не смогла доделать {external_id}: {self._max_attempts} "
+                    f"повторных запуска подряд упали, останавливаюсь. "
+                    f"Нужно посмотреть логи/тикет и перезапустить "
+                    f"(например через /reset).",
                 )
                 return False
             task.recovery_attempts += 1

@@ -159,3 +159,46 @@ async def test_dev_inbox_swallows_unrelated_exceptions_for_ack() -> None:
     # Unrelated exceptions don't get a tracker comment — the existing
     # contract (avoid spamming Jira with low-signal stack traces).
     assert tracker.comments == []
+
+
+class _RecordingCommunicator:
+    """Only the two methods the lead-escalation path touches."""
+
+    def __init__(self) -> None:
+        self.dms: list[tuple[str, str]] = []
+
+    async def resolve_user_id(self, *, username: str | None = None,
+                              email: str | None = None) -> str | None:
+        return f"uid-{username}"
+
+    async def send_dm(self, user_id: str, text: str, **kwargs):  # noqa: ANN003
+        self.dms.append((user_id, text))
+
+
+def _cfg_with_lead() -> AppConfig:
+    cfg = _cfg()
+    cfg.agents.escalation.mattermost_user = "lead"
+    return cfg
+
+
+@pytest.mark.asyncio
+async def test_dev_inbox_dms_lead_on_permanent_error() -> None:
+    """A terminal failure must reach the lead in MM, not only a Jira
+    comment nobody watches."""
+    tracker = _FakeTracker()
+    communicator = _RecordingCommunicator()
+    dev = _FakeDev(raises=CodeAgentPermanentError("git fetch failed: 403"))
+    inbox = DevInbox(
+        dev_agent=dev,  # type: ignore[arg-type]
+        task_tracker=tracker,
+        config=_cfg_with_lead(),
+        communicator=communicator,  # type: ignore[arg-type]
+    )
+    await inbox.handle(_msg())
+
+    assert len(communicator.dms) == 1
+    user_id, text = communicator.dms[0]
+    assert user_id == "uid-lead"
+    assert "DM-7" in text
+    # Jira comment still posted alongside the DM.
+    assert len(tracker.comments) == 1

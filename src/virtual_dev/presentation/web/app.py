@@ -195,6 +195,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             dev_agent=dev,
             task_tracker=container.task_tracker,
             config=container.config,
+            communicator=container.communicator,
         )
         runner = AgentRunner(
             agent_key=dev.agent_key,

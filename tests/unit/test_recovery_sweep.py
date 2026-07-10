@@ -288,3 +288,40 @@ async def test_sweep_stops_after_max_attempts_and_fails_the_task(
         row = await session.get(TaskRow, task_id)
         row.updated_at = _OLD
     assert await svc.sweep_stuck_tasks() == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_cap_dms_the_lead(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    class _RecordingCommunicator:
+        def __init__(self) -> None:
+            self.dms: list[tuple[str, str]] = []
+
+        async def resolve_user_id(self, *, username=None, email=None):
+            return f"uid-{username}"
+
+        async def send_dm(self, user_id, text, **kwargs):
+            self.dms.append((user_id, text))
+
+    task_id = await _insert_task(session_factory, external_id="DM-CAP")
+    await _insert_plan(session_factory, external_id="DM-CAP")
+    bus = InMemoryMessageBus()
+    await bus.subscribe(dev_agent_key("bellingshausen", "backend"))
+    communicator = _RecordingCommunicator()
+
+    svc = RecoveryService(
+        session_factory=session_factory, message_bus=bus,
+        stuck_after=timedelta(minutes=30), max_attempts=1,
+        communicator=communicator,  # type: ignore[arg-type]
+        escalation_user="lead",
+    )
+    for _ in range(2):
+        async with session_scope(session_factory) as session:
+            row = await session.get(TaskRow, task_id)
+            row.updated_at = _OLD
+        await svc.sweep_stuck_tasks()
+
+    assert len(communicator.dms) == 1
+    assert communicator.dms[0][0] == "uid-lead"
+    assert "DM-CAP" in communicator.dms[0][1]
