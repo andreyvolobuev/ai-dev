@@ -42,6 +42,11 @@ from virtual_dev.infrastructure.db import (
 
 
 _DEFAULT_STUCK_AFTER = timedelta(minutes=30)
+# Re-dispatch ceiling. A task whose runs keep dying the same way (every
+# push rejected, repo gone, …) must NOT be re-run forever: each sweep
+# costs a full model cycle. Past the cap the task is flipped to FAILED
+# so a human decides.
+_DEFAULT_MAX_ATTEMPTS = 3
 
 
 class RecoveryService:
@@ -52,11 +57,34 @@ class RecoveryService:
         message_bus: MessageBusPort,
         stuck_after: timedelta = _DEFAULT_STUCK_AFTER,
         dev_specialisation: str = "backend",
+        max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
     ) -> None:
         self._session_factory = session_factory
         self._bus = message_bus
         self._stuck_after = stuck_after
         self._dev_specialisation = dev_specialisation
+        self._max_attempts = max_attempts
+
+    async def _claim_attempt(self, task_id: int) -> bool:
+        """Increment the task's recovery counter; False when the cap is
+        exhausted (the task is flipped to FAILED so sweeps stop touching
+        it and a human takes over)."""
+        async with self._session_factory() as session:
+            task = await session.get(TaskRow, task_id)
+            if task is None:
+                return False
+            if task.recovery_attempts >= self._max_attempts:
+                task.internal_status = TaskStatus.FAILED.value
+                await session.commit()
+                logger.error(
+                    "RecoveryService: task {} exceeded {} recovery attempts — "
+                    "flipping to FAILED; operator action needed",
+                    task.external_id, self._max_attempts,
+                )
+                return False
+            task.recovery_attempts += 1
+            await session.commit()
+            return True
 
     async def sweep_stuck_tasks(self) -> int:
         """Re-publish plan.ready for stuck CODING tasks. Returns the
@@ -102,6 +130,8 @@ class RecoveryService:
         published = 0
         for task in orphaned:
             try:
+                if not await self._claim_attempt(task.id):
+                    continue
                 await self._bus.publish(AgentMessage(
                     id=uuid.uuid4().hex,
                     from_agent="recovery-sweep",
@@ -153,6 +183,8 @@ class RecoveryService:
                 return False
             if await self._has_open_mr(session, task.external_id):
                 return False
+        if not await self._claim_attempt(task.id):
+            return False
         target_repo_key = plan.target_repo_key or task.target_repo_key
         if not target_repo_key:
             return False

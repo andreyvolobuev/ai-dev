@@ -250,3 +250,41 @@ async def test_undispatched_sweep_skips_recent_and_non_discovered(
         stuck_after=timedelta(minutes=30),
     )
     assert await svc.sweep_undispatched_tasks() == 0
+
+
+@pytest.mark.asyncio
+async def test_sweep_stops_after_max_attempts_and_fails_the_task(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A task whose runs keep dying the same way must not be re-dispatched
+    forever (each sweep burns a full model cycle — real prod incident:
+    rejected pushes looped for hours). Past the cap → FAILED."""
+    task_id = await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    bus = InMemoryMessageBus()
+    await bus.subscribe(dev_agent_key("bellingshausen", "backend"))
+
+    svc = RecoveryService(
+        session_factory=session_factory, message_bus=bus,
+        stuck_after=timedelta(minutes=30), max_attempts=3,
+    )
+
+    for expected in (1, 1, 1, 0):
+        # _claim_attempt bumps updated_at; rewind so the task stays "stuck".
+        async with session_scope(session_factory) as session:
+            row = await session.get(TaskRow, task_id)
+            assert row is not None
+            row.updated_at = _OLD
+        assert await svc.sweep_stuck_tasks() == expected
+
+    async with session_scope(session_factory) as session:
+        row = await session.get(TaskRow, task_id)
+        assert row is not None
+        assert row.internal_status == TaskStatus.FAILED.value
+        assert row.recovery_attempts == 3
+
+    # FAILED task is out of the sweep entirely on later ticks.
+    async with session_scope(session_factory) as session:
+        row = await session.get(TaskRow, task_id)
+        row.updated_at = _OLD
+    assert await svc.sweep_stuck_tasks() == 0

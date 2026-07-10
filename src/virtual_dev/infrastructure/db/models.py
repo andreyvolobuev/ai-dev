@@ -63,6 +63,10 @@ class TaskRow(Base):
 
     # Our view of the task
     internal_status: Mapped[str] = mapped_column(String(32), default="discovered", index=True)
+    # How many times the recovery sweep re-dispatched this task. Capped —
+    # a run that keeps failing the same way (e.g. every push rejected)
+    # otherwise loops forever, burning a full model cycle per sweep.
+    recovery_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     target_repo_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     dor_satisfied: Mapped[bool] = mapped_column(default=False)
 
