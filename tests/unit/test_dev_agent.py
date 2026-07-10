@@ -1048,3 +1048,43 @@ async def test_fresh_plan_run_force_pushes_over_stale_branch(
     pushes = [args for kind, args in vcs.calls if kind == "push"]
     assert len(pushes) == 1
     assert pushes[0][2] is True  # force
+
+
+@pytest.mark.asyncio
+async def test_transient_fetch_error_does_not_fail_the_task(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """A GitLab 503 during branch prep is a network hiccup, not a config
+    problem: the task must NOT flip to FAILED (prod incident: one 503
+    permanently failed a healthy ticket). Infra error → recovery retries."""
+    from virtual_dev.application.agents.dev import CodeAgentInfraError
+
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    class _FlakyGitlabVcs(_FakeVcs):
+        async def create_branch(self, repo_key: str, branch: str, base: str) -> None:
+            raise VcsError(
+                "git fetch failed (exit=128): fatal: unable to access "
+                "'https://gitlab/x.git/': The requested URL returned error: 503"
+            )
+
+    vcs = _FlakyGitlabVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=1, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent,
+        preset_submission=None,
+    )
+    with pytest.raises(CodeAgentInfraError):
+        await dev.handle_plan("jira", "DM-7")
+
+    from sqlalchemy import select
+    async with session_factory() as session:
+        row = (await session.execute(
+            select(TaskRow).where(TaskRow.external_id == "DM-7")
+        )).scalar_one()
+    assert row.internal_status != TaskStatus.FAILED.value

@@ -52,6 +52,28 @@ class GitIdentity:
     email: str
 
 
+# Network/infra hiccups that a retry (or a later re-dispatch) can fix —
+# as opposed to true configuration errors (dirty tree, missing repo,
+# no permission). "returned error: 5xx" is curl's phrasing surfaced by
+# git ("The requested URL returned error: 503"), which the plain
+# "HTTP 5" marker does not match.
+_TRANSIENT_GIT_MARKERS = (
+    "Internal API unreachable",
+    "could not resolve host",
+    "Could not resolve host",
+    "Connection reset",
+    "Connection timed out",
+    "early EOF",
+    "HTTP 5",
+    "returned error: 5",
+    "returned error: 429",
+)
+
+
+def is_transient_git_error(message: str) -> bool:
+    return any(marker in message for marker in _TRANSIENT_GIT_MARKERS)
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -491,15 +513,7 @@ class GitLabVcs(VcsPort):
                     return
                 except VcsError as exc:
                     message = str(exc)
-                    transient = any(
-                        marker in message for marker in (
-                            "Internal API unreachable",
-                            "could not resolve host",
-                            "Connection reset",
-                            "early EOF",
-                            "HTTP 5",
-                        )
-                    )
+                    transient = is_transient_git_error(message)
                     if not transient or attempt == 3:
                         raise
                     last_exc = exc

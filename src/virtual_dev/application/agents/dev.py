@@ -40,7 +40,11 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from virtual_dev.adapters.vcs.gitlab import VcsError, VcsRogueCommitError
+from virtual_dev.adapters.vcs.gitlab import (
+    VcsError,
+    VcsRogueCommitError,
+    is_transient_git_error,
+)
 from virtual_dev.application.services import PromptsLoader, ResearcherToolkit, RulesLoader
 from virtual_dev.application.services.ticket_reset import was_reset_since
 from virtual_dev.domain.models.chat import ChatMessage
@@ -223,17 +227,25 @@ class DevAgent:
         plan = row_to_plan(plan_row)
 
         # Prepare workspace — clone + fresh task branch off default.
-        # VcsError here is permanent: dirty working tree, non-git
-        # local_path, missing repo config. Bus retries can't fix any of
-        # these — flip the task to FAILED so the recovery sweep skips
-        # it, then raise CodeAgentPermanentError so the inbox surfaces
-        # a tracker comment for the human to act on.
+        # A VcsError here is USUALLY permanent (dirty working tree,
+        # non-git local_path, missing repo config): flip to FAILED and
+        # let the inbox surface a tracker comment. But a network hiccup
+        # (GitLab 503 on fetch — real prod case) is transient: leave the
+        # task in place and raise infra so the capped recovery sweep
+        # retries it instead of permanently failing a healthy ticket.
         try:
             workspace_path = await self._vcs.ensure_clone(self._repo_key)
             branch_name = self._branch_name(task_row)
             base_branch = self._default_branch()
             await self._vcs.create_branch(self._repo_key, branch_name, base_branch)
         except VcsError as exc:
+            if is_transient_git_error(str(exc)):
+                logger.warning(
+                    "Dev[{}] transient VCS failure for {} (will be retried "
+                    "by recovery): {}",
+                    self._agent_key, external_id, exc,
+                )
+                raise CodeAgentInfraError(str(exc)) from exc
             logger.warning(
                 "Dev[{}] permanent VCS failure for {}: {}",
                 self._agent_key, external_id, exc,
