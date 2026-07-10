@@ -76,8 +76,8 @@ class _FakeVcs(VcsPort):
         self._dirty_files.clear()
         return "abc123"
 
-    async def push(self, repo_key: str, branch: str) -> None:
-        self.calls.append(("push", (repo_key, branch)))
+    async def push(self, repo_key: str, branch: str, *, force: bool = False) -> None:
+        self.calls.append(("push", (repo_key, branch, force)))
 
     async def current_branch(self, repo_key: str) -> str:
         return self._branch
@@ -1019,3 +1019,32 @@ async def test_dev_discards_run_when_ticket_reset_mid_run(
     kinds = [c[0] for c in vcs.calls]
     assert "push" not in kinds
     assert "create_merge_request" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_fresh_plan_run_force_pushes_over_stale_branch(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """handle_plan rebuilds the bot branch from the default branch, so its
+    push must be forced: a leftover remote branch from a run that died
+    between push and MR creation otherwise rejects every retry forever."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    vcs = _FakeVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=8, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent,
+        preset_submission={"title": "t", "description": "d", "status": "success"},
+        edits=["app/users.py"],
+    )
+    result = await dev.handle_plan("jira", "DM-7")
+
+    assert result.outcome is DevOutcome.MR_OPENED
+    pushes = [args for kind, args in vcs.calls if kind == "push"]
+    assert len(pushes) == 1
+    assert pushes[0][2] is True  # force

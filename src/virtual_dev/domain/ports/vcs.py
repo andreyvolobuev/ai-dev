@@ -51,8 +51,13 @@ class VcsPort(ABC):
         """
 
     @abstractmethod
-    async def push(self, repo_key: str, branch: str) -> None:
-        """Push ``branch`` to origin."""
+    async def push(self, repo_key: str, branch: str, *, force: bool = False) -> None:
+        """Push ``branch`` to origin.
+
+        ``force=True`` overwrites the remote branch — used by fresh plan
+        runs, which rebuild the bot's own branch from the default branch;
+        a leftover remote branch from a dead earlier run would otherwise
+        reject every subsequent push as non-fast-forward."""
 
     @abstractmethod
     async def current_branch(self, repo_key: str) -> str:

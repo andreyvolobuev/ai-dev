@@ -436,7 +436,7 @@ class GitLabVcs(VcsPort):
             f"{self._project_path(repo_key)}.git"
         )
 
-    async def push(self, repo_key: str, branch: str) -> None:
+    async def push(self, repo_key: str, branch: str, *, force: bool = False) -> None:
         """Push with limited retry.
 
         GitLab occasionally answers ``Internal API unreachable`` or
@@ -456,13 +456,19 @@ class GitLabVcs(VcsPort):
             # using a tmp dir as "upstream") fall back to ``origin`` —
             # there's no PAT to embed and no GitLab to attribute to.
             repo_url = self._repo(repo_key).url
+            # --force (not --force-with-lease: we don't track the remote
+            # tip across process restarts, and the branch is bot-owned) —
+            # a fresh plan run intentionally rebuilds ai-dev/<ticket> from
+            # the default branch, so a stale remote from a dead run must
+            # be overwritten, not merged.
+            force_args: tuple[str, ...] = ("--force",) if force else ()
             if repo_url.startswith(("git@", "https://", "http://")):
                 push_target = self._https_push_url_for(repo_key)
                 push_args: tuple[str, ...] = (
-                    "push", push_target, f"{branch}:{branch}",
+                    "push", *force_args, push_target, f"{branch}:{branch}",
                 )
             else:
-                push_args = ("push", "--set-upstream", "origin", branch)
+                push_args = ("push", *force_args, "--set-upstream", "origin", branch)
             last_exc: VcsError | None = None
             for attempt in range(1, 4):
                 try:

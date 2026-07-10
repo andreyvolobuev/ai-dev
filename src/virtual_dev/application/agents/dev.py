@@ -337,7 +337,13 @@ class DevAgent:
                 stopped_reason=result.stopped_reason,
             )
 
-        await self._vcs.push(self._repo_key, branch_name)
+        # force: this run rebuilt the branch from the default branch; a
+        # remote leftover from a previous run that died between push and
+        # MR creation would reject a plain push as non-fast-forward and
+        # loop the whole task forever (real prod incident: a GitLab 503
+        # killed run #1 after its push, every recovery re-run then burned
+        # a full model cycle just to be rejected).
+        await self._vcs.push(self._repo_key, branch_name, force=True)
 
         mr = await self._vcs.create_merge_request(
             repo_key=self._repo_key,
