@@ -1088,3 +1088,80 @@ async def test_transient_fetch_error_does_not_fail_the_task(
             select(TaskRow).where(TaskRow.external_id == "DM-7")
         )).scalar_one()
     assert row.internal_status != TaskStatus.FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_push_permission_error_fails_task_on_first_attempt(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """A 403 on push (bot lacks the Developer role) is permanent: fail
+    the task immediately — permanent failures DM the lead via the inbox —
+    instead of burning two more model cycles rediscovering the same 403."""
+    from virtual_dev.application.agents.dev import CodeAgentPermanentError
+
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    class _NoPushVcs(_FakeVcs):
+        async def push(self, repo_key: str, branch: str, *, force: bool = False) -> None:
+            raise VcsError(
+                "git push failed (exit=128): remote: You are not allowed to "
+                "push code to this project. fatal: unable to access "
+                "'https://gitlab/x.git/': The requested URL returned error: 403"
+            )
+
+    vcs = _NoPushVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=1, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent,
+        preset_submission={"title": "t", "description": "d", "status": "success"},
+        edits=["app/users.py"],
+    )
+    with pytest.raises(CodeAgentPermanentError, match="Developer role"):
+        await dev.handle_plan("jira", "DM-7")
+
+    from sqlalchemy import select
+    async with session_factory() as session:
+        row = (await session.execute(
+            select(TaskRow).where(TaskRow.external_id == "DM-7")
+        )).scalar_one()
+    assert row.internal_status == TaskStatus.FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_transient_push_error_leaves_task_for_retry(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    from virtual_dev.application.agents.dev import CodeAgentInfraError
+
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    class _FlakyPushVcs(_FakeVcs):
+        async def push(self, repo_key: str, branch: str, *, force: bool = False) -> None:
+            raise VcsError("git push failed: The requested URL returned error: 502")
+
+    vcs = _FlakyPushVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=1, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent,
+        preset_submission={"title": "t", "description": "d", "status": "success"},
+        edits=["app/users.py"],
+    )
+    with pytest.raises(CodeAgentInfraError):
+        await dev.handle_plan("jira", "DM-7")
+
+    from sqlalchemy import select
+    async with session_factory() as session:
+        row = (await session.execute(
+            select(TaskRow).where(TaskRow.external_id == "DM-7")
+        )).scalar_one()
+    assert row.internal_status != TaskStatus.FAILED.value

@@ -355,7 +355,31 @@ class DevAgent:
         # loop the whole task forever (real prod incident: a GitLab 503
         # killed run #1 after its push, every recovery re-run then burned
         # a full model cycle just to be rejected).
-        await self._vcs.push(self._repo_key, branch_name, force=True)
+        #
+        # Push failures are classified the same way as branch prep: a
+        # network hiccup retries via the capped recovery sweep, anything
+        # else (403 — the bot has no Developer role on the repo) is
+        # permanent and must fail LOUDLY on the first attempt, before
+        # two more full model cycles are burned discovering the same 403.
+        try:
+            await self._vcs.push(self._repo_key, branch_name, force=True)
+        except VcsError as exc:
+            if is_transient_git_error(str(exc)):
+                logger.warning(
+                    "Dev[{}] transient push failure for {} (recovery will "
+                    "retry): {}",
+                    self._agent_key, external_id, exc,
+                )
+                raise CodeAgentInfraError(str(exc)) from exc
+            logger.warning(
+                "Dev[{}] permanent push failure for {}: {}",
+                self._agent_key, external_id, exc,
+            )
+            await self._set_internal_status(task_row.id, TaskStatus.FAILED)
+            raise CodeAgentPermanentError(
+                f"git push failed for {self._repo_key!r} — likely missing "
+                f"repo permission (bot needs the Developer role): {exc}"
+            ) from exc
 
         mr = await self._vcs.create_merge_request(
             repo_key=self._repo_key,

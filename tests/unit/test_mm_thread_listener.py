@@ -33,6 +33,15 @@ from virtual_dev.runtime.workers.mm_thread_listener import (
     MmThreadListener,
 )
 
+async def _settle(condition, *, timeout: float = 3.0) -> None:
+    """Poll until ``condition()`` is truthy — a fixed 0.1s sleep flakes
+    when the full suite loads the machine and dispatch takes longer."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while not condition() and asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(0.02)
+
+
+
 
 class _ScriptedChat(ChatPort):
     """ChatPort stub where subscribe yields a scripted list of ChatMessages."""
@@ -370,7 +379,7 @@ async def test_iterate_forwards_full_thread_transcript_to_dev(
     )
 
     task = asyncio.create_task(listener.run_forever())
-    await asyncio.sleep(0.1)
+    await _settle(lambda: dev.calls)
     await listener.stop()
     await asyncio.wait_for(task, timeout=2)
 
