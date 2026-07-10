@@ -10,7 +10,11 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from virtual_dev.application.agents.devops import DevOpsAgent, _collapse_status
+from virtual_dev.application.agents.devops import (
+    DevOpsAgent,
+    _collapse_status,
+    _looks_like_infra_failure,
+)
 from virtual_dev.application.services import CommunicatorService, InjectionFilter
 from virtual_dev.domain.models.chat import ChatMessage, ChatUser
 from virtual_dev.domain.models.merge_request import (
@@ -41,6 +45,10 @@ class _StubVcs(VcsPort):
     def __init__(self, jobs: dict[tuple[str, int], list[PipelineJob]]) -> None:
         self._jobs = jobs
         self.log_calls: list[int] = []
+        self.pipeline_retries: list[tuple[str, int]] = []
+
+    async def retry_latest_pipeline(self, repo_key: str, iid: int) -> None:
+        self.pipeline_retries.append((repo_key, iid))
 
     async def get_latest_pipeline_jobs(
         self, repo_key: str, iid: int, *, log_tail_lines: int = 80,
@@ -125,10 +133,13 @@ def _msg(text: str) -> ChatMessage:
     )
 
 
-def _cfg(*, max_attempts: int = 3) -> AppConfig:
+def _cfg(*, max_attempts: int = 3, max_infra_retries: int = 2) -> AppConfig:
     agents = AgentsCfg(
         escalation=EscalationCfg(mattermost_user="tech-lead"),
-        pipeline_policy=PipelinePolicyCfg(max_autofix_attempts=max_attempts),
+        pipeline_policy=PipelinePolicyCfg(
+            max_autofix_attempts=max_attempts,
+            max_infra_retries=max_infra_retries,
+        ),
     )
     return AppConfig(
         repositories=[RepositoryCfg(key="bellingshausen", url="git@x:g/bellingshausen.git")],
@@ -137,6 +148,11 @@ def _cfg(*, max_attempts: int = 3) -> AppConfig:
         notifications=NotificationsCfg(mattermost=MmTemplatesCfg(
             pipeline_autofix_gave_up_dm=(
                 "CI на `{repo_key}!{iid}` не починился после {attempts} попыток. "
+                "Failing: {failing_jobs}. {web_url}"
+            ),
+            pipeline_infra_gave_up_dm=(
+                "CI на `{repo_key}!{iid}` падает по инфраструктурным причинам, "
+                "код ни при чём. Перезапусков: {retries}. "
                 "Failing: {failing_jobs}. {web_url}"
             ),
         )),
@@ -156,6 +172,7 @@ async def _insert_mr(
     *,
     iid: int = 42,
     pipeline_autofix_attempts: int = 0,
+    pipeline_infra_retries: int = 0,
     pipeline_autofix_escalated: bool = False,
     task_external_id: str | None = "DM-1",
 ) -> int:
@@ -169,6 +186,7 @@ async def _insert_mr(
             web_url=f"https://gitlab/x/merge_requests/{iid}",
             status="open",
             pipeline_autofix_attempts=pipeline_autofix_attempts,
+            pipeline_infra_retries=pipeline_infra_retries,
             pipeline_autofix_escalated=pipeline_autofix_escalated,
         )
         session.add(row)
@@ -424,3 +442,168 @@ async def test_inflight_autofix_task_is_tracked_and_released(
             break
         await asyncio.sleep(0.01)
     assert agent._inflight_tasks == set()
+
+
+# --- transient CI-infrastructure failures ---
+# Log excerpts below are verbatim from a real incident: docker-registry's
+# S3 backend answering 502/404 on layer push + Nexus PyPI proxy timing
+# out. None of it is fixable from code — the correct move is a pipeline
+# retry, not a Dev iteration.
+
+_LOG_REGISTRY_502 = (
+    "#22 pushing layer sha256:1f4c8f8b\n"
+    "error: failed to push: write blob: received unexpected HTTP status: "
+    "502 Bad Gateway\n"
+)
+_LOG_REGISTRY_NOSUCHKEY = (
+    "error parsing HTTP 404 response body: invalid character '<' looking "
+    "for beginning of value: \"<?xml version=\\\"1.0\\\"?><Error>"
+    "<Code>NoSuchKey</Code></Error>\"\n"
+    "blob upload unknown to registry\n"
+)
+_LOG_PYPI_TIMEOUT = (
+    "pip._vendor.urllib3.exceptions.ReadTimeoutError: HTTPSConnectionPool"
+    "(host='nexus.2gis.dev', port=443): Read timed out.\n"
+)
+_LOG_REAL_TEST_FAILURE = (
+    "=========================== FAILURES ===========================\n"
+    "test/unit/test_x.py::test_y\n"
+    "AssertionError: assert 1 == 2\n"
+)
+
+
+def test_looks_like_infra_failure_classification() -> None:
+    infra = [
+        _job("bellingshausen:build", "failed", log=_LOG_REGISTRY_502),
+        _job("krusenstern:build", "failed", log=_LOG_REGISTRY_NOSUCHKEY),
+        _job("test-rapid", "failed", log=_LOG_PYPI_TIMEOUT),
+        _job("lint", "success"),
+    ]
+    assert _looks_like_infra_failure(infra) is True
+    # One genuinely code-broken job poisons the whole classification —
+    # the auto-fix path must run.
+    mixed = infra + [_job("units", "failed", log=_LOG_REAL_TEST_FAILURE)]
+    assert _looks_like_infra_failure(mixed) is False
+    # Only empty logs → can't tell anything → treat as code failure.
+    assert _looks_like_infra_failure([_job("x", "failed", log="")]) is False
+    # No failed jobs at all → not an infra failure.
+    assert _looks_like_infra_failure([_job("x", "success")]) is False
+    # An empty log next to infra-marked siblings doesn't veto: when CI
+    # infra is down GitLab often 500s on the trace endpoint too (seen
+    # live on lisyansky:build during the 2026-07-08 incident).
+    assert _looks_like_infra_failure([
+        _job("bellingshausen:build", "failed", log=_LOG_REGISTRY_502),
+        _job("lisyansky:build", "failed", log=""),
+    ]) is True
+    # Infra-looking noise mid-log of a code-broken job must NOT match:
+    # the marker scan only covers the log tail.
+    retried_pip_then_asserts = (
+        "WARNING: Read timed out, retrying download\n"
+        + "collected 120 items\n" * 400
+        + _LOG_REAL_TEST_FAILURE
+    )
+    assert _looks_like_infra_failure(
+        [_job("units", "failed", log=retried_pip_then_asserts)]
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_retries_pipeline_instead_of_autofix(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Registry 5xx / proxy timeouts → retry the pipeline via the API.
+    No Dev iteration, no autofix attempt consumed, nobody DM'd."""
+    mr_id = await _insert_mr(session_factory)
+    vcs = _StubVcs({
+        ("bellingshausen", 42): [
+            _job("bellingshausen:build", "failed", log=_LOG_REGISTRY_502),
+            _job("test-rapid", "failed", log=_LOG_PYPI_TIMEOUT),
+        ],
+    })
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev()
+    agent = DevOpsAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+    )
+
+    stats = await agent.tick()
+    assert stats.pipeline_retries == 1
+    assert stats.autofix_dispatched == 0
+    assert vcs.pipeline_retries == [("bellingshausen", 42)]
+    assert dev.calls == []
+    assert chat.sent_dms == []
+    assert chat.sent_channels == []
+
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pipeline_infra_retries == 1
+        assert row.pipeline_autofix_attempts == 0   # attempts stay untouched
+
+
+@pytest.mark.asyncio
+async def test_infra_retries_exhausted_escalates_honestly(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """When pipeline retries run out the lead is DM'd with the *infra*
+    template — «код ни при чём», not «не починился после N попыток
+    авто-фикса» (which would be a lie: no auto-fix ever ran)."""
+    mr_id = await _insert_mr(session_factory, pipeline_infra_retries=2)
+    vcs = _StubVcs({
+        ("bellingshausen", 42): [
+            _job("bellingshausen:build", "failed", log=_LOG_REGISTRY_NOSUCHKEY),
+        ],
+    })
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev()
+    agent = DevOpsAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(max_infra_retries=2),
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+    )
+
+    stats = await agent.tick()
+    assert stats.escalations_sent == 1
+    assert vcs.pipeline_retries == []       # budget exhausted, no more retries
+    assert dev.calls == []
+    assert len(chat.sent_dms) == 1
+    _, body = chat.sent_dms[0]
+    assert "инфраструктурным" in body
+    assert "не починился" not in body       # the misleading autofix wording
+
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pipeline_autofix_escalated is True
+        assert row.autofix_escalation_root_id == "m"   # /restart thread works
+
+
+@pytest.mark.asyncio
+async def test_green_pipeline_resets_infra_retries(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    mr_id = await _insert_mr(
+        session_factory, pipeline_infra_retries=2, pipeline_autofix_escalated=True,
+    )
+    vcs = _StubVcs({("bellingshausen", 42): [_job("tests", "success")]})
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = DevOpsAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        dev_agents={"bellingshausen": _ScriptedDev()},   # type: ignore[dict-item]
+    )
+
+    await agent.tick()
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pipeline_infra_retries == 0
+        assert row.pipeline_autofix_escalated is False

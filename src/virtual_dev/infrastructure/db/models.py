@@ -163,6 +163,12 @@ class MergeRequestRow(Base):
     # the team-lead, so we don't keep DMing on every subsequent tick.
     pipeline_autofix_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     pipeline_autofix_escalated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Pipeline retries spent on transient CI-infrastructure failures
+    # (registry 5xx, package-proxy timeouts, runner errors). Separate
+    # budget from autofix attempts: no Dev iteration is involved, the
+    # pipeline is just re-run via the GitLab API. Resets together with
+    # the autofix counter (green pipeline / `/restart`).
+    pipeline_infra_retries: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # MM post id of the "I gave up after N attempts" DM to the team-lead.
     # A `/restart` reply in this post's thread resets the autofix counter
     # for this MR (the lead nudging the bot to try again).

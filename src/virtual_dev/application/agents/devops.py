@@ -7,11 +7,17 @@ Behaviour per tick (one open MR = one ``_check_one`` call):
     Reviewer's poll will pick the green status up and ping the team
     channel — that's the FIRST and ONLY time the channel hears about
     this MR.
-  * If pipeline is red AND attempts < ``max_autofix_attempts``:
-    dispatch ``Dev.handle_iteration`` with the failing-jobs feedback
-    (job name + stage + URL + full log) as a background task. Counter
-    increments after the iteration finishes (not before — we want it
-    to reflect actual completed attempts).
+  * If pipeline is red AND every failed job's log looks like CI
+    *infrastructure* (registry 5xx, package-proxy timeouts, runner
+    failures): the code is not the problem — retry the pipeline via
+    the GitLab API (up to ``max_infra_retries``), never dispatching a
+    Dev iteration. When retries run out, DM the escalation contact
+    with an honest "CI infra is down, nothing to fix in code" message.
+  * If pipeline is red (code-looking) AND attempts <
+    ``max_autofix_attempts``: dispatch ``Dev.handle_iteration`` with
+    the failing-jobs feedback (job name + stage + URL + full log) as a
+    background task. Counter increments after the iteration finishes
+    (not before — we want it to reflect actual completed attempts).
   * If pipeline is red AND attempts ≥ max: DM the escalation contact
     once (``pipeline_autofix_escalated`` flag), then stay quiet.
 
@@ -44,6 +50,7 @@ class DevOpsTickStats:
     mrs_checked: int = 0
     failures_detected: int = 0
     autofix_dispatched: int = 0
+    pipeline_retries: int = 0
     escalations_sent: int = 0
 
 
@@ -110,6 +117,7 @@ class DevOpsAgent:
             await self._persist_pipeline_status(
                 row.id, pipeline_status,
                 attempts_reset=row.pipeline_autofix_attempts != 0
+                or row.pipeline_infra_retries != 0
                 or row.pipeline_autofix_escalated,
             )
             return
@@ -126,6 +134,15 @@ class DevOpsAgent:
         jobs = list(await self._vcs.get_latest_pipeline_jobs(
             row.repo_key, row.iid, log_tail_lines=-1,
         ))
+
+        # CI-infrastructure failure (registry 5xx, proxy timeouts…)?
+        # Then there is nothing to fix in code — a Dev iteration would
+        # only conclude the same and burn an attempt. Retry the pipeline
+        # instead; escalate honestly when retries run out.
+        if _looks_like_infra_failure(jobs):
+            await self._handle_infra_failure(row, jobs, pipeline_status, stats)
+            return
+
         attempts = row.pipeline_autofix_attempts
         max_attempts = self._config.agents.pipeline_policy.max_autofix_attempts
 
@@ -224,12 +241,67 @@ class DevOpsAgent:
         finally:
             self._inflight_autofix.discard(key)
 
+    async def _handle_infra_failure(
+        self,
+        row: MergeRequestRow,
+        jobs: list[PipelineJob],
+        pipeline_status: str,
+        stats: DevOpsTickStats,
+    ) -> None:
+        """Red pipeline caused by CI infrastructure: retry it (bounded),
+        then escalate with a message that truthfully says the code is
+        fine and no auto-fix was attempted."""
+        assert self._vcs is not None
+        retries = row.pipeline_infra_retries
+        max_retries = self._config.agents.pipeline_policy.max_infra_retries
+
+        if retries < max_retries:
+            logger.warning(
+                "DevOps: pipeline on {}!{} failed on CI infrastructure, "
+                "retrying pipeline ({}/{}) instead of dispatching auto-fix",
+                row.repo_key, row.iid, retries + 1, max_retries,
+            )
+            try:
+                await self._vcs.retry_latest_pipeline(row.repo_key, row.iid)
+            except Exception:
+                # Still consume a retry slot below — otherwise a broken
+                # retry API would loop this branch forever in silence.
+                logger.exception(
+                    "DevOps: pipeline retry failed for {}!{}", row.repo_key, row.iid,
+                )
+            stats.pipeline_retries += 1
+            await self._persist_pipeline_status(
+                row.id, pipeline_status, increment_infra_retries=True,
+            )
+            return
+
+        if not row.pipeline_autofix_escalated:
+            escalation_root_id = await self._escalate_via_dm(
+                row, jobs, retries, infra=True,
+            )
+            if escalation_root_id is None:
+                await self._persist_pipeline_status(row.id, pipeline_status)
+                return
+            stats.escalations_sent += 1
+            await self._persist_pipeline_status(
+                row.id, pipeline_status, mark_escalated=True,
+                escalation_root_id=escalation_root_id,
+            )
+        else:
+            await self._persist_pipeline_status(row.id, pipeline_status)
+
     async def _escalate_via_dm(
-        self, row: MergeRequestRow, jobs: list[PipelineJob], attempts: int,
+        self,
+        row: MergeRequestRow,
+        jobs: list[PipelineJob],
+        attempts: int,
+        *,
+        infra: bool = False,
     ) -> str | None:
-        """DM the team-lead that auto-fix is exhausted. Returns the DM
-        post id so the caller can record it — a `/restart` reply in that
-        post's thread resets this MR's counter. None if no DM was sent."""
+        """DM the team-lead that auto-fix (or infra pipeline retrying,
+        when ``infra``) is exhausted. Returns the DM post id so the
+        caller can record it — a `/restart` reply in that post's thread
+        resets this MR's counters. None if no DM was sent."""
         user = await self._resolve_escalation_user()
         if user is None:
             logger.warning(
@@ -239,15 +311,26 @@ class DevOpsAgent:
             )
             return None
         failing_names = ", ".join(j.name for j in jobs if j.status == "failed") or "n/a"
+        templates = self._config.notifications.mattermost
+        template = (
+            templates.pipeline_infra_gave_up_dm if infra
+            else templates.pipeline_autofix_gave_up_dm
+        )
+        text = ""
         try:
-            text = self._config.notifications.mattermost.pipeline_autofix_gave_up_dm.format(
+            text = template.format(
                 repo_key=row.repo_key, iid=row.iid,
                 title=row.title, web_url=row.web_url,
-                attempts=attempts, failing_jobs=failing_names,
+                attempts=attempts, retries=attempts, failing_jobs=failing_names,
             )
         except (KeyError, IndexError) as exc:
-            logger.warning("DevOps: pipeline_autofix_gave_up_dm template error: {}", exc)
+            logger.warning("DevOps: pipeline give-up DM template error: {}", exc)
+        if not text.strip():
             text = (
+                f"CI на {row.repo_key}!{row.iid} падает по инфраструктурным "
+                f"причинам — код ни при чём, {attempts} перезапуска(ов) "
+                f"пайплайна не помогли. {row.web_url}"
+            ) if infra else (
                 f"CI на {row.repo_key}!{row.iid} не починился после {attempts} "
                 f"попыток. {row.web_url}"
             )
@@ -279,6 +362,7 @@ class DevOpsAgent:
         attempts_reset: bool = False,
         mark_escalated: bool = False,
         increment_attempts: bool = False,
+        increment_infra_retries: bool = False,
         escalation_root_id: str | None = None,
     ) -> None:
         async with session_scope(self._session_factory) as session:
@@ -290,6 +374,7 @@ class DevOpsAgent:
             row.pipeline_status = pipeline_status
             if attempts_reset:
                 row.pipeline_autofix_attempts = 0
+                row.pipeline_infra_retries = 0
                 row.pipeline_autofix_escalated = False
             if mark_escalated:
                 row.pipeline_autofix_escalated = True
@@ -297,6 +382,8 @@ class DevOpsAgent:
                 row.autofix_escalation_root_id = escalation_root_id
             if increment_attempts:
                 row.pipeline_autofix_attempts = (row.pipeline_autofix_attempts or 0) + 1
+            if increment_infra_retries:
+                row.pipeline_infra_retries = (row.pipeline_infra_retries or 0) + 1
 
     async def _post_iteration_state(
         self, row_id: int, *, commit_sha: str | None,
@@ -339,6 +426,63 @@ def _collapse_status(jobs: list[PipelineJob]) -> str:
     if statuses & _RUNNING_JOB_STATUSES:
         return "running"
     return "unknown"
+
+
+# Substrings (lowercase) that mark a job log as "CI infrastructure died",
+# not "the code under test is broken". Sourced from real incidents:
+# docker-registry S3 backend answering 5xx/NoSuchKey on layer push,
+# Nexus PyPI proxy read-timeouts, DNS/runner hiccups.
+_TRANSIENT_CI_MARKERS: tuple[str, ...] = (
+    # docker registry / its object-storage backend
+    "blob upload unknown",
+    "received unexpected http status: 5",
+    "bad gateway",
+    "service unavailable",
+    "gateway time-out",
+    "gateway timeout",
+    "nosuchkey",
+    # package proxies (pypi / npm behind nexus and friends)
+    "readtimeouterror",
+    "read timed out",
+    "connection reset by peer",
+    "connection timed out",
+    "could not resolve host",
+    "temporary failure in name resolution",
+    "tls handshake timeout",
+    # gitlab runner itself
+    "runner system failure",
+    "no space left on device",
+)
+
+# Markers are matched against the log *tail* only: infra failures kill a
+# job at the point of the error, so it's the last thing printed. A full
+# scan would false-positive on e.g. a retried-then-successful pip
+# download warning half-way through an otherwise code-broken job.
+_INFRA_SCAN_TAIL_CHARS = 6_000
+
+
+def _looks_like_infra_failure(jobs: list[PipelineJob]) -> bool:
+    """True when the failed jobs died on CI infrastructure.
+
+    Every failed job with a readable log must match an infra marker —
+    one genuinely code-broken job → False and the normal auto-fix path
+    runs. Jobs whose log came back EMPTY don't veto: when CI infra is
+    down GitLab routinely 500s on the trace endpoint too (seen live),
+    and a Dev iteration couldn't read those logs either. But at least
+    one marker-matched log is required — all-empty means we know
+    nothing, not "infra".
+    """
+    matched = 0
+    for job in jobs:
+        if job.status != "failed":
+            continue
+        tail = (job.log_excerpt or "")[-_INFRA_SCAN_TAIL_CHARS:].lower()
+        if not tail:
+            continue
+        if not any(marker in tail for marker in _TRANSIENT_CI_MARKERS):
+            return False
+        matched += 1
+    return matched > 0
 
 
 def _render_autofix_feedback(

@@ -102,6 +102,12 @@ class PipelinePolicyCfg(_StrictModel):
     """
 
     max_autofix_attempts: int = 3
+    # Red pipelines whose failed jobs ALL look like CI infrastructure
+    # (registry 5xx, package-proxy timeouts, runner failures) are not a
+    # code problem — DevOps retries the pipeline via the GitLab API
+    # instead of burning a Dev iteration. This caps how many such
+    # retries happen before DevOps escalates to the lead.
+    max_infra_retries: int = 2
 
 
 class EscalationCfg(_StrictModel):
@@ -120,6 +126,11 @@ class MmTemplatesCfg(_StrictModel):
     # channel — only DM'd to escalation.mattermost_user when the bot
     # has exhausted its auto-fix attempts.
     pipeline_autofix_gave_up_dm: str = ""
+    # Same DM slot, but for pipelines that keep failing on CI
+    # *infrastructure* (registry 5xx / proxy timeouts) — the bot retried
+    # the pipeline itself and never touched the code, so the text must
+    # not claim "auto-fix attempts" that never happened.
+    pipeline_infra_gave_up_dm: str = ""
     # Confirmation the bot posts when the team-lead replies `/restart` in
     # the give-up DM thread and the autofix counter is reset.
     pipeline_autofix_restart_ack: str = ""

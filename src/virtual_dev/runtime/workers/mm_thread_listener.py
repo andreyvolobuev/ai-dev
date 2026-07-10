@@ -658,6 +658,7 @@ class MmThreadListener:
             row.iteration_ack_target = "mm"
             if reset_autofix:
                 row.pipeline_autofix_attempts = 0
+                row.pipeline_infra_retries = 0
                 row.pipeline_autofix_escalated = False
 
     def _resolve_repo_workspace(self, repo_key: str) -> str | None:
@@ -875,6 +876,7 @@ class MmThreadListener:
             if fresh is None:
                 return
             fresh.pipeline_autofix_attempts = 0
+            fresh.pipeline_infra_retries = 0
             fresh.pipeline_autofix_escalated = False
         logger.info(
             "MmThreadListener: /restart reset autofix counter for {}!{}",

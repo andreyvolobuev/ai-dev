@@ -156,6 +156,15 @@ class VcsPort(ABC):
     async def get_mr_approvals(self, repo_key: str, iid: int) -> ApprovalInfo:
         """Return the current approval state for an MR."""
 
+    async def retry_latest_pipeline(self, repo_key: str, iid: int) -> None:
+        """Re-run the failed jobs of the MR's latest pipeline.
+
+        Used by DevOps when the failure is CI infrastructure (registry
+        5xx, proxy timeouts) rather than code — retrying is the fix, no
+        Dev iteration needed. Non-abstract so fakes that never touch
+        pipelines can ignore it."""
+        raise NotImplementedError
+
     @abstractmethod
     async def get_latest_pipeline_jobs(
         self, repo_key: str, iid: int, *, log_tail_lines: int = 0,

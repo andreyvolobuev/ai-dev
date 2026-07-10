@@ -826,6 +826,23 @@ class GitLabVcs(VcsPort):
 
         return await asyncio.to_thread(_run)
 
+    async def retry_latest_pipeline(self, repo_key: str, iid: int) -> None:
+        def _run() -> int:
+            project = self._client.projects.get(self._project_path(repo_key))
+            mr = project.mergerequests.get(iid)
+            pipelines = mr.pipelines.list(per_page=1, get_all=False)
+            if not pipelines:
+                raise VcsError(f"No pipeline to retry on {repo_key}!{iid}")
+            pipeline_id = int(pipelines[0].id)
+            project.pipelines.get(pipeline_id).retry()
+            return pipeline_id
+
+        pipeline_id = await asyncio.to_thread(_run)
+        logger.info(
+            "Retried pipeline {} on {}!{} (failed jobs re-run)",
+            pipeline_id, repo_key, iid,
+        )
+
     # --- helpers ---
 
     def _repo(self, repo_key: str) -> RepositoryCfg:
