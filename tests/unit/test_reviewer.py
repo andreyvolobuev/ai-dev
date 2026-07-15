@@ -150,6 +150,8 @@ class _RecordingChat(ChatPort):
     def __init__(self) -> None:
         self.sent_channels: list[tuple[str, str]] = []
         self.sent_dms: list[tuple[str, str]] = []
+        # Parallel to sent_channels: thread_root_id of each channel post.
+        self.sent_thread_roots: list[str | None] = []
 
     async def read_thread(self, thread_root_id: str) -> Sequence[ChatMessage]:
         return []
@@ -162,6 +164,7 @@ class _RecordingChat(ChatPort):
         self, channel_id: str, text: str, thread_root_id: str | None = None,
     ) -> ChatMessage:
         self.sent_channels.append((channel_id, text))
+        self.sent_thread_roots.append(thread_root_id)
         return _msg(text)
 
     async def find_user_by_email(self, email: str) -> ChatUser | None:
@@ -234,6 +237,8 @@ async def _insert_mr(
     created_at: datetime | None = None,
     status: str = "open",
     review_ping_sent: bool = True,   # default: past the initial review ping
+    review_thread_channel_id: str | None = None,
+    review_thread_root_id: str | None = None,
 ) -> int:
     async with session_scope(session_factory) as session:
         row = MergeRequestRow(
@@ -247,6 +252,8 @@ async def _insert_mr(
             last_seen_comment_id=last_seen,
             last_activity_at=last_activity_at,
             review_ping_sent=review_ping_sent,
+            review_thread_channel_id=review_thread_channel_id,
+            review_thread_root_id=review_thread_root_id,
             created_at=created_at or datetime.now(timezone.utc),
         )
         session.add(row)
@@ -924,6 +931,54 @@ async def test_ping_fires_before_escalation(
     assert stats.pings_sent == 1
     assert stats.escalations_sent == 0
     assert any("waiting for a review" in text for _, text in chat.sent_channels)
+
+
+@pytest.mark.asyncio
+async def test_stale_ping_replies_into_existing_review_thread(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The nag must land in the MM thread of the original "please
+    review" post, not as a new top-level channel message."""
+    idle = datetime.now(timezone.utc) - timedelta(hours=5)
+    await _insert_mr(
+        session_factory, last_activity_at=idle,
+        review_thread_channel_id="team-chan",
+        review_thread_root_id="root-post-1",
+    )
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    stats = await agent.tick()
+    assert stats.pings_sent == 1
+    assert chat.sent_channels == [("team-chan", chat.sent_channels[0][1])]
+    assert chat.sent_thread_roots == ["root-post-1"]
+
+
+@pytest.mark.asyncio
+async def test_merge_ping_replies_into_existing_review_thread(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _insert_mr(
+        session_factory,
+        review_thread_channel_id="team-chan",
+        review_thread_root_id="root-post-1",
+    )
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(approved_by=["bob"], required=1)},
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    stats = await agent.tick()
+    assert stats.approvals_sent == 1
+    assert chat.sent_thread_roots == ["root-post-1"]
 
 
 # --- last_seen coupled to actually handling the comment -----------------

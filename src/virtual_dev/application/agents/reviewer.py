@@ -674,9 +674,13 @@ class ReviewerAgent:
             repo_key=row.repo_key, iid=row.iid,
             title=row.title, web_url=row.web_url,
         )
-        channel_id = self._team_channel_for(row.repo_key)
+        # One task — one thread: follow-ups land under the original
+        # "please review" post instead of spawning new channel messages.
+        channel_id = row.review_thread_channel_id or self._team_channel_for(row.repo_key)
         if channel_id:
-            await self._communicator.send_channel(channel_id, msg)
+            await self._communicator.send_channel(
+                channel_id, msg, thread_root_id=row.review_thread_root_id,
+            )
             return
         user = await self._resolve_escalation_user()
         if user:
@@ -729,7 +733,13 @@ class ReviewerAgent:
 
         if idle >= timedelta(hours=policy.ping_reviewers_after_hours):
             if row.ping_reviewers_at is None:
-                channel_id = self._team_channel_for(row.repo_key)
+                # One task — one thread: the nag replies under the original
+                # "please review" post; a new top-level message only when
+                # no review thread exists yet.
+                channel_id = (
+                    row.review_thread_channel_id
+                    or self._team_channel_for(row.repo_key)
+                )
                 if not channel_id:
                     return None
                 text = self._render_template(
@@ -738,7 +748,9 @@ class ReviewerAgent:
                     title=row.title, web_url=row.web_url,
                     idle_hours=int(idle.total_seconds() / 3600),
                 )
-                outcome = await self._communicator.send_channel(channel_id, text)
+                outcome = await self._communicator.send_channel(
+                    channel_id, text, thread_root_id=row.review_thread_root_id,
+                )
                 # Same idea as escalation: a suppressed channel post
                 # must not stamp ping_reviewers_at; otherwise the next
                 # tick sees the MR as already-pinged and stays silent.
