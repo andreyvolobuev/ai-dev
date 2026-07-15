@@ -458,9 +458,12 @@ class ReviewerAgent:
         deliberately ignored). A swallowed network error returns False so
         the caller keeps ``last_seen`` pinned and retries next tick — we
         must not mark a comment read that we never managed to answer."""
-        # Build a "thread" of prior non-system, non-bot comments as
-        # context. Convert to ChatMessage shape so ThreadResponder is
-        # medium-agnostic.
+        # Build the "thread" context from THIS discussion only. Feeding
+        # the whole MR comment history here made the model drag topics
+        # from neighbouring threads into its reply («почему в треде про
+        # confloat ты поднимаешь тему соседнего треда»). The bot's own
+        # prior replies in the discussion stay in (marked trusted) so it
+        # doesn't repeat itself.
         from datetime import datetime as _dt
         from datetime import timezone as _tz
 
@@ -472,13 +475,15 @@ class ReviewerAgent:
                 id=c.id, channel_id=f"gitlab:{row.iid}",
                 author_id=c.author_username, text=c.body,
                 timestamp=c.created_at or _dt.now(_tz.utc),
-                thread_root_id=None, trusted=False,
+                thread_root_id=None,
+                trusted=self._is_bot_author(c.author_username),
             )
 
+        discussion_key = latest.discussion_id or latest.id
         transcript = [
             _to_chat(c) for c in all_comments
             if not c.system
-            and not self._is_bot_author(c.author_username)
+            and (c.discussion_id or c.id) == discussion_key
             and c.id != latest.id
         ]
         latest_chat = _to_chat(latest)

@@ -1162,6 +1162,73 @@ async def test_actionable_comment_marked_seen_when_reply_succeeds(
 
 
 @pytest.mark.asyncio
+async def test_responder_sees_only_its_own_discussion(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The thread transcript passed to ThreadResponder must contain only
+    the comments of the discussion being answered — feeding the whole MR
+    history made the bot drag neighbouring threads' topics into replies."""
+    from virtual_dev.application.agents import ResponderAction, ResponderDecision
+
+    await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice",
+                      body="earlier note", discussion_id="disc-A"),
+        ReviewComment(id="c-1", mr_id="42", author_username="bob",
+                      body="а зачем тут confloat?", discussion_id="disc-B"),
+        ReviewComment(id="c-2", mr_id="42", author_username="virtual-dev",
+                      body="потому что даёт валидацию диапазона",
+                      discussion_id="disc-B"),
+        ReviewComment(id="c-3", mr_id="42", author_username="bob",
+                      body="why is this dependency here?", discussion_id="disc-B"),
+    ]
+
+    class _OkVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+        async def reply_to_comment(
+            self, repo_key: str, iid: int, comment_id: str, body: str,
+        ) -> None:
+            return None
+
+    class _CapturingResponder:
+        def __init__(self) -> None:
+            self.threads: list[list[ChatMessage]] = []
+
+        async def decide(self, **kwargs: object) -> ResponderDecision:
+            self.threads.append(list(kwargs["thread"]))   # type: ignore[arg-type]
+            return ResponderDecision(
+                action=ResponderAction.REPLY, reply_text="ответ", reasoning="stub",
+            )
+
+    vcs = _OkVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _CapturingResponder()
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+    )
+    await agent.tick()
+
+    assert len(responder.threads) == 1
+    thread = responder.threads[0]
+    # Only disc-B context (minus the latest comment itself): the human
+    # question and the bot's own prior reply; disc-A never leaks in.
+    assert [m.id for m in thread] == ["c-1", "c-2"]
+    assert thread[1].trusted is True   # own reply marked as bot-authored
+
+
+@pytest.mark.asyncio
 async def test_gitlab_iterate_posts_acknowledgement(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
