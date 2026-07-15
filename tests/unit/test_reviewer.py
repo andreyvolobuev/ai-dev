@@ -960,6 +960,65 @@ async def test_stale_ping_replies_into_existing_review_thread(
 
 
 @pytest.mark.asyncio
+async def test_stale_ping_held_while_bot_owes_a_fix(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An iteration awaiting green CI means reviewers already reacted —
+    nagging them 'гляньте, пожалуйста' in that state is spam."""
+    idle = datetime.now(timezone.utc) - timedelta(hours=5)
+    mr_id = await _insert_mr(session_factory, last_activity_at=idle)
+    async with session_scope(session_factory) as session:
+        row = (await session.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        row.iteration_pending_ci_sha = "abc123"
+        row.iteration_ack_target = "mm"
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        # CI still running → the iteration ack is not posted either.
+        ci_jobs=[PipelineJob(
+            id=1, name="tests", stage="test", status="running",
+            web_url="https://gitlab/x/jobs/1",
+        )],
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    stats = await agent.tick()
+    assert stats.pings_sent == 0
+    assert chat.sent_channels == []
+
+
+@pytest.mark.asyncio
+async def test_stale_ping_held_while_reply_still_pending(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    idle = datetime.now(timezone.utc) - timedelta(hours=5)
+    mr_id = await _insert_mr(session_factory, last_activity_at=idle, last_seen="c-9")
+    async with session_scope(session_factory) as session:
+        row = (await session.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        row.pending_comment_ids = ["c-9"]
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): [ReviewComment(
+            id="c-9", mr_id="42", author_username="bob",
+            body="можешь переименовать поле?",
+        )]},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    stats = await agent.tick()
+    assert stats.pings_sent == 0
+    assert chat.sent_channels == []
+
+
+@pytest.mark.asyncio
 async def test_merge_ping_replies_into_existing_review_thread(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

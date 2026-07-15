@@ -732,6 +732,18 @@ class ReviewerAgent:
             return None
 
         if idle >= timedelta(hours=policy.ping_reviewers_after_hours):
+            # Never nag reviewers while the ball is on OUR side: an
+            # undelivered reply (pending_comment_ids) or a fix awaiting
+            # green CI (iteration_pending_ci_sha) means humans already
+            # reacted and are waiting for the bot, not the other way
+            # around. "Гляньте, пожалуйста" in that state reads as
+            # tone-deaf spam.
+            if row.pending_comment_ids or row.iteration_pending_ci_sha:
+                logger.debug(
+                    "Reviewer: {}!{} — bot owes replies/fixes, holding stale ping",
+                    row.repo_key, row.iid,
+                )
+                return None
             if row.ping_reviewers_at is None:
                 # One task — one thread: the nag replies under the original
                 # "please review" post; a new top-level message only when
