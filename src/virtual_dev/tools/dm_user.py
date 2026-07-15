@@ -22,7 +22,10 @@ def build(ctx: ToolContext):
     @tool(
         "dm_user",
         "Send a direct message to a chat-platform user with one "
-        "question. The `message` argument is the ONLY thing the human "
+        "question. `message` must read like a human typed it: 1-3 "
+        "short sentences, ~350 chars max, no lists/headings, no "
+        "analysis dumps — state the conclusion and ask. "
+        "The `message` argument is the ONLY thing the human "
         "sees — your reasoning text, llm_text blocks, and tool-result "
         "summaries are invisible to them. So if you want to "
         "acknowledge or answer something they said, the "

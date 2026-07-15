@@ -41,7 +41,9 @@ def build(ctx: ToolContext):
     @tool(
         "submit_mr",
         "Call this exactly once at the end. Provide the MR title and "
-        "a detailed description of what was done. Status is 'success' "
+        "a SHORT description of what was done — one 2-3 sentence "
+        "paragraph plus at most 5 bullet points, no headings; humans "
+        "complain about wall-of-text descriptions. Status is 'success' "
         "if the change is ready for review, 'failed' if you couldn't "
         "complete the task. The runtime commits + pushes + opens the "
         "draft MR for you — don't shell out to git yourself.",
