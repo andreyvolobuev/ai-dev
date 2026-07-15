@@ -143,8 +143,9 @@ class Settings(BaseSettings):
     review_poll_interval_seconds: int = 180
     pipeline_poll_interval_seconds: int = 120
     # When False, Communicator sends messages outside working hours anyway.
-    # Useful for demos / manual smoke tests; production should keep True.
-    communicator_respect_working_hours: bool = False
+    # Set False only for demos / manual smoke tests — with the default True
+    # the bot stays silent nights and weekends (agents retry next tick).
+    communicator_respect_working_hours: bool = True
 
     # --- Phase 3.8 (clarification tree) ---
     # AnswerCoalescer poll cadence + idle-window before triggering LLM
