@@ -38,7 +38,7 @@ from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.application.services.ticket_reset import reset_ticket_state
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
-from virtual_dev.domain.ports.chat import ChatPort
+from virtual_dev.domain.ports.chat import ChannelReadDeniedError, ChatPort
 from virtual_dev.domain.ports.vcs import VcsPort
 from pathlib import Path
 
@@ -77,6 +77,12 @@ _CATCHUP_MAX_LOOKBACK = timedelta(days=7)
 # is worse than asking the lead to repeat one.
 _DM_COMMAND_LOOKBACK = timedelta(hours=24)
 
+# How long a channel that answered 403 (read denied) is excluded from
+# catch-up sweeps. Permission errors don't heal on their own — retrying
+# every tick floods the log with the MM gateway's HTML error page. One
+# probe an hour is enough to notice the bot got invited.
+_DENIED_CHANNEL_COOLDOWN = timedelta(hours=1)
+
 
 class MmThreadListener:
     """Drives the ChatPort.subscribe() async iterator in the background."""
@@ -109,6 +115,8 @@ class MmThreadListener:
         # only on success (see _lead_dm_channel_id).
         self._lead_dm_channel: str | None = None
         self._lead_dm_resolved = False
+        # channel_id → don't sweep again until this time (403 backoff).
+        self._denied_channels: dict[str, datetime] = {}
         self._stop_event = asyncio.Event()
         self._running = False
         # Reconnect cadence after subscribe() crashes. Defaults are
@@ -261,11 +269,26 @@ class MmThreadListener:
         self.stats.catchup_runs += 1
 
         total = 0
+        now = datetime.now(timezone.utc)
         for channel_id, since in cursors.items():
+            denied_until = self._denied_channels.get(channel_id)
+            if denied_until is not None:
+                if now < denied_until:
+                    continue
+                del self._denied_channels[channel_id]
             try:
                 posts = await self._chat.read_channel_since(
                     channel_id, since=since,
                 )
+            except ChannelReadDeniedError:
+                self._denied_channels[channel_id] = now + _DENIED_CHANNEL_COOLDOWN
+                logger.warning(
+                    "MmThreadListener: no read access to channel {} (403) — "
+                    "skipping catch-up for {}; invite the bot to the channel "
+                    "or fix the stale reference (lead DM / review thread)",
+                    channel_id, _DENIED_CHANNEL_COOLDOWN,
+                )
+                continue
             except Exception:
                 logger.exception(
                     "MmThreadListener: catch-up fetch failed for {} since {}",

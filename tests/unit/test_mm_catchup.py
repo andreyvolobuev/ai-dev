@@ -248,6 +248,44 @@ async def test_catchup_replays_missed_clarification_fragment(
 
 
 @pytest.mark.asyncio
+async def test_catchup_backs_off_channel_after_read_denied(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A 403 channel must be excluded from subsequent sweeps for the
+    cooldown window — before this, the listener re-fetched it every tick
+    and flooded the log with the MM gateway's HTML error page."""
+    from virtual_dev.domain.ports.chat import ChannelReadDeniedError
+
+    await _seed_task_awaiting(session_factory)
+
+    class _DeniedChat(_CatchupChat):
+        async def read_channel_since(
+            self, channel_id: str, since: datetime,
+        ) -> list[ChatMessage]:
+            self.read_channel_calls.append((channel_id, since))
+            raise ChannelReadDeniedError(f"channel {channel_id}: read denied (403)")
+
+    chat = _DeniedChat()
+    listener = _listener(session_factory, chat, _make_inbox(session_factory, chat))
+
+    total = await listener.catch_up()
+    assert total == 0
+    assert len(chat.read_channel_calls) == 1
+
+    # Second sweep inside the cooldown: the denied channel is skipped.
+    total = await listener.catch_up()
+    assert total == 0
+    assert len(chat.read_channel_calls) == 1
+
+    # Cooldown expiry: the channel is probed again.
+    listener._denied_channels["dm-uid-alice"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=1)
+    )
+    await listener.catch_up()
+    assert len(chat.read_channel_calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_catchup_idempotent_on_replayed_fragment(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

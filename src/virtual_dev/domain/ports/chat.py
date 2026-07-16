@@ -9,6 +9,15 @@ from datetime import datetime
 from virtual_dev.domain.models.chat import ChatMessage, ChatUser
 
 
+class ChannelReadDeniedError(RuntimeError):
+    """The chat server refuses to let the bot read this channel (403).
+
+    Permission errors are not transient — retrying every poll tick just
+    floods the log. Callers should back off per-channel and surface the
+    id so an operator can invite the bot or clean up the stale reference.
+    """
+
+
 class ChatPort(ABC):
     """Abstraction over a team chat.
 

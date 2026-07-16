@@ -30,7 +30,7 @@ from mattermostdriver import Driver
 from mattermostdriver.websocket import Websocket
 
 from virtual_dev.domain.models.chat import ChatFile, ChatMessage, ChatUser
-from virtual_dev.domain.ports.chat import ChatPort
+from virtual_dev.domain.ports.chat import ChannelReadDeniedError, ChatPort
 
 
 def _build_wss_context(verify: bool | str) -> ssl.SSLContext:
@@ -428,6 +428,8 @@ class MattermostChat(ChatPort):
         Returned in chronological order (oldest first).
         """
         def _fetch() -> list[ChatMessage]:
+            from mattermostdriver.exceptions import NotEnoughPermissions
+
             self._ensure_login()
             bot_id = self._bot_user_id()
             since_ms = int(since.timestamp() * 1000)
@@ -435,6 +437,15 @@ class MattermostChat(ChatPort):
                 raw = self._driver.posts.get_posts_for_channel(
                     channel_id, params={"since": since_ms},
                 )
+            except NotEnoughPermissions as exc:
+                # 403 — the bot is not allowed to read this channel (not a
+                # member / DM-visibility policy). Not transient: raise the
+                # typed error so the caller backs off instead of hammering
+                # the endpoint every tick. The MM gateway returns a full
+                # HTML error page as the message — keep one line of it.
+                raise ChannelReadDeniedError(
+                    f"channel {channel_id}: read denied (403)"
+                ) from exc
             except Exception:
                 logger.exception(
                     "MattermostChat: get_posts_for_channel failed for {} since {}",
