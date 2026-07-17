@@ -520,7 +520,18 @@ class ReviewerAgent:
         # in the routing.
         if decision.action in (
             ResponderAction.REPLY, ResponderAction.PROPOSE_ALTERNATIVE,
-        ) and decision.reply_text:
+        ):
+            if not decision.reply_text:
+                # Model glitch: a reply-class decision with no text (the
+                # reply usually ended up inside `reasoning`). Treating it
+                # as handled silently ghosts the reviewer — keep the
+                # comment pending so the next tick retries the decision.
+                logger.warning(
+                    "Reviewer: {} decision without reply_text on {}!{} — "
+                    "keeping comment pending for retry",
+                    decision.action.value, row.repo_key, row.iid,
+                )
+                return False
             if not await self._post_comment_reply(row, latest, decision.reply_text):
                 return False
             stats.gitlab_replies_posted += 1

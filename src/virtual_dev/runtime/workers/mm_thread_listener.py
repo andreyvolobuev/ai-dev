@@ -524,7 +524,20 @@ class MmThreadListener:
         # catch-up sweep retries it rather than silently swallowing it.
         delivered = True
 
-        if decision.action == ResponderAction.REPLY and decision.reply_text:
+        if decision.action in (
+            ResponderAction.REPLY, ResponderAction.PROPOSE_ALTERNATIVE,
+        ) and not decision.reply_text:
+            # Model glitch: reply-class decision with no text. Marking the
+            # post ✅ would silently ghost the human — leave it unreacted
+            # so the catch-up sweep retries the decision.
+            logger.warning(
+                "MmThreadListener: {} decision without reply_text on post {} — "
+                "leaving unprocessed for retry",
+                decision.action.value, event.id,
+            )
+            delivered = False
+
+        elif decision.action == ResponderAction.REPLY and decision.reply_text:
             delivered = await self._post_reply(channel_id, root_id, decision.reply_text)
             if delivered:
                 self.stats.replies_posted += 1

@@ -57,6 +57,24 @@ def build(ctx: ToolContext):
     async def _submit(args: dict[str, Any]) -> dict[str, Any]:
         if run_state.get("terminal"):
             return wrap_text({"recorded": False, "reason": "already_terminal"})
+        # A reply-класс decision without the actual text is a known model
+        # glitch (the reply ends up pasted inside `reasoning` as fake XML).
+        # Recording it would silently drop the human's comment — reject and
+        # let the model re-call with the text in the right field.
+        action = str(args.get("action") or "").lower()
+        if action in ("reply", "propose_alternative") and not str(
+            args.get("reply_text") or ""
+        ).strip():
+            return wrap_text({
+                "recorded": False,
+                "reason": "missing_reply_text",
+                "instruction": (
+                    f"action={action!r} requires a non-empty reply_text — "
+                    "that field is the ONLY thing the human sees. Call "
+                    "submit_response again with the reply in reply_text "
+                    "(not inside reasoning)."
+                ),
+            })
         submit_capture.clear()
         submit_capture.update(args)
         run_state["terminal"] = True

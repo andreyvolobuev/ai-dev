@@ -1162,6 +1162,52 @@ async def test_actionable_comment_marked_seen_when_reply_succeeds(
 
 
 @pytest.mark.asyncio
+async def test_reply_decision_without_text_keeps_comment_pending(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A REPLY decision whose reply_text is empty (model glitch: the text
+    ended up inside reasoning) must NOT mark the comment handled — the
+    reviewer would be silently ghosted. It stays pending for retry."""
+    from virtual_dev.application.agents import ResponderAction
+
+    mr_id = await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(id="c-1", mr_id="42", author_username="alice",
+                      body="не используется в коде gc?"),
+    ]
+
+    class _OkVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+    vcs = _OkVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(ResponderAction.REPLY, reply_text="")
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+    )
+    await agent.tick()
+
+    assert vcs.posted_mr_comments == []
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pending_comment_ids == ["c-1"]
+
+
+@pytest.mark.asyncio
 async def test_responder_sees_only_its_own_discussion(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

@@ -87,6 +87,33 @@ async def test_submit_response_refuses_second_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_submit_response_rejects_reply_without_text() -> None:
+    """A reply-class decision with an empty reply_text must be rejected
+    (not recorded, not terminal) so the model re-calls with the text —
+    recording it silently ghosts the reviewer's comment."""
+    ctx = _make_ctx()
+    tool = build_submit_response(ctx)
+    assert tool is not None
+
+    result = await _run(tool, {
+        "action": "reply",
+        "reasoning": "the reply accidentally ended up in here",
+    })
+    body = result["content"][0]["text"]
+    assert "missing_reply_text" in body
+    assert ctx.submit_capture == {}
+    assert not ctx.run_state.get("terminal")
+
+    # The retry with reply_text present is accepted.
+    ok = await _run(tool, {
+        "action": "reply", "reply_text": "вот ответ", "reasoning": "fixed",
+    })
+    assert ok["content"][0]["text"]
+    assert ctx.submit_capture["reply_text"] == "вот ответ"
+    assert ctx.run_state.get("terminal") is True
+
+
+@pytest.mark.asyncio
 async def test_submit_mr_marks_terminal_after_success() -> None:
     """The runtime relies on ``run_state['terminal']`` to know the
     agent's done; ensure the tool actually flips it."""
