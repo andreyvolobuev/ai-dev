@@ -559,6 +559,78 @@ async def test_iteration_aborts_on_rogue_commit_detection(
 
 
 @pytest.mark.asyncio
+async def test_iteration_applies_mr_title_and_description_update(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """A reviewer ask like «поправь заголовок MR» can't be a commit —
+    when the model passes mr_title/mr_description, the iteration must
+    push them to the VCS and mirror them into the MR row. Before this,
+    the bot promised the rename, committed nothing relevant, and the MR
+    title never changed."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    async with session_scope(session_factory) as session:
+        session.add(MergeRequestRow(
+            repo_key="bellingshausen", iid=99,
+            external_id="999", task_external_id="DM-7",
+            title="DM-7: Терпимость к падениям", description="старое описание",
+            source_branch="ai-dev/dm-7",
+            target_branch="main", author_username="bot",
+            web_url="https://gl/mr/999",
+            status=MRStatus.OPEN.value,
+            approvals_count=0, approvals_required=1,
+            pipeline_status=PipelineStatus.UNKNOWN.value, pipeline_url="",
+        ))
+
+    class _UpdatableVcs(_FakeVcs):
+        async def update_merge_request(
+            self, repo_key: str, iid: int, *,
+            title: str | None = None, description: str | None = None,
+        ) -> bool:
+            self.calls.append(("update_merge_request", (repo_key, iid, title, description)))
+            return True
+
+    vcs = _UpdatableVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=2, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent,
+        preset_submission={
+            "status": "success",
+            "title": "address review: retitle MR",
+            "description": "retitle only",
+            "mr_title": "[DM-7] Tolerate per-source failures in GC",
+            "mr_description": "English description per review",
+        },
+    )
+
+    result = await dev.handle_iteration(
+        tracker="jira", external_id="DM-7",
+        branch_name="ai-dev/dm-7",
+        feedback="поправь заголовок MR: тикет в скобки, текст на английском",
+    )
+
+    # Metadata update reached the VCS even though nothing was committed.
+    assert result.outcome is DevOutcome.NO_CHANGES
+    assert ("update_merge_request", (
+        "bellingshausen", 99,
+        "[DM-7] Tolerate per-source failures in GC",
+        "English description per review",
+    )) in vcs.calls
+
+    # And the local MR row mirrors the new metadata.
+    async with session_factory() as session:
+        row = (await session.execute(
+            select(MergeRequestRow).where(MergeRequestRow.iid == 99)
+        )).scalar_one()
+    assert row.title == "[DM-7] Tolerate per-source failures in GC"
+    assert row.description == "English description per review"
+
+
+@pytest.mark.asyncio
 async def test_dev_fails_when_no_submission(
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path: Path,

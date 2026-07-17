@@ -580,6 +580,29 @@ class GitLabVcs(VcsPort):
 
         return await asyncio.to_thread(_run)
 
+    async def update_merge_request(
+        self,
+        repo_key: str,
+        iid: int,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> bool:
+        if title is None and description is None:
+            return False
+
+        def _run() -> bool:
+            project = self._client.projects.get(self._project_path(repo_key))
+            mr = project.mergerequests.get(iid)
+            if title is not None:
+                mr.title = title
+            if description is not None:
+                mr.description = description
+            mr.save()
+            return True
+
+        return await asyncio.to_thread(_run)
+
     async def list_open_merge_requests(
         self, repo_key: str, author_username: str | None = None
     ) -> list[MergeRequest]:

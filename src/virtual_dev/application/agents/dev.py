@@ -498,6 +498,12 @@ class DevAgent:
                 submission=captured,
             )
 
+        # Reviewer asks like «поправь заголовок MR» can't be expressed as a
+        # commit — apply metadata changes via the VCS API before looking at
+        # the working tree, so a pure-retitle iteration isn't lost as
+        # NO_CHANGES with the title silently unchanged.
+        await self._apply_mr_metadata(task_row, captured)
+
         commit_message = (
             f"[{task_row.external_id}] {_strip_ticket_prefix(str(captured.get('title') or 'iteration'), task_row.external_id)}"
         )
@@ -871,6 +877,58 @@ class DevAgent:
         if existing_mr_iid is not None:
             return DevSkipReason.ALREADY_HAS_MR
         return None
+
+    async def _apply_mr_metadata(
+        self, task_row: TaskRow, captured: dict[str, Any],
+    ) -> None:
+        """Apply reviewer-requested MR title/description changes.
+
+        ``mr_title`` / ``mr_description`` from ``submit_mr`` are pushed to
+        the VCS verbatim and mirrored into the local MR row so the
+        reviewer/responder flows see the new metadata immediately.
+        """
+        new_title = str(captured.get("mr_title") or "").strip()
+        new_desc = str(captured.get("mr_description") or "").strip()
+        if not new_title and not new_desc:
+            return
+        iid = await self._existing_open_mr_iid(task_row.external_id)
+        if iid is None:
+            logger.warning(
+                "Dev[{}] mr_title/mr_description submitted but no open MR "
+                "found for {}", self._agent_key, task_row.external_id,
+            )
+            return
+        try:
+            applied = await self._vcs.update_merge_request(
+                self._repo_key, iid,
+                title=new_title or None, description=new_desc or None,
+            )
+        except Exception:
+            logger.exception(
+                "Dev[{}] update_merge_request failed for {}!{}",
+                self._agent_key, self._repo_key, iid,
+            )
+            return
+        if not applied:
+            return
+        async with session_scope(self._session_factory) as session:
+            row = (await session.execute(
+                select(MergeRequestRow).where(
+                    MergeRequestRow.task_external_id == task_row.external_id,
+                    MergeRequestRow.repo_key == self._repo_key,
+                    MergeRequestRow.iid == iid,
+                )
+            )).scalar_one_or_none()
+            if row is not None:
+                if new_title:
+                    row.title = new_title
+                if new_desc:
+                    row.description = new_desc
+        logger.info(
+            "Dev[{}] updated MR metadata for {}!{} (title={}, description={})",
+            self._agent_key, self._repo_key, iid,
+            bool(new_title), bool(new_desc),
+        )
 
     async def _existing_open_mr_iid(self, external_id: str) -> int | None:
         """iid of an open/draft MR for this ticket on this repo, if any."""

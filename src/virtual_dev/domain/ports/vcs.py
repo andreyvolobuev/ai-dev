@@ -88,6 +88,23 @@ class VcsPort(ABC):
 
     # --- Remote API ---
 
+    async def update_merge_request(
+        self,
+        repo_key: str,
+        iid: int,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> bool:
+        """Update an open MR's title and/or description in place.
+
+        Returns ``True`` when the update was applied. Default impl is a
+        no-op returning ``False`` so test fakes don't need boilerplate;
+        the Dev iteration path uses it to honour reviewer asks like
+        «поправь заголовок MR» — pushing a commit alone can't do that.
+        """
+        return False
+
     @abstractmethod
     async def create_merge_request(
         self,
