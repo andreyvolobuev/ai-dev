@@ -156,7 +156,7 @@ jira:
 # {key} — ticket external id, {title} — модель-сабмит, {url} — ticket URL,
 # {description} — модель-сабмит, {plan_block}, {notes_block}.
 merge_request:
-  title: "{key}: {title}"
+  title: "[{key}] {title}"
   commit_message: "[{key}] {title}"
   description: |
     **Задача:** [{key}]({url})

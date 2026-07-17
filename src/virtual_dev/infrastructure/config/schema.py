@@ -157,7 +157,7 @@ class JiraTemplatesCfg(_StrictModel):
 
 
 class MrTemplatesCfg(_StrictModel):
-    title: str = "{key}: {title}"
+    title: str = "[{key}] {title}"
     commit_message: str = "[{key}] {title}"
     description: str = ""
 
