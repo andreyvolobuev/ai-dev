@@ -23,8 +23,10 @@ def build(ctx: ToolContext):
         "dm_user",
         "Send a direct message to a chat-platform user with one "
         "question. `message` must read like a human typed it: 1-3 "
-        "short sentences, ~350 chars max, no lists/headings, no "
-        "analysis dumps — state the conclusion and ask. "
+        "short sentences, ~350 chars max, no headings, no analysis "
+        "dumps — state the conclusion and ask. If it carries more than "
+        "one thought, split into short paragraphs with a blank line "
+        "(questions may be bullet points) instead of one dense block. "
         "The `message` argument is the ONLY thing the human "
         "sees — your reasoning text, llm_text blocks, and tool-result "
         "summaries are invisible to them. So if you want to "
