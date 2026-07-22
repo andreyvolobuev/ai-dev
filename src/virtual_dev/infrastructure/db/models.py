@@ -175,6 +175,14 @@ class MergeRequestRow(Base):
     autofix_escalation_root_id: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True
     )
+    # Timestamp of the newest `/restart` post already executed for this MR.
+    # DB-backed replay dedup: the lead-DM catch-up sweep re-delivers the
+    # same post every tick, and the ✅-reaction guard alone proved
+    # insufficient live (reaction lookups can fail or lag, and another bot
+    # instance may have acked). Only a strictly newer post claims a reset.
+    autofix_restart_processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Set by both MM-driven and autofix iteration paths after a successful
     # push. The Reviewer poll ack-posts to the thread when CI for this sha
     # turns green, then clears the field. Means: "we have an unannounced

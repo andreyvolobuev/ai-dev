@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents import DevAgent, ResponderAction, ThreadResponderAgent
@@ -911,18 +911,44 @@ class MmThreadListener:
     ) -> None:
         """The team-lead replied in the give-up DM thread. On `/restart`,
         reset this MR's auto-fix counter so DevOps retries; ack and mark
-        the command processed. Other chatter in the thread is ignored."""
+        the command processed. Other chatter in the thread is ignored.
+
+        Replay-safe by construction: the reset is an atomic claim on
+        ``autofix_restart_processed_at`` — only a `/restart` post strictly
+        newer than the last claimed one wins. The catch-up sweep re-delivers
+        the same post every tick (fixed lookback cursor), and the
+        ✅-reaction guard alone proved insufficient live, so the DB is the
+        authority; the reaction stays as a cheap fast-path."""
         if not self._is_restart_command(event.text):
             return
         async with session_scope(self._session_factory) as session:
-            fresh = (await session.execute(
-                select(MergeRequestRow).where(MergeRequestRow.id == row.id)
-            )).scalar_one_or_none()
-            if fresh is None:
+            result = await session.execute(
+                update(MergeRequestRow)
+                .where(
+                    MergeRequestRow.id == row.id,
+                    or_(
+                        MergeRequestRow.autofix_restart_processed_at.is_(None),
+                        MergeRequestRow.autofix_restart_processed_at
+                        < event.timestamp,
+                    ),
+                )
+                .values(
+                    autofix_restart_processed_at=event.timestamp,
+                    pipeline_autofix_attempts=0,
+                    pipeline_infra_retries=0,
+                    pipeline_autofix_escalated=False,
+                )
+            )
+            # session.execute() is typed as the generic Result, but an
+            # UPDATE always yields a CursorResult carrying rowcount.
+            if int(getattr(result, "rowcount", 0) or 0) == 0:
+                # Replay of an already-claimed /restart (or a concurrent
+                # instance won the claim) — no ack, no counter churn.
+                logger.debug(
+                    "MmThreadListener: stale /restart replay for {}!{} ignored",
+                    row.repo_key, row.iid,
+                )
                 return
-            fresh.pipeline_autofix_attempts = 0
-            fresh.pipeline_infra_retries = 0
-            fresh.pipeline_autofix_escalated = False
         logger.info(
             "MmThreadListener: /restart reset autofix counter for {}!{}",
             row.repo_key, row.iid,

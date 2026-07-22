@@ -566,8 +566,22 @@ class ReviewerAgent:
                     feedback=latest.body,
                 )
             except Exception:
+                # The ack above already promised action. Retrying (return
+                # False) re-runs the whole LLM iteration every tick and
+                # re-promises with nothing to show — seen live as days of
+                # «коммит будет здесь» with zero commits. Announce the
+                # failure and mark handled; a human ping re-triggers.
                 logger.exception("Reviewer: GitLab iteration crashed")
-                return False
+                templates = self._config.notifications.mattermost
+                crashed = templates.thread_reply_iteration_crashed
+                if crashed and not await self._post_comment_reply(
+                    row, latest, crashed,
+                ):
+                    logger.warning(
+                        "Reviewer: crash follow-up failed to post for {}!{}",
+                        row.repo_key, row.iid,
+                    )
+                return True
             if result.commit_sha:
                 # Mark as pending CI confirmation. The green-CI status ack
                 # always lands in the MM review thread, never as a GitLab

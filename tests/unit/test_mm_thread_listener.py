@@ -674,6 +674,57 @@ async def test_restart_command_not_reprocessed_on_catchup_replay(
 
 
 @pytest.mark.asyncio
+async def test_restart_replay_is_noop_even_without_reaction_visibility(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Seen live: the ✅-reaction guard alone did not stop the replay loop
+    (reaction lookups can fail / lag / come from another bot instance).
+    The dedup must be DB-backed: a `/restart` post whose timestamp is not
+    newer than the already-claimed one is a no-op even when the chat
+    reports no bot reactions at all."""
+    mr_id = await _insert_escalated_mr(session_factory, escalation_root_id="esc-root")
+    event = _human_post(id="cmd-1", thread_root_id="esc-root", text="/restart")
+
+    class _BlindChat(_ScriptedChat):
+        """Chat whose reaction visibility is broken — get_post never
+        reports any bot reactions (the production failure mode)."""
+
+        async def get_post(self, post_id: str) -> ChatMessage | None:
+            m = await super().get_post(post_id)
+            if m is None:
+                return None
+            m.bot_reactions = []
+            return m
+
+    chat = _BlindChat([event, event])
+    responder = _ScriptedResponder([])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await _settle(lambda: len(chat.sent) >= 1)
+    await asyncio.sleep(0.1)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    from sqlalchemy import select
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pipeline_autofix_attempts == 0
+    acks = [body for _, body, root in chat.sent if body == "ack: retrying"]
+    assert acks == ["ack: retrying"]   # DB claim, not reactions, dedups
+
+
+@pytest.mark.asyncio
 async def test_non_restart_reply_in_escalation_thread_does_not_reset(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

@@ -1463,6 +1463,72 @@ async def test_gitlab_iterate_failed_tells_the_reviewer(
 
 
 @pytest.mark.asyncio
+async def test_gitlab_iterate_crash_tells_the_reviewer_and_stops_retrying(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Seen live: the ack promises a commit, ``handle_iteration`` raises,
+    and the old code kept the comment pending — every tick re-promised,
+    re-ran a full LLM iteration and crashed again, with the humans never
+    told. A crash must post the crashed template and mark the comment
+    handled (a human ping re-triggers if wanted), mirroring the MM path."""
+    from virtual_dev.application.agents import ResponderAction
+
+    mr_id = await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="please fix the typings",
+        ),
+    ]
+
+    class _OkVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+    vcs = _OkVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(
+        ResponderAction.ITERATE,
+        reply_text="уже правлю, коммит будет здесь",
+        feedback="fix the typings",
+    )
+
+    class _CrashingDev:
+        async def handle_iteration(self, **kwargs: object) -> object:
+            raise RuntimeError("workspace exploded")
+
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+        dev_agents={"bellingshausen": _CrashingDev()},
+    )
+    await agent.tick()
+
+    # The failure is announced to the humans…
+    assert any(
+        body == "dev упал" for _, _, body in vcs.posted_mr_comments
+    ), f"crash follow-up not posted; MR comments = {vcs.posted_mr_comments}"
+    # …and the comment does NOT stay pending (no infinite promise loop).
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert not (row.pending_comment_ids or []), (
+            "crashed iteration left the comment pending — it would re-run forever"
+        )
+
+
+@pytest.mark.asyncio
 async def test_failed_ack_keeps_comment_pending_and_skips_iteration(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
