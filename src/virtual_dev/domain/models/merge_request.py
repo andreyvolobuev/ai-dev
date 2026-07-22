@@ -73,6 +73,7 @@ class PipelineJob:
     status: str               # raw GitLab status ("failed", "success", ...)
     web_url: str
     log_excerpt: str = ""     # trailing N lines of the job log, populated on demand
+    allow_failure: bool = False   # GitLab tolerates this job failing (pipeline stays green)
 
 
 @dataclass

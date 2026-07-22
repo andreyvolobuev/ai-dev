@@ -201,6 +201,20 @@ def test_collapse_status() -> None:
     assert _collapse_status([_job("a", "running"), _job("b", "pending")]) == "running"
 
 
+def test_collapse_status_ignores_failed_allow_failure_jobs() -> None:
+    """A failed `allow_failure` job (e.g. a `destroy:feature` cleanup) does
+    not make GitLab mark the pipeline red — DevOps must agree, or it burns
+    auto-fix attempts «fixing» a job the code can't fix and escalates a
+    pipeline the humans see as green."""
+    cleanup = PipelineJob(
+        id=2, name="destroy:feature", stage="feature", status="failed",
+        web_url="https://gitlab/x/-/jobs/destroy", allow_failure=True,
+    )
+    assert _collapse_status([_job("a", "success"), cleanup]) == "success"
+    # A real failure alongside the tolerated one still reads as red.
+    assert _collapse_status([_job("a", "failed"), cleanup]) == "failed"
+
+
 @pytest.mark.asyncio
 async def test_red_pipeline_dispatches_dev_iteration_no_channel_post(
     session_factory: async_sessionmaker[AsyncSession],

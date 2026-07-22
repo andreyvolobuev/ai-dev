@@ -432,6 +432,15 @@ class MmThreadListener:
         if event.thread_root_id:
             escalated = await self._load_mr_by_escalation_thread(event.thread_root_id)
             if escalated is not None:
+                # Idempotency for catch-up replay: the lead-DM sweep uses a
+                # fixed lookback cursor, so it re-delivers this post every
+                # tick. A ✅-marked /restart was already executed — without
+                # this guard the bot re-acks and re-resets the counter on
+                # every sweep (seen live: dozens of identical acks).
+                if event.id and self._chat is not None:
+                    fresh = await self._chat.get_post(event.id)
+                    if fresh is not None and _PROCESSED_REACTION in fresh.bot_reactions:
+                        return
                 await self._handle_autofix_restart(escalated, event)
                 return
 

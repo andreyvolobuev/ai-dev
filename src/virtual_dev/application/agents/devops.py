@@ -415,10 +415,18 @@ _RUNNING_JOB_STATUSES = frozenset({"running", "pending", "preparing", "scheduled
 
 
 def _collapse_status(jobs: list[PipelineJob]) -> str:
-    """Derive a single pipeline state from job statuses."""
+    """Derive a single pipeline state from job statuses.
+
+    Failed ``allow_failure`` jobs (cleanup / destroy-env gates) don't make
+    GitLab mark the pipeline red, so they must not make DevOps see red
+    either — there is nothing in the code for an auto-fix to fix.
+    """
     if not jobs:
         return "unknown"
-    statuses = {j.status for j in jobs}
+    statuses = {
+        "success" if j.status == "failed" and j.allow_failure else j.status
+        for j in jobs
+    }
     if "failed" in statuses:
         return "failed"
     if statuses <= _PASSING_JOB_STATUSES:

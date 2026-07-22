@@ -635,6 +635,45 @@ async def test_restart_command_resets_autofix_counter(
 
 
 @pytest.mark.asyncio
+async def test_restart_command_not_reprocessed_on_catchup_replay(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The catch-up sweep re-delivers lead-DM posts every tick (its cursor
+    is a fixed lookback, it never advances). A `/restart` that was already
+    ✅-acked must be a no-op on replay — otherwise the bot spams one ack
+    per sweep and keeps resetting the autofix counter forever."""
+    mr_id = await _insert_escalated_mr(session_factory, escalation_root_id="esc-root")
+    event = _human_post(id="cmd-1", thread_root_id="esc-root", text="/restart")
+    # Same post delivered twice: once via WS, once via catch-up replay.
+    chat = _ScriptedChat([event, event])
+    responder = _ScriptedResponder([])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await _settle(lambda: len(chat.sent) >= 1)
+    await asyncio.sleep(0.1)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    from sqlalchemy import select
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pipeline_autofix_attempts == 0
+    acks = [body for _, body, root in chat.sent if body == "ack: retrying"]
+    assert acks == ["ack: retrying"]   # exactly one, not one per delivery
+
+
+@pytest.mark.asyncio
 async def test_non_restart_reply_in_escalation_thread_does_not_reset(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

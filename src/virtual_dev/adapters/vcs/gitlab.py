@@ -844,6 +844,7 @@ class GitLabVcs(VcsPort):
                 out.append(PipelineJob(
                     id=job_id, name=name, stage=stage, status=status,
                     web_url=web_url, log_excerpt=tail,
+                    allow_failure=bool(attrs.get("allow_failure", False)),
                 ))
             return out
 

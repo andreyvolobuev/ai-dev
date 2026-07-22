@@ -581,6 +581,27 @@ class ReviewerAgent:
                     "for {}!{} sha={}",
                     row.repo_key, row.iid, result.commit_sha[:12],
                 )
+            else:
+                # The ack above promised action; an iteration that ends
+                # with no commit (nothing to change, merge conflict, model
+                # failure) must say so — silence after «уже делаю» reads
+                # as the bot ghosting the reviewer. Best-effort: a dropped
+                # follow-up is logged, not retried — retrying would re-run
+                # the whole LLM iteration.
+                from virtual_dev.application.agents.dev import DevOutcome
+                templates = self._config.notifications.mattermost
+                followup = (
+                    templates.thread_reply_iteration_crashed
+                    if result.outcome == DevOutcome.FAILED
+                    else templates.thread_reply_iteration_no_changes
+                )
+                if followup and not await self._post_comment_reply(
+                    row, latest, followup,
+                ):
+                    logger.warning(
+                        "Reviewer: no-commit follow-up failed to post "
+                        "for {}!{}", row.repo_key, row.iid,
+                    )
 
         # ITERATE that ran (with or without a commit), or a no-op decision
         # (IGNORE / empty reply_text): nothing failed transiently, so the
