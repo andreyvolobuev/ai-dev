@@ -1037,7 +1037,13 @@ class ReviewerAgent:
             row.review_ping_sent = review_ping_sent
             if touched:
                 row.last_activity_at = now
-                row.ping_reviewers_at = None
+                # NOTE: ping_reviewers_at deliberately survives activity.
+                # Resetting it re-armed the «ждёт ревью уже 4ч» nag after
+                # every burst of review activity + 4 quiet hours — seen
+                # live as the same nag on Jul 23, 28 and 29 while review
+                # was well underway. The channel nag fires at most once
+                # per MR; a review that stalls AFTER engagement is the
+                # escalation DM's job, which does re-arm below.
                 row.last_escalation_at = None
             if escalated_this_tick:
                 row.last_escalation_at = now

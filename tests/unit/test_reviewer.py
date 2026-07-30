@@ -963,6 +963,57 @@ async def test_stale_ping_replies_into_existing_review_thread(
 
 
 @pytest.mark.asyncio
+async def test_stale_ping_fires_at_most_once_per_mr(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Seen live (DM-2740): the bot nagged «ждёт ревью уже 4ч» on Jul 23,
+    28 AND 29 — every burst of review activity reset ``ping_reviewers_at``,
+    so each 4-hour lull re-armed the same nag (always claiming «4ч»,
+    since idle==threshold at the moment it fires). Once reviewers have
+    engaged, «ждёт ревью» is simply false; a truly abandoned review is
+    the escalation DM's job, which does re-arm on activity."""
+    mr_id = await _insert_mr(
+        session_factory,
+        last_activity_at=datetime.now(timezone.utc),
+        last_seen="c-0",
+    )
+    # The nag already fired once for this MR, days ago.
+    async with session_scope(session_factory) as session:
+        row = (await session.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        row.ping_reviewers_at = datetime.now(timezone.utc) - timedelta(days=1)
+
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(id="c-1", mr_id="42", author_username="alice", body="спасибо, гляну"),
+    ]
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    # Tick 1: review activity arrives (human chatter comment).
+    stats1 = await agent.tick()
+    assert stats1.pings_sent == 0
+
+    # ...then five quiet hours pass (idle > ping_after_hours=4).
+    async with session_scope(session_factory) as session:
+        row = (await session.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        row.last_activity_at = datetime.now(timezone.utc) - timedelta(hours=5)
+
+    # Tick 2: the nag must NOT re-fire — it already ran once for this MR.
+    stats2 = await agent.tick()
+    assert stats2.pings_sent == 0
+    assert not any("waiting for a review" in text for _, text in chat.sent_channels)
+
+
+@pytest.mark.asyncio
 async def test_stale_ping_held_while_bot_owes_a_fix(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
