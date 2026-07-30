@@ -1329,6 +1329,89 @@ async def test_responder_sees_only_its_own_discussion(
 
 
 @pytest.mark.asyncio
+async def test_gitlab_iterate_passes_responder_feedback_to_dev(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Seen live (DM-2740): the responder composed a detailed
+    `iteration_feedback`, but the GitLab path handed the dev the RAW
+    comment body instead. On «ping» the dev said "nothing actionable"
+    and committed nothing; on «ну и сиди без аппрува, железяка» it
+    returned status=failed — while the actual instruction was silently
+    dropped. The dev must receive the responder's iteration_feedback
+    (with the discussion transcript for context), not the raw comment."""
+    from virtual_dev.application.agents import (
+        DevOutcome,
+        DevResult,
+        ResponderAction,
+    )
+
+    await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="поправь: ping", discussion_id="disc-p",
+        ),
+    ]
+
+    class _OkVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+        async def reply_to_comment(
+            self, repo_key: str, iid: int, comment_id: str, body: str,
+        ) -> None:
+            self.posted_mr_comments.append((repo_key, iid, body))
+
+    vcs = _OkVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(
+        ResponderAction.ITERATE,
+        reply_text="уже делаю",
+        feedback="Удалить буллет про critical из CLAUDE.md, убедиться что коммит попал в MR.",
+    )
+
+    class _CapturingDev:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def handle_iteration(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return DevResult(
+                outcome=DevOutcome.MR_OPENED, branch_name="ai-dev/dm-1-42",
+                commit_sha="deadbeef",
+            )
+
+    dev = _CapturingDev()
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+        dev_agents={"bellingshausen": dev},
+    )
+    await agent.tick()
+
+    assert len(dev.calls) == 1
+    call = dev.calls[0]
+    assert call["feedback"] == (
+        "Удалить буллет про critical из CLAUDE.md, убедиться что коммит попал в MR."
+    )
+    # The human originals travel along as the thread, so the dev can
+    # cross-check the responder's paraphrase.
+    thread = call.get("thread")
+    assert thread, "dev must receive the discussion transcript"
+    assert any("поправь: ping" in m.text for m in thread)   # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
 async def test_gitlab_iterate_posts_acknowledgement(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

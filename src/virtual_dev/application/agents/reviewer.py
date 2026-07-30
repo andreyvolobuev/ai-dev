@@ -610,11 +610,21 @@ class ReviewerAgent:
             ):
                 return False
             try:
+                # The dev gets the responder's distilled instruction, NOT
+                # the raw comment. Seen live (DM-2740): passing latest.body
+                # meant «ping» reached the dev as the whole task («nothing
+                # actionable» → no commit) and «ну и сиди без аппрува,
+                # железяка» became status=failed — while the responder's
+                # detailed iteration_feedback was silently dropped. The
+                # discussion transcript travels along so the dev can
+                # cross-check the paraphrase against the human originals
+                # (mirrors the MM-thread path).
                 result = await dev.handle_iteration(   # type: ignore[union-attr]
                     tracker="jira",
                     external_id=row.task_external_id,
                     branch_name=row.source_branch,
-                    feedback=latest.body,
+                    feedback=decision.iteration_feedback or latest.body,
+                    thread=[*transcript, latest_chat],
                 )
             except Exception:
                 # The ack above already promised action. Retrying (return
