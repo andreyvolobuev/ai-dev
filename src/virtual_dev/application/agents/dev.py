@@ -124,6 +124,10 @@ class DevSkipReason(str, Enum):
 class DevOutcome(str, Enum):
     SKIPPED = "skipped"
     NO_CHANGES = "no_changes"           # Claude submitted but did not modify anything
+    # Iteration touched only MR title/description (applied via the VCS
+    # API, nothing to commit). A success — callers must not announce it
+    # with the no-changes/failure template.
+    METADATA_UPDATED = "metadata_updated"
     MR_OPENED = "mr_opened"
     FAILED = "failed"
 
@@ -502,7 +506,7 @@ class DevAgent:
         # commit — apply metadata changes via the VCS API before looking at
         # the working tree, so a pure-retitle iteration isn't lost as
         # NO_CHANGES with the title silently unchanged.
-        await self._apply_mr_metadata(task_row, captured)
+        metadata_applied = await self._apply_mr_metadata(task_row, captured)
 
         commit_message = (
             f"[{task_row.external_id}] {_strip_ticket_prefix(str(captured.get('title') or 'iteration'), task_row.external_id)}"
@@ -511,6 +515,24 @@ class DevAgent:
             task_row=task_row, message=commit_message,
         )
         if not commit_sha:
+            # A clean tree after the metadata was applied is a SUCCESS
+            # (pure-retitle / description fix), not a failure. Seen live:
+            # this returned NO_CHANGES and the review thread got the
+            # «не смогла внести правку, смотри логи» template right after
+            # the description was in fact updated.
+            if metadata_applied:
+                logger.info(
+                    "Dev[{}] iteration: metadata-only update for {}",
+                    self._agent_key, external_id,
+                )
+                return DevResult(
+                    outcome=DevOutcome.METADATA_UPDATED,
+                    branch_name=branch_name,
+                    cost_usd=result.cost_usd,
+                    iterations=result.turns,
+                    stopped_reason=result.stopped_reason,
+                    submission=captured,
+                )
             logger.info(
                 "Dev[{}] iteration: no changes to commit for {}",
                 self._agent_key, external_id,
@@ -880,24 +902,26 @@ class DevAgent:
 
     async def _apply_mr_metadata(
         self, task_row: TaskRow, captured: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         """Apply reviewer-requested MR title/description changes.
 
         ``mr_title`` / ``mr_description`` from ``submit_mr`` are pushed to
         the VCS verbatim and mirrored into the local MR row so the
         reviewer/responder flows see the new metadata immediately.
+        Returns whether the VCS actually accepted an update — callers use
+        it to distinguish a metadata-only success from a true no-op.
         """
         new_title = str(captured.get("mr_title") or "").strip()
         new_desc = str(captured.get("mr_description") or "").strip()
         if not new_title and not new_desc:
-            return
+            return False
         iid = await self._existing_open_mr_iid(task_row.external_id)
         if iid is None:
             logger.warning(
                 "Dev[{}] mr_title/mr_description submitted but no open MR "
                 "found for {}", self._agent_key, task_row.external_id,
             )
-            return
+            return False
         try:
             applied = await self._vcs.update_merge_request(
                 self._repo_key, iid,
@@ -908,9 +932,9 @@ class DevAgent:
                 "Dev[{}] update_merge_request failed for {}!{}",
                 self._agent_key, self._repo_key, iid,
             )
-            return
+            return False
         if not applied:
-            return
+            return False
         async with session_scope(self._session_factory) as session:
             row = (await session.execute(
                 select(MergeRequestRow).where(
@@ -929,6 +953,7 @@ class DevAgent:
             self._agent_key, self._repo_key, iid,
             bool(new_title), bool(new_desc),
         )
+        return True
 
     async def _existing_open_mr_iid(self, external_id: str) -> int | None:
         """iid of an open/draft MR for this ticket on this repo, if any."""

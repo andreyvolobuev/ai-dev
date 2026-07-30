@@ -61,12 +61,15 @@ mattermost:
   # Reviewer thread responses (MmThreadListener). {commit_sha_short}, {branch}.
   thread_reply_no_dev_agent: "Не могу внести правку по этому репозиторию — нужна помощь человека."
   thread_reply_no_task: "Не нашла связанный тикет."
-  thread_reply_iteration_crashed: "Попробовала внести правку, но не получилось — нужна помощь человека, гляньте логи."
+  thread_reply_iteration_crashed: "Попробовала внести правку, но упёрлась в проблему на своей стороне. Пните меня здесь ещё раз — попробую заново."
   # Постится в тред когда CI на iteration-коммите станет зелёным.
   # До этого момента бот молчит — нет смысла звать ревьюеров на код,
   # который ещё не подтверждён пайплайном.
   thread_reply_iteration_done: "✅ Внесла правки, CI зелёный — коммит `{commit_sha_short}` на `{branch}`. Можно смотреть 🙏"
-  thread_reply_iteration_no_changes: "Рабочее дерево осталось чистым — правка не потребовалась или я не смогла внести её. Смотри логи."
+  thread_reply_iteration_no_changes: "Посмотрела ещё раз — код уже соответствует замечанию, отдельный коммит не потребовался. Если я что-то упустила, напишите, что именно поправить."
+  # Итерация обновила только заголовок/описание MR (через API, без
+  # коммита) — это успех, а не "ничего не изменилось".
+  thread_reply_iteration_metadata_only: "✅ Поправила описание/заголовок MR — правка кода тут не требовалась."
 
   # --- Lead-escalation DMs ---
   # The analyst agent composes the body of every per-recipient DM

@@ -111,6 +111,7 @@ def _test_config() -> AppConfig:
             thread_reply_iteration_crashed="dev упал",
             thread_reply_iteration_done="готово {commit_sha_short} на {branch}",
             thread_reply_iteration_no_changes="без изменений",
+            thread_reply_iteration_metadata_only="обновила метаданные MR",
             pipeline_autofix_restart_ack="ack: retrying",
         )),
     )
@@ -276,6 +277,116 @@ async def test_iterate_triggers_dev_and_reports_back(
         assert row.pipeline_autofix_attempts == 0   # reset by user-driven iter
     # ✅ reaction set on the source comment.
     assert ("post-b", _PROCESSED_REACTION) in chat.reactions
+
+
+@pytest.mark.asyncio
+async def test_iterate_metadata_only_acks_success(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A metadata-only iteration (MR title/description updated via the VCS
+    API, nothing committed) is a success — the thread must NOT hear the
+    no-changes/failure template."""
+    await _insert_mr(session_factory, root_id="root-m1")
+    events = [_human_post(id="post-m1", thread_root_id="root-m1", text="поправь описание MR")]
+    chat = _ScriptedChat(events)
+    responder = _ScriptedResponder([ResponderDecision(
+        action=ResponderAction.ITERATE,
+        reply_text="Принято, поправлю описание.",
+        iteration_feedback="Fix the MR description.",
+        reasoning="metadata-fix",
+    )])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.METADATA_UPDATED, branch_name="ai-dev/dm-1"))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await _settle(lambda: len(chat.sent) >= 2)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    replies = [body for _, body, root in chat.sent if root == "root-m1"]
+    assert "обновила метаданные MR" in replies
+    assert "без изменений" not in replies
+    assert "dev упал" not in replies
+
+
+@pytest.mark.asyncio
+async def test_iterate_failed_posts_crashed_template(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A FAILED iteration (merge conflict, model status=failed) must post
+    the crashed template — not «без изменений», which reads as "your ask
+    needed no change" while the change silently never happened."""
+    await _insert_mr(session_factory, root_id="root-m2")
+    events = [_human_post(id="post-m2", thread_root_id="root-m2", text="почини тест")]
+    chat = _ScriptedChat(events)
+    responder = _ScriptedResponder([ResponderDecision(
+        action=ResponderAction.ITERATE,
+        reply_text="Принято, чиню.",
+        iteration_feedback="Fix the test.",
+        reasoning="clear-fix",
+    )])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(
+        outcome=DevOutcome.FAILED, branch_name="ai-dev/dm-1",
+        stopped_reason="merge-conflict-with-master",
+    ))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await _settle(lambda: len(chat.sent) >= 2)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    replies = [body for _, body, root in chat.sent if root == "root-m2"]
+    assert "dev упал" in replies
+    assert "без изменений" not in replies
+
+
+@pytest.mark.asyncio
+async def test_skips_post_deleted_before_dispatch(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Seen live (DM-2740): a reviewer posted, then deleted+reposted the
+    message. The stale event still reached the responder (an LLM run on an
+    unanswerable post) and the reply landed under a post that no longer
+    exists. When get_post can't fetch the source post, skip it — catch-up
+    retries later if it was a transient MM error."""
+    await _insert_mr(session_factory, root_id="root-m3")
+    event = _human_post(id="post-m3", thread_root_id="root-m3", text="был да сплыл")
+    chat = _ScriptedChat([event])
+    del chat._posts["post-m3"]   # the post is gone by dispatch time
+    responder = _ScriptedResponder([])   # must NOT be called
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await _settle(lambda: listener.stats.events_routed >= 1, timeout=1.0)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert responder.calls == 0
+    assert chat.sent == []
+    assert chat.reactions == []
 
 
 @pytest.mark.asyncio

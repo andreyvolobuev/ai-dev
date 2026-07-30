@@ -613,8 +613,11 @@ async def test_iteration_applies_mr_title_and_description_update(
         feedback="поправь заголовок MR: тикет в скобки, текст на английском",
     )
 
-    # Metadata update reached the VCS even though nothing was committed.
-    assert result.outcome is DevOutcome.NO_CHANGES
+    # Metadata update reached the VCS even though nothing was committed —
+    # and the outcome says so. Seen live: a successful description-only
+    # iteration came back as NO_CHANGES and the thread got the
+    # "не смогла внести правку, смотри логи" failure template.
+    assert result.outcome is DevOutcome.METADATA_UPDATED
     assert ("update_merge_request", (
         "bellingshausen", 99,
         "[DM-7] Tolerate per-source failures in GC",

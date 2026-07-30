@@ -139,6 +139,9 @@ class MmTemplatesCfg(_StrictModel):
     thread_reply_iteration_crashed: str = ""
     thread_reply_iteration_done: str = ""
     thread_reply_iteration_no_changes: str = ""
+    # Iteration updated only the MR title/description (no commit) — a
+    # success ack, distinct from no_changes which means "nothing done".
+    thread_reply_iteration_metadata_only: str = ""
     # Lead-escalation DMs. Two flavours:
     # * stuck — agent ran out of angles and asks the lead for help
     #   (ticket stays in "In Progress").

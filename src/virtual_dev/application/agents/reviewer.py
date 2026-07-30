@@ -604,11 +604,15 @@ class ReviewerAgent:
                 # the whole LLM iteration.
                 from virtual_dev.application.agents.dev import DevOutcome
                 templates = self._config.notifications.mattermost
-                followup = (
-                    templates.thread_reply_iteration_crashed
-                    if result.outcome == DevOutcome.FAILED
-                    else templates.thread_reply_iteration_no_changes
-                )
+                if result.outcome == DevOutcome.FAILED:
+                    followup = templates.thread_reply_iteration_crashed
+                elif result.outcome == DevOutcome.METADATA_UPDATED:
+                    # Metadata-only iteration (title/description fixed via
+                    # the VCS API) is a success — ack it as such. There is
+                    # no commit, hence no CI to wait for.
+                    followup = templates.thread_reply_iteration_metadata_only
+                else:
+                    followup = templates.thread_reply_iteration_no_changes
                 if followup and not await self._post_comment_reply(
                     row, latest, followup,
                 ):

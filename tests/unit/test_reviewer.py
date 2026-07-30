@@ -225,6 +225,7 @@ def _cfg(
             thread_reply_iteration_done="✅ CI зелёный — коммит {commit_sha_short} на {branch}",
             thread_reply_iteration_no_changes="без изменений",
             thread_reply_iteration_crashed="dev упал",
+            thread_reply_iteration_metadata_only="обновила метаданные MR",
         )),
     )
 
@@ -1399,6 +1400,69 @@ async def test_gitlab_iterate_without_commit_tells_the_reviewer(
     assert any(
         body == "без изменений" for _, _, body in vcs.posted_mr_comments
     ), f"no-changes follow-up not posted; MR comments = {vcs.posted_mr_comments}"
+
+
+@pytest.mark.asyncio
+async def test_gitlab_iterate_metadata_only_acks_success(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Seen live (DM-2740): «поправь описание MR» — the dev updated the MR
+    description via the VCS API, nothing to commit, and the thread got the
+    no-changes template «…не смогла внести её. Смотри логи». A successful
+    metadata-only iteration must be acked as success, not as a failure."""
+    from virtual_dev.application.agents import (
+        DevOutcome,
+        DevResult,
+        ResponderAction,
+    )
+
+    await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="поправь описание МР'а, в нём осталось _is_source_critical",
+        ),
+    ]
+
+    class _OkVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+    vcs = _OkVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(
+        ResponderAction.ITERATE,
+        reply_text="поправлю описание",
+        feedback="update the MR description",
+    )
+
+    class _MetadataOnlyDev:
+        async def handle_iteration(self, **kwargs: object) -> object:
+            return DevResult(
+                outcome=DevOutcome.METADATA_UPDATED, branch_name="ai-dev/dm-1-42",
+            )
+
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+        dev_agents={"bellingshausen": _MetadataOnlyDev()},
+    )
+    await agent.tick()
+
+    bodies = [body for _, _, body in vcs.posted_mr_comments]
+    assert "обновила метаданные MR" in bodies, f"MR comments = {bodies}"
+    assert "без изменений" not in bodies
+    assert "dev упал" not in bodies
 
 
 @pytest.mark.asyncio

@@ -32,7 +32,12 @@ from loguru import logger
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from virtual_dev.application.agents import DevAgent, ResponderAction, ThreadResponderAgent
+from virtual_dev.application.agents import (
+    DevAgent,
+    DevOutcome,
+    ResponderAction,
+    ThreadResponderAgent,
+)
 from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.application.services.ticket_reset import reset_ticket_state
@@ -480,9 +485,22 @@ class MmThreadListener:
 
         self.stats.events_routed += 1
 
-        # Idempotency: skip if we already reacted ✅.
+        # The post is gone (author deleted it) or MM is flaking — either
+        # way there is nothing safe to answer. Seen live: a reviewer
+        # deleted+reposted a message; the stale event still ran the LLM
+        # and the reply landed under a post that no longer existed. A
+        # transient fetch error self-heals: the post stays unreacted and
+        # the catch-up sweep retries it.
         fresh_post = await self._chat.get_post(event.id)
-        if fresh_post is not None and _PROCESSED_REACTION in fresh_post.bot_reactions:
+        if fresh_post is None:
+            logger.info(
+                "MmThreadListener: post {} unfetchable (deleted?) — skipping",
+                event.id,
+            )
+            return
+
+        # Idempotency: skip if we already reacted ✅.
+        if _PROCESSED_REACTION in fresh_post.bot_reactions:
             logger.debug(
                 "MmThreadListener: skipping already-processed post {}", event.id,
             )
@@ -682,6 +700,19 @@ class MmThreadListener:
                 "MmThreadListener: iteration pushed silently {}!{} sha={}, "
                 "thread ack will follow once CI is green",
                 row.repo_key, row.iid, result.commit_sha[:12],
+            )
+        elif result.outcome is DevOutcome.FAILED:
+            # The iteration genuinely failed (merge conflict, model
+            # status=failed). Announcing it as "no changes needed" reads
+            # as the ask being satisfied while nothing happened.
+            await self._post_reply(
+                channel_id, root_id, templates.thread_reply_iteration_crashed,
+            )
+        elif result.outcome is DevOutcome.METADATA_UPDATED:
+            # MR title/description fixed via the VCS API — a success with
+            # no commit, hence no CI gate to wait for. Ack immediately.
+            await self._post_reply(
+                channel_id, root_id, templates.thread_reply_iteration_metadata_only,
             )
         else:
             # Nothing to push → nothing to wait for. Tell the user we
