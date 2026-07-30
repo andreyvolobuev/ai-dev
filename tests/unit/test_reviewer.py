@@ -1403,6 +1403,149 @@ async def test_gitlab_iterate_without_commit_tells_the_reviewer(
 
 
 @pytest.mark.asyncio
+async def test_gitlab_reply_withheld_when_discussion_moved_on(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Seen live (DM-2740, «ты ответила не в тот тред»): the reviewer
+    fetched «оставь в схеме…», spent minutes in the LLM, and posted the
+    reply — but the human had already followed up with «а хотя погоди…»
+    in the same discussion. The reply landed under a superseded state and
+    read as a non-sequitur. When a fresh fetch right before posting shows
+    newer human comments in the discussion, the reply must be withheld
+    (comment stays pending) so the next tick answers the true latest."""
+    from virtual_dev.application.agents import ResponderAction
+
+    await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    first_batch = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="поправь: оставь в схеме и начни использовать модель в gc",
+            discussion_id="disc-b",
+        ),
+    ]
+    second_batch = [
+        *first_batch,
+        ReviewComment(
+            id="c-2", mr_id="42", author_username="alice",
+            body="а хотя погоди, что за нововведение с critical?",
+            discussion_id="disc-b",
+        ),
+    ]
+
+    class _RacingVcs(_StubVcs):
+        """First fetch: before the follow-up. Later fetches: after it."""
+
+        def __init__(self) -> None:
+            super().__init__(
+                comments={},
+                approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+            )
+            self.list_calls = 0
+
+        async def list_review_comments(
+            self, repo_key: str, iid: int,
+        ) -> list[ReviewComment]:
+            self.list_calls += 1
+            return list(first_batch) if self.list_calls == 1 else list(second_batch)
+
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+        async def reply_to_comment(
+            self, repo_key: str, iid: int, comment_id: str, body: str,
+        ) -> None:
+            self.posted_mr_comments.append((repo_key, iid, body))
+
+    vcs = _RacingVcs()
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(
+        ResponderAction.REPLY,
+        reply_text="Ок, тогда парсим настройки через модель…",
+    )
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+    )
+    await agent.tick()
+
+    # Nothing posted into the stale discussion…
+    assert vcs.posted_mr_comments == []
+    # …and the comment is kept pending so the next tick retries against
+    # the full discussion (including the follow-up).
+    async with session_factory() as session:
+        row = (await session.execute(
+            select(MergeRequestRow).where(MergeRequestRow.iid == 42)
+        )).scalar_one()
+    assert row.pending_comment_ids == ["c-1"]
+
+
+@pytest.mark.asyncio
+async def test_gitlab_reply_withheld_when_comment_deleted_mid_decide(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The comment vanished (author deleted it) while the responder was
+    deciding — replying to it would thread a message under nothing. Skip
+    the post; the pending id is pruned on the next tick when the comment
+    no longer resolves."""
+    from virtual_dev.application.agents import ResponderAction
+
+    await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    first_batch = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="поправь вот это (сейчас удалю коммент)", discussion_id="disc-x",
+        ),
+    ]
+
+    class _DeletingVcs(_StubVcs):
+        def __init__(self) -> None:
+            super().__init__(
+                comments={},
+                approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+            )
+            self.list_calls = 0
+
+        async def list_review_comments(
+            self, repo_key: str, iid: int,
+        ) -> list[ReviewComment]:
+            self.list_calls += 1
+            return list(first_batch) if self.list_calls == 1 else [first_batch[0]]
+
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+        async def reply_to_comment(
+            self, repo_key: str, iid: int, comment_id: str, body: str,
+        ) -> None:
+            self.posted_mr_comments.append((repo_key, iid, body))
+
+    vcs = _DeletingVcs()
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(ResponderAction.REPLY, reply_text="ответ")
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+    )
+    await agent.tick()
+
+    assert vcs.posted_mr_comments == []
+
+
+@pytest.mark.asyncio
 async def test_gitlab_iterate_metadata_only_acks_success(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

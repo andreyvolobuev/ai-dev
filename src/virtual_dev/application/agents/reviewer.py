@@ -423,6 +423,37 @@ class ReviewerAgent:
                 still_pending.append(latest.id)
         return still_pending
 
+    async def _discussion_moved_on(
+        self, row: MergeRequestRow, latest: ReviewComment,
+    ) -> bool:
+        """True when ``latest``'s discussion has newer human comments than
+        the snapshot the decision was made against, or the comment itself
+        was deleted. On a fetch error, assume not-moved-on: answering a
+        possibly-stale comment beats retry-looping on API failures."""
+        assert self._vcs is not None
+        try:
+            fresh = list(await self._vcs.list_review_comments(row.repo_key, row.iid))
+        except Exception:
+            logger.exception(
+                "Reviewer: staleness re-fetch failed for {}!{} — posting anyway",
+                row.repo_key, row.iid,
+            )
+            return False
+        key = latest.discussion_id or latest.id
+        same = [
+            c for c in fresh
+            if not c.system and (c.discussion_id or c.id) == key
+        ]
+        idx = next((i for i, c in enumerate(same) if c.id == latest.id), None)
+        if idx is None:
+            # The comment we were about to answer no longer exists —
+            # threading a reply under it is impossible/meaningless. The
+            # pending id is pruned next tick when it fails to resolve.
+            return True
+        return any(
+            not self._is_bot_author(c.author_username) for c in same[idx + 1:]
+        )
+
     async def _post_comment_reply(
         self, row: MergeRequestRow, latest: ReviewComment, text: str,
     ) -> bool:
@@ -513,6 +544,26 @@ class ReviewerAgent:
             "Reviewer: GitLab comment decision={} reasoning={!r}",
             decision.action.value, decision.reasoning,
         )
+
+        # decide() runs for minutes; the discussion may have moved on
+        # underneath it. Seen live («ты ответила не в тот тред»): the
+        # human posted a follow-up reversing themselves while the model
+        # was thinking, and the reply landed under a superseded state.
+        # Re-fetch right before posting: if a newer human comment exists
+        # in this discussion (or the comment vanished), withhold — the
+        # comment stays pending and the next tick answers the true
+        # latest with the full transcript.
+        if decision.action in (
+            ResponderAction.REPLY,
+            ResponderAction.PROPOSE_ALTERNATIVE,
+            ResponderAction.ITERATE,
+        ) and await self._discussion_moved_on(row, latest):
+            logger.info(
+                "Reviewer: discussion {} on {}!{} moved on while deciding — "
+                "withholding the reply, retrying next tick",
+                discussion_key, row.repo_key, row.iid,
+            )
+            return False
 
         # PROPOSE_ALTERNATIVE has the same chat side-effect as REPLY on
         # GitLab: post the text on the discussion. The semantic
