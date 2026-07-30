@@ -227,6 +227,78 @@ async def test_checkout_existing_branch_fetches_outside_single_branch_refspec(
 
 
 @pytest.mark.asyncio
+async def test_merge_base_into_current_connects_shallow_histories(
+    tmp_path: Path,
+) -> None:
+    """Seen live (DM-2740): after a pod redeploy the workspace is a fresh
+    --depth=1 clone of master, and the bot's existing MR branch is fetched
+    tip-only — the two grafted histories share no recorded ancestor, so
+    every iteration died on «fatal: refusing to merge unrelated histories»
+    before the model even ran. merge_base_into_current must deepen both
+    histories until a merge base appears and then merge cleanly."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _init_remote_repo(upstream)
+    # Fork the MR branch off main's current tip, add a commit…
+    subprocess.run(["git", "checkout", "-qb", "ai-dev/DM-1-fix"], cwd=upstream, check=True)
+    (upstream / "fix.txt").write_text("the fix")
+    subprocess.run(["git", "add", "-A"], cwd=upstream, check=True)
+    subprocess.run(["git", "-c", "user.email=o@x", "-c", "user.name=o",
+                    "commit", "-qm", "fix"], cwd=upstream, check=True)
+    # …then advance main so the branch tip and main tip diverge.
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=upstream, check=True)
+    (upstream / "mainline.txt").write_text("newer main")
+    subprocess.run(["git", "add", "-A"], cwd=upstream, check=True)
+    subprocess.run(["git", "-c", "user.email=o@x", "-c", "user.name=o",
+                    "commit", "-qm", "mainline"], cwd=upstream, check=True)
+    # file:// URL — git silently ignores --depth for plain local paths.
+    vcs = _vcs(tmp_path, _cfg("demo", f"file://{upstream}"))
+
+    workspace = Path(await vcs.ensure_clone("demo"))
+    await vcs.checkout_existing_branch("demo", "ai-dev/DM-1-fix")
+
+    result = await vcs.merge_base_into_current("demo", "main")
+
+    assert result is None, f"merge failed: {result}"
+    # main's commit really got merged into the branch's working tree.
+    assert (workspace / "mainline.txt").read_text() == "newer main"
+    assert (workspace / "fix.txt").read_text() == "the fix"
+
+
+@pytest.mark.asyncio
+async def test_merge_base_into_current_reports_real_conflict(
+    tmp_path: Path,
+) -> None:
+    """A genuine content conflict must come back as an error string (the
+    caller surfaces it to the UI) with the working tree restored."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _init_remote_repo(upstream)
+    (upstream / "shared.txt").write_text("base\n")
+    subprocess.run(["git", "add", "-A"], cwd=upstream, check=True)
+    subprocess.run(["git", "-c", "user.email=o@x", "-c", "user.name=o",
+                    "commit", "-qm", "base"], cwd=upstream, check=True)
+    subprocess.run(["git", "checkout", "-qb", "ai-dev/DM-1-fix"], cwd=upstream, check=True)
+    (upstream / "shared.txt").write_text("branch version\n")
+    subprocess.run(["git", "-c", "user.email=o@x", "-c", "user.name=o",
+                    "commit", "-aqm", "branch change"], cwd=upstream, check=True)
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=upstream, check=True)
+    (upstream / "shared.txt").write_text("main version\n")
+    subprocess.run(["git", "-c", "user.email=o@x", "-c", "user.name=o",
+                    "commit", "-aqm", "main change"], cwd=upstream, check=True)
+    vcs = _vcs(tmp_path, _cfg("demo", f"file://{upstream}"))
+
+    workspace = Path(await vcs.ensure_clone("demo"))
+    await vcs.checkout_existing_branch("demo", "ai-dev/DM-1-fix")
+
+    result = await vcs.merge_base_into_current("demo", "main")
+
+    assert result is not None and "conflict" in result.lower()
+    # merge --abort restored the branch's version.
+    assert (workspace / "shared.txt").read_text() == "branch version\n"
+
+
+@pytest.mark.asyncio
 async def test_ensure_clone_reaps_dead_owners_tmp_dirs(tmp_path: Path) -> None:
     """Leftover `.<repo>.cloning.<pid>` dirs from crashed/killed instances
     must be removed; a dir whose pid is alive (concurrent process mid-clone)

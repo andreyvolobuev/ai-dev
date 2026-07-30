@@ -74,6 +74,20 @@ def is_transient_git_error(message: str) -> bool:
     return any(marker in message for marker in _TRANSIENT_GIT_MARKERS)
 
 
+def _merge_error_summary(message: str) -> str:
+    """One informative line out of a failed `git merge` output.
+
+    Prefer the line that names the actual failure (CONFLICT / fatal /
+    error) over whatever git printed first — with rerere enabled the
+    first line is noise like «Recorded preimage for 'file'».
+    """
+    lines = [ln for ln in message.splitlines() if ln.strip()]
+    for line in lines:
+        if "CONFLICT" in line or line.lstrip().startswith(("fatal:", "error:")):
+            return line.strip()[:200]
+    return (lines[0].strip() if lines else "git merge failed")[:200]
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -328,27 +342,42 @@ class GitLabVcs(VcsPort):
             # safety check).
             await self._run_git(path, "checkout", "-B", branch, f"origin/{branch}")
 
-    async def merge_base_into_current(self, repo_key: str, base: str) -> bool:
+    async def merge_base_into_current(self, repo_key: str, base: str) -> str | None:
         """Merge ``origin/<base>`` into the currently checked-out branch.
 
-        Returns True on success (clean merge or already up-to-date), False
-        when there's a conflict. On conflict we ``git merge --abort`` so
-        the working tree is restored. Used by Dev iteration to keep the
+        Returns ``None`` on success (clean merge or already up-to-date), or
+        a short one-line error on failure — the caller surfaces it to the
+        activity UI, so «merge conflict» and «unrelated histories» stop
+        looking identical. On failure we ``git merge --abort`` so the
+        working tree is restored. Used by Dev iteration to keep the
         feature branch up to date with master before pushing again (#12
         in techdebt).
         """
         async with self._lock(repo_key):
             path = await self._ensure_local(repo_key)
             await self._ensure_origin_ref(path, base)
+            await self._connect_shallow_histories(path, base)
             try:
                 await self._run_git_with_identity(
                     path, "merge", "--no-edit", f"origin/{base}",
                 )
-                return True
+                return None
             except VcsError as exc:
+                detail = _merge_error_summary(str(exc))
+                # A content conflict prints CONFLICT to stdout, which
+                # VcsError (stderr-only) doesn't carry — ask git for the
+                # unmerged paths instead, BEFORE the abort wipes them.
+                try:
+                    unmerged = (await self._run_git(
+                        path, "diff", "--name-only", "--diff-filter=U",
+                    )).split()
+                except VcsError:
+                    unmerged = []
+                if unmerged:
+                    detail = f"merge conflict in: {', '.join(unmerged)}"[:200]
                 logger.warning(
                     "VCS: merge origin/{} into current failed: {}",
-                    base, str(exc).splitlines()[0][:200],
+                    base, detail,
                 )
                 # Best-effort abort — ignore failures (nothing to abort,
                 # already-resolved, etc.) so we always return cleanly.
@@ -356,7 +385,62 @@ class GitLabVcs(VcsPort):
                     await self._run_git(path, "merge", "--abort")
                 except VcsError:
                     pass
-                return False
+                return detail
+
+    async def _connect_shallow_histories(self, path: Path, base: str) -> None:
+        """Deepen shallow history until origin/<base> and HEAD share a
+        merge base.
+
+        Clones are --depth=1 and MR branches are fetched tip-only, so a
+        branch created by a PREVIOUS process shares no recorded ancestor
+        with origin/<base> — ``git merge`` then dies with «refusing to
+        merge unrelated histories». Seen live (DM-2740): after a pod
+        redeploy every iteration failed this way before the model even
+        ran. Deepen both histories in steps (cheap for young branches),
+        fall back to a full unshallow, and leave the repo untouched on
+        fetch errors so the merge below reports the real failure.
+        """
+        if not await self._is_shallow(path):
+            return
+        if await self._has_merge_base(path, base):
+            return
+        head = (await self._run_git(path, "rev-parse", "--abbrev-ref", "HEAD")).strip()
+        refs = [base] if head in ("HEAD", base) else [base, head]
+        for step in ("64", "1024"):
+            try:
+                await self._run_git(
+                    path, "fetch", "--deepen", step, "origin", *refs, timeout=1800,
+                )
+            except VcsError as exc:
+                logger.warning(
+                    "VCS: deepen fetch failed while connecting histories: {}",
+                    str(exc).splitlines()[0][:200],
+                )
+                return
+            if await self._has_merge_base(path, base):
+                return
+        if not await self._is_shallow(path):
+            return
+        try:
+            await self._run_git(
+                path, "fetch", "--unshallow", "origin", *refs, timeout=1800,
+            )
+        except VcsError as exc:
+            logger.warning(
+                "VCS: unshallow fetch failed while connecting histories: {}",
+                str(exc).splitlines()[0][:200],
+            )
+
+    async def _is_shallow(self, path: Path) -> bool:
+        out = await self._run_git(path, "rev-parse", "--is-shallow-repository")
+        return out.strip() == "true"
+
+    async def _has_merge_base(self, path: Path, base: str) -> bool:
+        try:
+            await self._run_git(path, "merge-base", f"origin/{base}", "HEAD")
+            return True
+        except VcsError:
+            return False
 
     async def create_branch(self, repo_key: str, branch: str, base: str) -> None:
         async with self._lock(repo_key):

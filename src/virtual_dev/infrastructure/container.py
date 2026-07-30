@@ -348,6 +348,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
                 config=config,
                 settings=settings,
                 researcher=researcher if mr_history else None,
+                trace=trace,
             )
 
     thread_responder = ThreadResponderAgent(

@@ -67,15 +67,16 @@ class VcsPort(ABC):
     async def has_uncommitted_changes(self, repo_key: str) -> bool:
         """Return ``True`` iff the working tree has staged or unstaged changes."""
 
-    async def merge_base_into_current(self, repo_key: str, base: str) -> bool:
+    async def merge_base_into_current(self, repo_key: str, base: str) -> str | None:
         """Merge ``origin/<base>`` into the currently checked-out branch.
 
-        Returns ``True`` on a clean merge (or already up-to-date),
-        ``False`` if the merge conflicted (caller should give up). Default
-        impl is a no-op that returns ``True`` so test fakes don't need
-        boilerplate.
+        Returns ``None`` on a clean merge (or already up-to-date), or a
+        short one-line error description when the merge failed (conflict,
+        unrelated histories, …) — the caller surfaces it to humans/UI and
+        gives up. Default impl is a no-op success so test fakes don't
+        need boilerplate.
         """
-        return True
+        return None
 
     async def get_mr_diff(self, repo_key: str, iid: int) -> str:
         """Return the unified diff for an MR.

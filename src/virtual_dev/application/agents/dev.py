@@ -46,6 +46,11 @@ from virtual_dev.adapters.vcs.gitlab import (
     is_transient_git_error,
 )
 from virtual_dev.application.services import PromptsLoader, ResearcherToolkit, RulesLoader
+from virtual_dev.application.services.agent_trace import (
+    AgentTrace,
+    AgentTraceEvent,
+    emit_if,
+)
 from virtual_dev.application.services.ticket_reset import was_reset_since
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus
@@ -195,6 +200,7 @@ class DevAgent:
         settings: Settings,
         researcher: ResearcherToolkit | None = None,
         max_turns: int | None = None,
+        trace: "AgentTrace | None" = None,
     ) -> None:
         self._agent_key = agent_key
         self._repo_key = repo_key
@@ -207,6 +213,7 @@ class DevAgent:
         self._session_factory = session_factory
         self._config = config
         self._settings = settings
+        self._trace = trace
         self._max_turns = max_turns or _dev_max_turns(config) or 30
 
     @property
@@ -460,13 +467,18 @@ class DevAgent:
         # conflict, give up cleanly and surface FAILED so the human can
         # rebase manually (#12 in techdebt).
         base_branch = self._default_branch()
-        merge_ok = await self._vcs.merge_base_into_current(
+        merge_error = await self._vcs.merge_base_into_current(
             self._repo_key, base_branch,
         )
-        if not merge_ok:
+        if merge_error is not None:
             logger.warning(
-                "Dev[{}] iteration aborted for {}: merge conflict against {}",
-                self._agent_key, external_id, base_branch,
+                "Dev[{}] iteration aborted for {}: merge of {} failed: {}",
+                self._agent_key, external_id, base_branch, merge_error,
+            )
+            await self._emit_iteration_failed(
+                external_id, branch_name,
+                reason=f"merge-conflict-with-{base_branch}",
+                detail=merge_error,
             )
             return DevResult(
                 outcome=DevOutcome.FAILED,
@@ -481,9 +493,14 @@ class DevAgent:
         )
         try:
             captured, result = await self._call_model(request)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Dev[{}] iteration model call failed for {}", self._agent_key, external_id,
+            )
+            await self._emit_iteration_failed(
+                external_id, branch_name,
+                reason="model-call-crashed",
+                detail=f"{type(exc).__name__}: {exc}",
             )
             raise
 
@@ -492,6 +509,14 @@ class DevAgent:
             logger.warning(
                 "Dev[{}] iteration returned status={} for {}",
                 self._agent_key, status_val, external_id,
+            )
+            notes = str(captured.get("notes") or "").strip() if captured else ""
+            await self._emit_iteration_failed(
+                external_id, branch_name,
+                reason=(
+                    "model-returned-failed" if captured else "model-did-not-submit"
+                ),
+                detail=notes or result.stopped_reason,
             )
             return DevResult(
                 outcome=DevOutcome.FAILED,
@@ -572,6 +597,29 @@ class DevAgent:
             stopped_reason=result.stopped_reason,
             submission=captured,
         )
+
+    async def _emit_iteration_failed(
+        self, external_id: str, branch_name: str | None,
+        *, reason: str, detail: str = "",
+    ) -> None:
+        """Surface a failed iteration in the activity UI.
+
+        Humans in review threads get a short human-facing template with no
+        internals (deliberately); the WHY must still be visible somewhere
+        the operator looks — this event carries the machine reason and the
+        underlying error into the AgentTrace feed.
+        """
+        await emit_if(self._trace, AgentTraceEvent(
+            type="iteration_failed",
+            agent_key=self._agent_key,
+            payload={
+                "external_id": external_id,
+                "repo_key": self._repo_key,
+                "branch": branch_name or "",
+                "reason": reason,
+                "detail": (detail or "")[:500],
+            },
+        ))
 
     def _build_iteration_request(
         self, *, plan: Plan, task_row: TaskRow,

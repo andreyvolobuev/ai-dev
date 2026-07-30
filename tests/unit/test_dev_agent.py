@@ -251,6 +251,7 @@ def _make_dev(
     preset_submission: dict[str, Any] | None,
     edits: list[str] | None = None,
     rules_dir: Path | None = None,
+    trace: object | None = None,
 ) -> _TestDev:
     cfg = _cfg()
     rules_loader = RulesLoader(rules_dir or Path("/nonexistent_rules"))
@@ -265,9 +266,20 @@ def _make_dev(
         session_factory=session_factory,
         config=cfg,
         settings=Settings(),
+        trace=trace,
         preset_submission=preset_submission,
         edits=edits,
     )
+
+
+class _RecordingTrace:
+    """Minimal AgentTrace stand-in collecting emitted events."""
+
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    async def emit(self, event: Any) -> None:
+        self.events.append(event)
 
 
 # --- Tests ---
@@ -631,6 +643,83 @@ async def test_iteration_applies_mr_title_and_description_update(
         )).scalar_one()
     assert row.title == "[DM-7] Tolerate per-source failures in GC"
     assert row.description == "English description per review"
+
+
+@pytest.mark.asyncio
+async def test_iteration_merge_failure_is_traced_with_detail(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """Seen live (DM-2740): every iteration silently died on «refusing to
+    merge unrelated histories» and neither the UI nor the thread said WHY.
+    A failed pre-merge must surface an `iteration_failed` trace event with
+    the actual git error, so the activity feed answers «what happened»."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    class _ConflictVcs(_FakeVcs):
+        async def merge_base_into_current(
+            self, repo_key: str, base: str,
+        ) -> str | None:
+            return "fatal: refusing to merge unrelated histories"
+
+    vcs = _ConflictVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=1, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    trace = _RecordingTrace()
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent,
+        preset_submission={"status": "success", "title": "t", "description": ""},
+        trace=trace,
+    )
+
+    result = await dev.handle_iteration(
+        tracker="jira", external_id="DM-7",
+        branch_name="ai-dev/dm-7", feedback="почини",
+    )
+
+    assert result.outcome is DevOutcome.FAILED
+    assert result.stopped_reason.startswith("merge-conflict-with-")
+    failed = [e for e in trace.events if e.type == "iteration_failed"]
+    assert failed, f"no iteration_failed event; got {[e.type for e in trace.events]}"
+    payload = failed[0].payload
+    assert payload["external_id"] == "DM-7"
+    assert "unrelated histories" in payload["detail"]
+
+
+@pytest.mark.asyncio
+async def test_iteration_model_failure_is_traced(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """A model-side failure (status=failed / no submission) must also land
+    in the activity feed with the model's own notes as the detail."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    vcs = _FakeVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=30, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="max_turns",
+    ))
+    trace = _RecordingTrace()
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent,
+        preset_submission={"status": "failed", "notes": "CI инфраструктура лежит"},
+        trace=trace,
+    )
+
+    result = await dev.handle_iteration(
+        tracker="jira", external_id="DM-7",
+        branch_name="ai-dev/dm-7", feedback="почини",
+    )
+
+    assert result.outcome is DevOutcome.FAILED
+    failed = [e for e in trace.events if e.type == "iteration_failed"]
+    assert failed
+    assert "CI инфраструктура лежит" in failed[0].payload["detail"]
 
 
 @pytest.mark.asyncio
