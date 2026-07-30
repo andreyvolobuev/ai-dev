@@ -26,7 +26,7 @@ from virtual_dev.infrastructure.config import (
     NotificationsCfg,
     Settings,
 )
-from virtual_dev.infrastructure.db import MergeRequestRow
+from virtual_dev.infrastructure.db import MergeRequestRow, ProcessedThreadPostRow
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.runtime.workers.mm_thread_listener import (
     _PROCESSED_REACTION,
@@ -353,6 +353,127 @@ async def test_iterate_failed_posts_crashed_template(
     replies = [body for _, body, root in chat.sent if root == "root-m2"]
     assert "dev упал" in replies
     assert "без изменений" not in replies
+
+
+@pytest.mark.asyncio
+async def test_skips_post_already_claimed_in_db(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A post claimed in ``processed_thread_posts`` is skipped even when
+    the ✅-reaction is missing (add_reaction failed on a deleted post, or
+    another instance answered but its reaction hasn't propagated). Seen
+    live: catch-up re-ran the LLM on such posts every sweep."""
+    await _insert_mr(session_factory, root_id="root-c1")
+    event = _human_post(id="post-c1", thread_root_id="root-c1", text="вопрос по коду")
+    chat = _ScriptedChat([event])
+    async with session_scope(session_factory) as session:
+        session.add(ProcessedThreadPostRow(post_id="post-c1"))
+    responder = _ScriptedResponder([])   # must NOT be called
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await _settle(lambda: listener.stats.events_routed >= 1, timeout=1.0)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert responder.calls == 0
+    assert chat.sent == []
+
+
+@pytest.mark.asyncio
+async def test_reaction_failure_does_not_cause_duplicate_reply(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The ✅-reaction is only a fast-path marker. When it never sticks
+    (MM error, post deleted right after), a replay of the same post must
+    not produce a second LLM run or a second thread reply — the DB claim
+    is the authority."""
+    await _insert_mr(session_factory, root_id="root-c2")
+    event = _human_post(id="post-c2", thread_root_id="root-c2", text="как это работает?")
+
+    class _NoReactionChat(_ScriptedChat):
+        async def add_reaction(self, post_id: str, emoji_name: str) -> None:
+            raise RuntimeError("MM flaked")
+
+    # The same post delivered twice (WS + catch-up replay).
+    chat = _NoReactionChat([event, event])
+    responder = _ScriptedResponder([
+        ResponderDecision(
+            action=ResponderAction.REPLY, reply_text="Отвечаю.", reasoning="q",
+        ),
+        ResponderDecision(
+            action=ResponderAction.REPLY, reply_text="Отвечаю дважды!", reasoning="q",
+        ),
+    ])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await _settle(lambda: listener.stats.events_routed >= 2, timeout=1.0)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert responder.calls == 1
+    replies = [body for _, body, _ in chat.sent]
+    assert replies == ["Отвечаю."]
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_releases_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A reply that never reached MM must not leave the post claimed —
+    otherwise the catch-up retry (the whole point of leaving it
+    unreacted) is permanently blocked and the human is ghosted."""
+    await _insert_mr(session_factory, root_id="root-c3")
+    event = _human_post(id="post-c3", thread_root_id="root-c3", text="вопрос")
+
+    class _BrokenSendChat(_ScriptedChat):
+        async def send_to_channel(
+            self, channel_id: str, text: str, thread_root_id: str | None = None,
+        ) -> ChatMessage:
+            raise RuntimeError("MM down")
+
+    chat = _BrokenSendChat([event])
+    responder = _ScriptedResponder([ResponderDecision(
+        action=ResponderAction.REPLY, reply_text="Отвечаю.", reasoning="q",
+    )])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await _settle(lambda: responder.calls >= 1, timeout=1.0)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    # No reaction (nothing delivered) and no lingering claim row.
+    assert chat.reactions == []
+    from sqlalchemy import select
+    async with session_factory() as session:
+        rows = (await session.execute(select(ProcessedThreadPostRow))).scalars().all()
+    assert rows == []
 
 
 @pytest.mark.asyncio

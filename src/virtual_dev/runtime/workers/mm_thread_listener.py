@@ -29,7 +29,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from loguru import logger
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents import (
@@ -48,7 +49,12 @@ from virtual_dev.domain.ports.vcs import VcsPort
 from pathlib import Path
 
 from virtual_dev.infrastructure.config import AppConfig, Settings
-from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow, TaskRow
+from virtual_dev.infrastructure.db import (
+    MergeRequestRow,
+    PlanRow,
+    ProcessedThreadPostRow,
+    TaskRow,
+)
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
 
@@ -499,10 +505,22 @@ class MmThreadListener:
             )
             return
 
-        # Idempotency: skip if we already reacted ✅.
+        # Idempotency fast-path: skip if we already reacted ✅.
         if _PROCESSED_REACTION in fresh_post.bot_reactions:
             logger.debug(
                 "MmThreadListener: skipping already-processed post {}", event.id,
+            )
+            return
+
+        # Idempotency authority: the DB claim. Covers what the reaction
+        # can't — add_reaction failed after delivery (post deleted, MM
+        # error), or another instance answered and its reaction hasn't
+        # landed yet. Without this, every catch-up sweep re-ran the LLM
+        # on such posts and could post a second reply.
+        if await self._post_already_claimed(event.id):
+            logger.debug(
+                "MmThreadListener: post {} already claimed in DB, skipping",
+                event.id,
             )
             return
 
@@ -545,26 +563,41 @@ class MmThreadListener:
         channel_id = row.review_thread_channel_id or event.channel_id
         root_id = event.thread_root_id
 
-        # A post is only marked ✅-processed once we've actually delivered
-        # our response. IGNORE has nothing to send, so it counts as
-        # delivered; a dropped reply leaves the post unreacted so the
-        # catch-up sweep retries it rather than silently swallowing it.
-        delivered = True
-
         if decision.action in (
             ResponderAction.REPLY, ResponderAction.PROPOSE_ALTERNATIVE,
         ) and not decision.reply_text:
             # Model glitch: reply-class decision with no text. Marking the
-            # post ✅ would silently ghost the human — leave it unreacted
-            # so the catch-up sweep retries the decision.
+            # post ✅ (or claiming it) would silently ghost the human —
+            # leave it untouched so the catch-up sweep retries the decision.
             logger.warning(
                 "MmThreadListener: {} decision without reply_text on post {} — "
                 "leaving unprocessed for retry",
                 decision.action.value, event.id,
             )
-            delivered = False
+            return
 
-        elif decision.action == ResponderAction.REPLY and decision.reply_text:
+        # Claim the post RIGHT BEFORE delivering. The claim is the atomic
+        # cross-instance/cross-restart race-closer: losing it means
+        # another tick (or another pod during a rolling deploy) is
+        # already delivering a response to this post — do nothing.
+        # Claiming after decide() keeps the crash window tiny without
+        # ghosting: a process that dies before the claim leaves the post
+        # unclaimed and unreacted, so catch-up retries it.
+        if not await self._claim_post(event.id):
+            logger.info(
+                "MmThreadListener: post {} claimed by another instance/tick — "
+                "skipping delivery", event.id,
+            )
+            return
+
+        # A post is only marked ✅-processed once we've actually delivered
+        # our response. IGNORE has nothing to send, so it counts as
+        # delivered; a dropped reply releases the claim and leaves the
+        # post unreacted so the catch-up sweep retries it rather than
+        # silently swallowing it.
+        delivered = True
+
+        if decision.action == ResponderAction.REPLY and decision.reply_text:
             delivered = await self._post_reply(channel_id, root_id, decision.reply_text)
             if delivered:
                 self.stats.replies_posted += 1
@@ -584,11 +617,12 @@ class MmThreadListener:
         elif decision.action == ResponderAction.ITERATE:
             # Acknowledge BEFORE touching code. If we can't even tell the
             # humans we're on it, don't change code we can't announce and
-            # don't mark the post processed — leave it for catch-up to
-            # retry (mirrors the GitLab reviewer path).
+            # don't mark the post processed — release the claim and leave
+            # it for catch-up to retry (mirrors the GitLab reviewer path).
             if decision.reply_text and not await self._post_reply(
                 channel_id, root_id, decision.reply_text,
             ):
+                await self._release_post_claim(event.id)
                 return
             if decision.reply_text:
                 self.stats.replies_posted += 1
@@ -603,8 +637,10 @@ class MmThreadListener:
             self.stats.iterations_dispatched += 1
 
         # React ✅ only when the response was delivered (or nothing needed
-        # sending) — a dropped reply stays unreacted so catch-up retries.
+        # sending) — a dropped reply releases the claim and stays
+        # unreacted so catch-up retries.
         if not delivered:
+            await self._release_post_claim(event.id)
             return
         try:
             await self._chat.add_reaction(event.id, _PROCESSED_REACTION)
@@ -750,6 +786,41 @@ class MmThreadListener:
         if repo_cfg.local_path:
             return str(Path(repo_cfg.local_path).expanduser().resolve())
         return str(Path(self._settings.workspaces_dir).resolve() / repo_key)
+
+    async def _post_already_claimed(self, post_id: str) -> bool:
+        """Read-only fast-path: has any instance already claimed this post?"""
+        async with self._session_factory() as session:
+            row = (await session.execute(
+                select(ProcessedThreadPostRow).where(
+                    ProcessedThreadPostRow.post_id == post_id,
+                )
+            )).scalar_one_or_none()
+        return row is not None
+
+    async def _claim_post(self, post_id: str) -> bool:
+        """Atomically claim the post for delivery.
+
+        A bare PK insert: exactly one claimer wins across ticks, restarts
+        and instances (the DB is shared). Returns False when the row
+        already exists — someone else is delivering.
+        """
+        async with self._session_factory() as session:
+            session.add(ProcessedThreadPostRow(post_id=post_id))
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                return False
+        return True
+
+    async def _release_post_claim(self, post_id: str) -> None:
+        """Undo a claim after a failed delivery so catch-up can retry."""
+        async with session_scope(self._session_factory) as session:
+            await session.execute(
+                delete(ProcessedThreadPostRow).where(
+                    ProcessedThreadPostRow.post_id == post_id,
+                )
+            )
 
     async def _post_reply(self, channel_id: str, root_id: str, text: str) -> bool:
         """Post into the thread; return whether it was actually delivered

@@ -400,6 +400,31 @@ class TicketResetRow(Base):
     reset_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class ProcessedThreadPostRow(Base):
+    """Cross-restart / cross-instance dedup claim for MM thread replies.
+
+    One row per Mattermost post the bot has responded to (including
+    IGNORE decisions — "responded" means the decision was delivered).
+    The ✅-reaction on the post stays as the human-visible fast-path
+    marker, but it proved insufficient live (DM-2740): it is set only
+    after the multi-second responder run, it never sticks on posts the
+    author deleted, and two instances (rolling deploy, stale pod) can't
+    see each other's in-memory state — the same post got two replies.
+
+    The claim is taken atomically (PK insert) right before delivering
+    the response; losing it means another tick/instance is delivering.
+    A failed delivery releases the claim so the catch-up sweep can
+    retry instead of ghosting the human.
+    """
+
+    __tablename__ = "processed_thread_posts"
+
+    post_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    claimed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+
 class EventRow(Base):
     """Generic audit/event log (anything interesting that happened)."""
 

@@ -15,6 +15,7 @@ from virtual_dev.infrastructure.db.models import (
     MergeRequestRow,
     MrHistoryRow,
     PlanRow,
+    ProcessedThreadPostRow,
     TaskRow,
     TicketResetRow,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "MergeRequestRow",
     "MrHistoryRow",
     "PlanRow",
+    "ProcessedThreadPostRow",
     "TaskRow",
     "TicketResetRow",
     "make_engine",
