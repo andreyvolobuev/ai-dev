@@ -407,6 +407,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         config=config,
         dev_agents=dev_agents,
         message_bus=message_bus,
+        bot_username=gitlab_bot_username,
     )
 
     recovery_service = RecoveryService(

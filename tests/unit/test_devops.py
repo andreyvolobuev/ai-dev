@@ -175,6 +175,8 @@ async def _insert_mr(
     pipeline_infra_retries: int = 0,
     pipeline_autofix_escalated: bool = False,
     task_external_id: str | None = "DM-1",
+    last_seen: str | None = None,
+    pending_comment_ids: list[str] | None = None,
 ) -> int:
     async with session_scope(session_factory) as session:
         row = MergeRequestRow(
@@ -188,6 +190,8 @@ async def _insert_mr(
             pipeline_autofix_attempts=pipeline_autofix_attempts,
             pipeline_infra_retries=pipeline_infra_retries,
             pipeline_autofix_escalated=pipeline_autofix_escalated,
+            last_seen_comment_id=last_seen,
+            pending_comment_ids=pending_comment_ids or [],
         )
         session.add(row)
         await session.flush()
@@ -621,3 +625,126 @@ async def test_green_pipeline_resets_infra_retries(
         )).scalar_one()
         assert row.pipeline_infra_retries == 0
         assert row.pipeline_autofix_escalated is False
+
+
+class _CommentsVcs(_StubVcs):
+    """_StubVcs + a fixed review-comment listing."""
+
+    def __init__(
+        self,
+        jobs: dict[tuple[str, int], list[PipelineJob]],
+        review_comments: list[ReviewComment],
+    ) -> None:
+        super().__init__(jobs)
+        self._review_comments = review_comments
+
+    async def list_review_comments(
+        self, repo_key: str, iid: int,
+    ) -> Sequence[ReviewComment]:
+        return list(self._review_comments)
+
+
+_RED_JOBS = {
+    ("bellingshausen", 42): [
+        _job("tests", "failed", log="AssertionError: nope"),
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_autofix_deferred_while_reviewer_has_unhandled_comments(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Seen live (Jul 31, !1114): the reviewer pushed a reference commit
+    (red CI) and commented «поправь ошибки, но декораторы не убирай».
+    DevOps auto-fix — whose prompt is CI logs only, no thread context —
+    dispatched first and «fixed CI» by reverting the decorators the human
+    explicitly asked to keep. While a human review comment is not yet
+    handled by the Reviewer, auto-fix must stand down: the Reviewer-driven
+    iteration carries the human's intent and refreshes CI anyway."""
+    row_id = await _insert_mr(session_factory)
+    vcs = _CommentsVcs(_RED_JOBS, [
+        ReviewComment(id="c-9", mr_id="42", author_username="alice",
+                      body="поправь ошибки, но декораторы не убирай"),
+    ])
+    dev = _ScriptedDev()
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    agent = DevOpsAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        bot_username="virtual-dev",
+    )
+
+    stats = await agent.tick()
+    await asyncio.sleep(0.05)
+
+    assert stats.autofix_dispatched == 0
+    assert dev.calls == []
+    async with session_factory() as s:
+        row = await s.get(MergeRequestRow, row_id)
+        assert row is not None
+        assert row.pipeline_autofix_attempts == 0   # no attempt burned
+        assert row.pipeline_status == "failed"      # status still recorded
+
+
+@pytest.mark.asyncio
+async def test_autofix_deferred_on_pending_comment_ids_without_api_call(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An undelivered reviewer reply (pending_comment_ids) also means the
+    human is mid-conversation — defer, and don't even hit the comments
+    API for it (the base stub raises NotImplementedError on it)."""
+    await _insert_mr(session_factory, pending_comment_ids=["c-5"])
+    vcs = _StubVcs(_RED_JOBS)
+    dev = _ScriptedDev()
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    agent = DevOpsAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        bot_username="virtual-dev",
+    )
+
+    stats = await agent.tick()
+    await asyncio.sleep(0.05)
+
+    assert stats.autofix_dispatched == 0
+    assert dev.calls == []
+
+
+@pytest.mark.asyncio
+async def test_autofix_proceeds_when_review_comments_all_handled(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Watermark on the newest human comment (bot's own replies and
+    system notes don't count) → no backlog → auto-fix runs."""
+    await _insert_mr(session_factory, last_seen="c-9")
+    vcs = _CommentsVcs(_RED_JOBS, [
+        ReviewComment(id="c-9", mr_id="42", author_username="alice",
+                      body="поправь ошибки"),
+        ReviewComment(id="c-10", mr_id="42", author_username="virtual-dev",
+                      body="Поняла, беру в работу."),
+        ReviewComment(id="c-11", mr_id="42", author_username="alice",
+                      body="added 1 commit", system=True),
+    ])
+    dev = _ScriptedDev()
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    agent = DevOpsAgent(
+        vcs=vcs, communicator=communicator,
+        session_factory=session_factory, config=_cfg(),
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        bot_username="virtual-dev",
+    )
+
+    stats = await agent.tick()
+    await asyncio.sleep(0.05)
+
+    assert stats.autofix_dispatched == 1
+    assert len(dev.calls) == 1

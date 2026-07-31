@@ -66,6 +66,7 @@ class DevOpsAgent:
         config: AppConfig,
         dev_agents: dict[str, DevAgent] | None = None,   # repo_key → DevAgent
         message_bus: MessageBusPort | None = None,
+        bot_username: str | None = None,
     ) -> None:
         self._vcs = vcs
         self._communicator = communicator
@@ -73,6 +74,9 @@ class DevOpsAgent:
         self._config = config
         self._dev_agents = dev_agents or {}
         self._message_bus = message_bus
+        # GitLab username of the bot — its own review replies must not
+        # count as "unhandled human comments" in the auto-fix deferral.
+        self._bot_username = (bot_username or "").strip() or None
         # In-process dedup so two close-together ticks don't dispatch
         # the same iteration twice. Cleared by the background task once
         # it finishes (success or failure).
@@ -165,6 +169,25 @@ class DevOpsAgent:
                 await self._persist_pipeline_status(row.id, pipeline_status)
             return
 
+        # A human is mid-conversation on this MR (a review comment the
+        # Reviewer hasn't handled yet, or a reply still undelivered):
+        # stand down. The auto-fix prompt is CI logs only — with no
+        # thread context it can «fix CI» by undoing exactly what the
+        # reviewer just asked for (seen live Jul 31, !1114: reverted the
+        # decorators the human explicitly said to keep). The
+        # Reviewer-driven iteration carries the human's intent and its
+        # commit refreshes CI anyway; if the comment turns out to be
+        # chatter, the Reviewer advances its watermark and the next
+        # DevOps tick auto-fixes as usual.
+        if await self._has_unhandled_review_comments(row):
+            logger.info(
+                "DevOps: {}!{} has review comments the Reviewer hasn't "
+                "handled yet — deferring auto-fix to the review iteration",
+                row.repo_key, row.iid,
+            )
+            await self._persist_pipeline_status(row.id, pipeline_status)
+            return
+
         # Try auto-fix. Skip if one is already running for this MR.
         key = (row.repo_key, row.iid)
         if key in self._inflight_autofix:
@@ -240,6 +263,43 @@ class DevOpsAgent:
             )
         finally:
             self._inflight_autofix.discard(key)
+
+    def _is_bot_author(self, username: str) -> bool:
+        return bool(
+            self._bot_username
+            and username.lower() == self._bot_username.lower()
+        )
+
+    async def _has_unhandled_review_comments(self, row: MergeRequestRow) -> bool:
+        """True when the Reviewer still owes a response on this MR.
+
+        Two signals, same source of truth the Reviewer persists:
+
+        * ``pending_comment_ids`` — an actionable comment whose reply
+          hasn't been delivered yet (checked first, no API call needed);
+        * the newest human, non-system comment is not the Reviewer's
+          ``last_seen`` watermark — the comment hasn't even been
+          classified yet (the watermark always lands on a human comment).
+
+        A comment-listing failure means we can't know — don't block
+        auto-fix on it.
+        """
+        if row.pending_comment_ids:
+            return True
+        assert self._vcs is not None
+        try:
+            comments = list(
+                await self._vcs.list_review_comments(row.repo_key, row.iid)
+            )
+        except Exception:
+            return False
+        human = [
+            c for c in comments
+            if not c.system and not self._is_bot_author(c.author_username)
+        ]
+        if not human:
+            return False
+        return human[-1].id != (row.last_seen_comment_id or "")
 
     async def _handle_infra_failure(
         self,
