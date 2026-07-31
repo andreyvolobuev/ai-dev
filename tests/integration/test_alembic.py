@@ -33,6 +33,9 @@ _EXPECTED_TABLES = {
     "analyst_conversation_steps",
     "analyst_conversation_fragments",
     "events",
+    "ticket_resets",
+    "processed_thread_posts",
+    "processed_review_comments",
 }
 
 # Per UniqueConstraint defined in models.py.

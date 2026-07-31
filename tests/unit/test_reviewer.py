@@ -2102,3 +2102,147 @@ async def test_new_comments_recovers_when_watermark_comment_deleted(
         assert row is not None
         fresh = agent._new_comments(row, comments)
     assert [c.id for c in fresh] == ["110"]
+
+
+@pytest.mark.asyncio
+async def test_gitlab_ack_not_reposted_when_restart_loses_tick_state(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Seen live (DM-2740, Jul 31): the ack + iteration run inline inside
+    the tick and take minutes, while last_seen/pending are persisted only
+    at the END of the tick. The pod died mid-iteration four times in a row,
+    so after every restart the same reviewer comment was re-classified and
+    re-acked — «Поняла, беру твой референс…» ×4 in one GitLab thread.
+
+    The response must be guarded by a DB claim (same pattern as
+    processed_thread_posts): once the ack is delivered, a restarted
+    instance treats the comment as handled — no second ack, no second
+    decide(), no second dev iteration. The lost work is re-triggered by a
+    human ping (new comment), mirroring the MM-listener semantics."""
+    from virtual_dev.application.agents import ResponderAction
+    from virtual_dev.application.agents.dev import DevOutcome, DevResult
+
+    mr_id = await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="поправь ошибки в декораторах, но декораторы не убирай",
+        ),
+    ]
+
+    class _OkVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+    class _CountingDev:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def handle_iteration(self, **kwargs: object) -> DevResult:
+            self.calls.append(dict(kwargs))
+            return DevResult(outcome=DevOutcome.MR_OPENED, commit_sha="fff000")
+
+    vcs = _OkVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(
+        ResponderAction.ITERATE,
+        reply_text="Поняла, беру твой референс — коммит будет здесь.",
+        feedback="Fix the decorator bugs, keep the decorators.",
+    )
+    dev = _CountingDev()
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+        dev_agents={"bellingshausen": dev},  # type: ignore[arg-type]
+    )
+    await agent.tick()
+    assert len(vcs.posted_mr_comments) == 1
+    assert len(dev.calls) == 1
+
+    # Simulate the pod dying before _persist_tick_state ran: a restarted
+    # instance sees the cursor exactly as it was BEFORE the tick.
+    async with session_scope(session_factory) as session:
+        row = await session.get(MergeRequestRow, mr_id)
+        assert row is not None
+        row.last_seen_comment_id = "c-0"
+        row.pending_comment_ids = []
+        row.iteration_pending_ci_sha = None
+
+    await agent.tick()
+
+    assert len(vcs.posted_mr_comments) == 1, "duplicate ack after restart"
+    assert len(dev.calls) == 1, "duplicate iteration after restart"
+    assert responder.calls == 1, "decide() re-ran for an already-answered comment"
+    async with session_factory() as s:
+        row2 = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row2.last_seen_comment_id == "c-1"
+        assert row2.pending_comment_ids == []
+
+
+@pytest.mark.asyncio
+async def test_gitlab_failed_reply_still_retried_with_claims(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Companion to the claim guard: a reply whose delivery FAILED must
+    release its claim so the next tick can retry — otherwise a transient
+    GitLab 5xx would permanently ghost the reviewer."""
+    from virtual_dev.application.agents import ResponderAction
+
+    mr_id = await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(id="c-1", mr_id="42", author_username="alice",
+                      body="what is this dependency for?"),
+    ]
+
+    class _FlakyVcs(_StubVcs):
+        fail_next_post = True
+
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+        async def add_mr_comment(self, repo_key: str, iid: int, body: str) -> None:
+            if self.fail_next_post:
+                self.fail_next_post = False
+                raise RuntimeError("gitlab 502")
+            await super().add_mr_comment(repo_key, iid, body)
+
+    vcs = _FlakyVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(ResponderAction.REPLY, reply_text="here's why")
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+    )
+    await agent.tick()
+    assert vcs.posted_mr_comments == []
+
+    await agent.tick()
+    assert len(vcs.posted_mr_comments) == 1
+
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pending_comment_ids == []

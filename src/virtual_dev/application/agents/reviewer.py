@@ -32,7 +32,8 @@ if TYPE_CHECKING:
     from virtual_dev.application.services.health_tracker import HealthTracker
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents.devops import _collapse_status
@@ -51,7 +52,7 @@ from virtual_dev.domain.models.merge_request import MRStatus, ReviewComment
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
 from virtual_dev.domain.ports.vcs import VcsPort
 from virtual_dev.infrastructure.config import AppConfig
-from virtual_dev.infrastructure.db import MergeRequestRow
+from virtual_dev.infrastructure.db import MergeRequestRow, ProcessedReviewCommentRow
 from virtual_dev.infrastructure.db.base import session_scope
 
 
@@ -489,6 +490,21 @@ class ReviewerAgent:
         deliberately ignored). A swallowed network error returns False so
         the caller keeps ``last_seen`` pinned and retries next tick — we
         must not mark a comment read that we never managed to answer."""
+        # DB-claim guard (cross-restart / cross-instance). The tick's
+        # cursor is persisted only at its END, while the ack + iteration
+        # below run for minutes — a pod dying mid-iteration made every
+        # restarted instance re-answer the same comment (seen live Jul 31:
+        # «Поняла, беру твой референс…» ×4 on !1114). A claimed comment
+        # was already answered by an earlier run; the work a restart
+        # killed is re-triggered by a human ping, mirroring the crash
+        # policy and the MM-listener claims.
+        if await self._comment_already_claimed(row, latest.id):
+            logger.info(
+                "Reviewer: comment {} on {}!{} already claimed by an "
+                "earlier run/instance — marking handled without re-answering",
+                latest.id, row.repo_key, row.iid,
+            )
+            return True
         # Build the "thread" context from THIS discussion only. Feeding
         # the whole MR comment history here made the model drag topics
         # from neighbouring threads into its reply («почему в треде про
@@ -583,7 +599,10 @@ class ReviewerAgent:
                     decision.action.value, row.repo_key, row.iid,
                 )
                 return False
+            if not await self._claim_comment(row, latest.id):
+                return True   # another tick/instance is delivering
             if not await self._post_comment_reply(row, latest, decision.reply_text):
+                await self._release_comment_claim(row, latest.id)
                 return False
             stats.gitlab_replies_posted += 1
             return True
@@ -605,9 +624,15 @@ class ReviewerAgent:
             # next tick retries, rather than silently changing code we
             # couldn't announce. Mirrors the MM-thread path, which also
             # posts the ack first.
+            #
+            # The claim is taken BEFORE the ack: from here on any restart
+            # must not re-ack and re-run the iteration.
+            if not await self._claim_comment(row, latest.id):
+                return True   # another tick/instance is delivering
             if decision.reply_text and not await self._post_comment_reply(
                 row, latest, decision.reply_text,
             ):
+                await self._release_comment_claim(row, latest.id)
                 return False
             try:
                 # The dev gets the responder's distilled instruction, NOT
@@ -970,6 +995,52 @@ class ReviewerAgent:
         if self._bot_username and username.lower() == self._bot_username.lower():
             return True
         return False
+
+    # --- GitLab comment claims (cross-restart / cross-instance dedup) ---
+
+    @staticmethod
+    def _comment_claim_key(row: MergeRequestRow, comment_id: str) -> str:
+        return f"{row.repo_key}!{row.iid}:{comment_id}"
+
+    async def _comment_already_claimed(
+        self, row: MergeRequestRow, comment_id: str,
+    ) -> bool:
+        """Read-only fast-path: has any run/instance already answered
+        this comment?"""
+        key = self._comment_claim_key(row, comment_id)
+        async with self._session_factory() as session:
+            found = (await session.execute(
+                select(ProcessedReviewCommentRow).where(
+                    ProcessedReviewCommentRow.comment_key == key,
+                )
+            )).scalar_one_or_none()
+        return found is not None
+
+    async def _claim_comment(self, row: MergeRequestRow, comment_id: str) -> bool:
+        """Atomically claim the comment for delivery (bare PK insert):
+        exactly one claimer wins across ticks, restarts and instances.
+        Returns False when the row already exists."""
+        key = self._comment_claim_key(row, comment_id)
+        async with self._session_factory() as session:
+            session.add(ProcessedReviewCommentRow(comment_key=key))
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                return False
+        return True
+
+    async def _release_comment_claim(
+        self, row: MergeRequestRow, comment_id: str,
+    ) -> None:
+        """Undo a claim after a failed delivery so the next tick retries."""
+        key = self._comment_claim_key(row, comment_id)
+        async with session_scope(self._session_factory) as session:
+            await session.execute(
+                delete(ProcessedReviewCommentRow).where(
+                    ProcessedReviewCommentRow.comment_key == key,
+                )
+            )
 
     async def _derive_ci_state(self, repo_key: str, iid: int) -> str:
         """Return one of: ``"success"``, ``"failed"``, ``"running"``,

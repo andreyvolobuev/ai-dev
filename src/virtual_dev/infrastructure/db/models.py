@@ -425,6 +425,33 @@ class ProcessedThreadPostRow(Base):
     )
 
 
+class ProcessedReviewCommentRow(Base):
+    """Cross-restart / cross-instance dedup claim for GitLab review replies.
+
+    Same pattern as ``ProcessedThreadPostRow``, for the GitLab path. The
+    ack + dev iteration run inline inside the Reviewer tick and take
+    minutes, while ``last_seen_comment_id``/``pending_comment_ids`` are
+    persisted only at the tick's END — a pod dying mid-iteration made a
+    restarted instance re-classify the same comment and re-post the ack
+    (seen live Jul 31: «Поняла, беру твой референс…» ×4 on !1114).
+
+    The claim is taken atomically (PK insert) right before delivering the
+    reply; a failed delivery releases it so the next tick retries. Work
+    lost to a mid-iteration restart is NOT re-run — the claim marks the
+    comment answered, and a human ping (a new comment) re-triggers, same
+    as the crash policy.
+    """
+
+    __tablename__ = "processed_review_comments"
+
+    # "<repo_key>!<iid>:<comment_id>" — note ids are unique per GitLab
+    # instance, the prefix keeps the claim safe across VCS backends.
+    comment_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    claimed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+
 class EventRow(Base):
     """Generic audit/event log (anything interesting that happened)."""
 
