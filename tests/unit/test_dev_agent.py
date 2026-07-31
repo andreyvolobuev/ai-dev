@@ -1329,3 +1329,59 @@ async def test_transient_push_error_leaves_task_for_retry(
             select(TaskRow).where(TaskRow.external_id == "DM-7")
         )).scalar_one()
     assert row.internal_status != TaskStatus.FAILED.value
+
+
+@pytest.mark.asyncio
+async def test_concurrent_iterations_on_one_repo_serialize(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """Seen live (Jul 31, bellingshausen!1114): DevOps auto-fix and a
+    Reviewer-driven iterate fired within a minute of each other and ran
+    CONCURRENTLY in the same working copy — interleaved checkouts, one run
+    overwriting garbage_collector.py under the other mid-read. A repo has
+    exactly one workspace, so all model-driven work on it must serialize."""
+    import asyncio
+
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    class _TrackingCodeAgent(CodeAgentPort):
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+
+        async def run_task(self, request: CodeAgentRequest) -> CodeAgentResult:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0.02)
+            self.active -= 1
+            return CodeAgentResult(
+                final_text="", turns=1, input_tokens=0, output_tokens=0,
+                cost_usd=0.0, stopped_reason="end_turn",
+            )
+
+        def stream_task(self, request: CodeAgentRequest) -> Any:  # pragma: no cover
+            raise NotImplementedError
+
+    vcs = _FakeVcs(tmp_path / "ws")
+    code_agent = _TrackingCodeAgent()
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent,
+        preset_submission={"title": "fix ci", "status": "success"},
+    )
+
+    await asyncio.gather(
+        dev.handle_iteration(
+            tracker="jira", external_id="DM-7",
+            branch_name="ai-dev/dm-7", feedback="fix the linter",
+        ),
+        dev.handle_iteration(
+            tracker="jira", external_id="DM-7",
+            branch_name="ai-dev/dm-7", feedback="address the review",
+        ),
+    )
+
+    assert code_agent.max_active == 1, (
+        "two iterations ran concurrently in the same workspace"
+    )

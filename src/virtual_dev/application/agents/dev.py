@@ -29,6 +29,7 @@ testable and local.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -215,6 +216,13 @@ class DevAgent:
         self._settings = settings
         self._trace = trace
         self._max_turns = max_turns or _dev_max_turns(config) or 30
+        # One workspace per repo — but three independent callers (Reviewer
+        # iterate, DevOps auto-fix, MM thread listener) can all reach this
+        # agent. Seen live (Jul 31, !1114): an auto-fix and a review
+        # iteration ran concurrently in the same checkout, interleaving
+        # git operations and overwriting each other's files mid-run. All
+        # model-driven work on the workspace serializes on this lock.
+        self._workspace_lock = asyncio.Lock()
 
     @property
     def agent_key(self) -> str:
@@ -223,6 +231,10 @@ class DevAgent:
     # --- entry ---
 
     async def handle_plan(self, tracker: str, external_id: str) -> DevResult:
+        async with self._workspace_lock:
+            return await self._handle_plan_locked(tracker, external_id)
+
+    async def _handle_plan_locked(self, tracker: str, external_id: str) -> DevResult:
         run_started = datetime.now(timezone.utc)
         task_row, plan_row = await self._load(tracker, external_id)
         existing_mr_iid = await self._existing_open_mr_iid(external_id)
@@ -452,6 +464,23 @@ class DevAgent:
         the feedback text, and push a new commit. GitLab auto-updates
         the MR.
         """
+        async with self._workspace_lock:
+            return await self._handle_iteration_locked(
+                tracker=tracker, external_id=external_id,
+                branch_name=branch_name, feedback=feedback,
+                feedback_kind=feedback_kind, thread=thread,
+            )
+
+    async def _handle_iteration_locked(
+        self,
+        *,
+        tracker: str,
+        external_id: str,
+        branch_name: str,
+        feedback: str,
+        feedback_kind: str = "mr_review",
+        thread: Sequence[ChatMessage] | None = None,
+    ) -> DevResult:
         run_started = datetime.now(timezone.utc)
         task_row, plan_row = await self._load(tracker, external_id)
         if task_row is None or plan_row is None:
