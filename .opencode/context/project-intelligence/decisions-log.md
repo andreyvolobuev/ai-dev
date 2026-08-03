@@ -1,26 +1,21 @@
-<!-- Context: project-intelligence/decisions | Priority: high | Version: 1.1 | Updated: 2026-07-02 -->
+<!-- Context: project-intelligence/decisions | Priority: high | Version: 1.2 | Updated: 2026-07-06 -->
 
 # Decisions Log
 
-## Decision: LLM через Claude Max, не Anthropic API
+## Decision: LLM — два режима (Claude Max + корпоративный шлюз)
 
-**Date**: 2025-11 (Phase 0)
+**Date**: 2025-11 (Phase 0), обновлено 2026-07 (Phase 4 — K8s deploy)
 **Status**: Decided
-**Owner**: Тимлид
 
-**Context**: Нужно было выбрать, как использовать LLM. Anthropic API требует бюджет ($/токен), API-ключ, контроль лимитов. Claude Max — flat-rate подписка без per-token биллинга.
+**Context**: Нужно было выбрать, как использовать LLM. Anthropic API требует бюджет ($/токен), API-ключ. Claude Max — flat-rate подписка без per-token биллинга. Для продакшена в K8s нужен автономный режим без личной подписки.
 
-**Decision**: Работаем через Claude Max подписку пользователя. `claude-agent-sdk` (PyPI) → subprocess `claude` CLI → залогиненная сессия. API-ключ не используем. Основная модель — Opus 4.8 (`claude-opus-4-8`), лёгкая — Haiku 4.5 (`claude-haiku-4-5-20251001`).
+**Decision**: Два режима работы, переключаемых через env:
+1. **Claude Max** (локальная разработка): `claude-agent-sdk` → `claude` CLI → залогиненная сессия. Без API-ключа.
+2. **Корпоративный шлюз** (продакшн/K8s): `ANTHROPIC_BASE_URL=https://ai-openai-proxy.k8s.n3.2gis.io/anthropic` + `ANTHROPIC_API_KEY`. Anthropic-compatible proxy, auth через `x-api-key` (не Bearer). `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` (строгий шлюз режет beta-поля). Только датированные model ID.
 
-**Rationale**: У Max нет лимитов на токены — только rate-limit на количество сообщений в 5-часовое окно. Это радикально упрощает архитектуру: не нужно tracking бюджета, throttling по cost, alarm'ов по превышению. Единственный лимит — `max_turns` (защита от runaway).
+**Rationale**: У Max и у шлюза нет per-token биллинга — не нужен budget-трекинг. Шлюз позволяет работать в K8s без личной подписки. `_build_claude_env()` в `container.py` автоматически переключает режимы.
 
-**Alternatives Rejected**:
-| Альтернатива | Почему нет |
-|-------------|------------|
-| Anthropic API (per-token) | Нужен API-key, budget-трекинг, сложнее инфра |
-| Self-hosted Llama | Пока нет infra для GPU, отложено |
-
-**Impact**: + Максимально простая LLM-интеграция. Rate-limit обрабатывается retry-loop (2 попытки). Минус: нельзя использовать anthropic/python-sdk напрямую.
+**Impact**: + Один код, два режима. + Нет budget-трекинга. − Шлюз требует датированные model ID (алиасы дают 404). − Шлюз режет beta-поля (`context_management` и т.д.).
 
 ---
 
@@ -31,9 +26,9 @@
 
 **Context**: Проект интегрируется с 4+ внешними системами (Jira, GitLab, Mattermost, Confluence). Они могут меняться.
 
-**Decision**: Чёткое разделение на domain (модели+порты), application (агенты), adapters (реализации портов). Замена адаптера не трогает domain и application.
+**Decision**: Чёткое разделение на domain (модели+порты), application (агенты), adapters (реализации портов).
 
-**Impact**: + Легко заменять внешние сервисы. Дороже на старте (интерфейсы), но окупается при смене интеграций.
+**Impact**: + Легко заменять внешние сервисы. Дороже на старте, но окупается при смене интеграций.
 
 ---
 
@@ -42,29 +37,62 @@
 **Date**: 2026-04 (Phase 2)
 **Status**: Decided
 
-**Context**: Dev-агент должен писать код, коммитить и создавать MR от имени бота, не затирая работу человека.
-
 **Decision**:
-- Коммиты: `Virtual Dev <virtual-dev@datamining.2gis.ru>`, per-call `-c user.name/email` (не глобальный git config)
+- Коммиты: `Virtual Dev <virtual-dev@datamining.2gis.ru>`, per-call `-c user.name/email`
 - Ветки: `ai-dev/<external_id>-<slug>`
-- MR: draft (`Draft:` префикс, т.к. self-hosted GitLab дропает `draft: true` API-флаг)
-- Workspace: уважает `local_path` из `repositories.yaml` (reuse чекаута). Safety-check на dirty tree один раз на входе.
-- Per-repo `asyncio.Lock` для всех мутирующих git-ops.
+- MR: draft (`Draft:` префикс, т.к. self-hosted GitLab дропает `draft: true`)
+- Workspace: уважает `local_path` из `repositories.yaml`, safety-check на dirty tree один раз на входе
+- Per-repo `asyncio.Lock` для всех мутирующих git-ops
 
 **Impact**: + Безопасная работа рядом с человеком. + Никаких глобальных мутаций git config.
 
 ---
 
-## Decision: Reviewer — Heuristic Comment Classification (пока)
+## Decision: PostgreSQL вместо SQLite
 
-**Date**: 2026-04 (Phase 3)
-**Status**: Decided (Phase 5 → LLM)
+**Date**: 2026-07 (Phase 4 — deployment)
+**Status**: Decided
 
-**Context**: Reviewer должен классифицировать комментарии в MR: апрув, вопрос, change request, флейм.
+**Context**: SQLite не подходит для продакшена в K8s: нет concurrent writes, file-based, нет connection pooling. Нужна "настоящая" БД для multi-past deploy.
 
-**Decision**: Пока эвристики (`ReviewCommentClassifier`: `approval_hint`/`question`/`change_request`/`chatter`). Phase 5 заменит на LLM-классификацию.
+**Decision**: PostgreSQL 16, asyncpg driver. `DB_DSN` вместо `DB_URL`. `SqlAlchemyMessageBus` с dialect-aware upsert. `psycopg2-binary` для sync Alembic.
 
-**Impact**: + Просто и дёшево. − Ошибается на сложных/саркастичных комментариях.
+**Rationale**: asyncpg строгий к типам (в отличие от SQLite) — выявил mismatch tz-aware datetime vs `TIMESTAMP WITHOUT TIME ZONE`. Это заставило сделать миграцию 0007 (`TIMESTAMPTZ`).
+
+**Impact**: + Production-grade БД. + Connection pooling. − Двойной driver (asyncpg + psycopg2). − Строгая типизация выявила скрытые баги (tz mismatch).
+
+---
+
+## Decision: TIMESTAMPTZ для всех DateTime колонок
+
+**Date**: 2026-07 (Phase 4)
+**Status**: Decided
+
+**Context**: Приложение везде генерирует tz-aware datetime (`datetime.now(timezone.utc)`, Jira отдаёт `+07:00`). Колонки были `TIMESTAMP WITHOUT TIME ZONE`. SQLite прощал mismatch, asyncpg — нет: `can't subtract offset-naive and offset-aware datetimes`.
+
+**Decision**: Все `DateTime` → `DateTime(timezone=True)` в ORM. Миграция 0007 конвертирует `TIMESTAMP` → `TIMESTAMPTZ` (Postgres only, SQLite no-op), интерпретируя существующие значения как UTC.
+
+**Impact**: + asyncpg работает корректно. + Jira datetimes сохраняются с оригинальным tz. − Миграция на проде (но идемпотентна).
+
+---
+
+## Decision: Docker + K8s Deployment
+
+**Date**: 2026-07 (Phase 4)
+**Status**: Decided
+
+**Context**: Приложение должно работать автономно в корпоративном K8s. До этого — локальный `virtual-dev run` на машине тимлида.
+
+**Decision**:
+- `Dockerfile`: корпоративный registry, uv, non-root user, `CMD ["virtual-dev", "run", "--host", "0.0.0.0"]`
+- `init_db()` в FastAPI `lifespan` с 30s timeout guard — миграции накатываются при старте пода
+- Helm chart в отдельном репо (`sd-bots-ai-dev-ai-dev`)
+- `readinessProbe: /healthz`, `helm --atomic --wait --timeout 5m`
+- `--host 0.0.0.0` в CMD overrides `WEB_HOST` из ConfigMap (CLI arg > env)
+
+**Rationale**: `init_db()` в lifespan вместо `initContainer` — нет доступа к деплой-файлам на момент реализации. Timeout guard защищает от зависания при недоступной БД.
+
+**Impact**: + Автоматический деплой без ручных шагов. + Миграции накатываются автоматически. − Если БД недоступна >30s — под стартует без миграций (но readinessProbe покажет реальное состояние).
 
 ---
 
@@ -73,11 +101,7 @@
 **Date**: 2026-04 (Phase 3.5.5)
 **Status**: Decided
 
-**Context**: Reviewer пинговал "please review" сразу после открытия MR, но CI часто был красным. Ревьюеры начинали смотреть, видели красный — теряли контекст.
-
-**Decision**: Review-ping отправляется только когда CI SUCCESS/UNKNOWN. Гейт на `get_latest_pipeline_jobs` + `_collapse_status`, не на `mr.pipeline.status` (который desync'ится после push'а). `created`/`manual`/`skipped` статусы считаются "passing" (downstream deploy-гейты).
-
-**Impact**: + Ревьюеры видят MR только когда код готов. + Никаких "посмотрю потом" из-за красного CI.
+**Decision**: Review-ping отправляется только когда CI SUCCESS/UNKNOWN. Гейт на `get_latest_pipeline_jobs` + `_collapse_status`. `created`/`manual`/`skipped` считаются "passing".
 
 ---
 
@@ -86,11 +110,7 @@
 **Date**: 2026-04 (Phase 3.5.5)
 **Status**: Decided
 
-**Context**: Раньше DevOps постил "Pipeline FAILED" в канал команды при каждом красном CI. Это создавало шум и не помогало.
-
-**Decision**: Красный CI → бот МОЛЧА пытается починить (Dev.handle_iteration с полным логом). До `max_autofix_attempts=3` — никаких сообщений. После 3 неудач — DM тимлиду. **Канал команды вообще не видит CI-failures**.
-
-**Impact**: + Нет шума в канале. + CI фиксится до того, как человек заметил. − Риск незаметного зацикливания (защита: max_attempts).
+**Decision**: Красный CI → бот МОЛЧА пытается починить (Dev.handle_iteration с полным логом). До 3 попыток — никаких сообщений. После — DM тимлиду. Канал не видит CI-failures.
 
 ---
 
@@ -99,24 +119,18 @@
 **Date**: 2026-04 (Phase 3.8.1)
 **Status**: Decided
 
-**Context**: WebSocket к Mattermost периодически падал (SSL, WAF, network issues). Каждое падение теряло сообщения.
-
-**Decision**: WS — только для низкой задержки. Корректность через REST catch-up (`read_channel_since`, polling раз в 60s). WS-разрыв не теряет сообщения. `run_forever` с exponential backoff (5s→5min). Идемпотентность через ✅-реакцию / UNIQUE-индексы.
-
-**Impact**: + WS может лежать час — сообщения не теряются. + Простая обработка ошибок (catch-up закроет gap за ≤1 минуту).
+**Decision**: WS — только для низкой задержки. Корректность через REST catch-up (`read_channel_since`, 60s polling). WS-разрыв не теряет сообщения. `run_forever` с exponential backoff 5s→5min.
 
 ---
 
-## Decision: AnalystConversation — Flat Log + Coalescing вместо дерева вопросов
+## Decision: AnalystConversation — Flat Log + Coalescing
 
 **Date**: 2026-06 (Phase 5.0)
 **Status**: Decided
 
-**Context**: Старый clarification flow (дерево Question/Answer/Classification) был избыточен: 6 типов классификации, 3 отдельных LLM-агента (AnswerClassifier, CounterQuestionAnswerer, StakeholderResolver), сложная state machine. На практике аналисту нужно просто: спросить → получить ответ → перепланировать.
+**Decision**: Плоский append-only лог (`ConversationStep`) + буферизированные фрагменты. Coalescing 180s → merge → HUMAN_REPLIED → перезапуск аналиста. Circuit breaker: `max_planner_calls_per_goal=8`.
 
-**Decision**: Плоский append-only лог (`ConversationStep`) + буферизированные фрагменты (`ConversationFragment`). Coalescing: ждём 180s тишины после последнего фрагмента → merge → HUMAN_REPLIED step → перезапуск аналиста с полной историей. Никакой классификации ответов, никаких деревьев. Circuit breaker: `max_planner_calls_per_goal=8`, `max_goal_age_hours=48`.
-
-**Impact**: + Радикально проще (один AnalystInbox вместо 3 агентов). + Меньше LLM-вызовов (классификация не нужна). − Нет структурного анализа ответов (пока не требовалось).
+**Impact**: + Радикально проще (один AnalystInbox вместо 3 агентов). + Меньше LLM-вызовов.
 
 ---
 
