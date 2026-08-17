@@ -72,31 +72,75 @@ _SLUG_SAFE_RE = re.compile(r"[^a-z0-9]+")
 
 
 # Inserted into the iteration prompt only on the MR-review path.
-# The model addresses the code-fix feedback AND adds a generalised
-# rule to the target repo's CLAUDE.md so the next session on that
+# The model addresses the code-fix feedback AND distils a generalised
+# rule into the target repo's CLAUDE.md so the next session on that
 # repo doesn't repeat the mistake. CI-failure iterations skip this —
 # pipeline flakes aren't project conventions worth pinning.
+#
+# The bar matters as much as the habit: the first version of this
+# instruction said "append a rule every iteration" with a
+# "use double quotes → ## Style" example, and the model dutifully
+# turned CLAUDE.md into a per-commit review log (linter-grade nits,
+# names of entities from the current MR, point-in-time config
+# values). Teams asked for the file to stop churning. The cure is to
+# generalise first and record only what survives — not to stop
+# maintaining the file, which is the feature's whole point.
 _CLAUDE_MD_INSTRUCTION = (
     "## Capture the lesson into CLAUDE.md\n"
-    "Along with the code fix, append a short rule extracted from the "
-    "feedback to the file `CLAUDE.md` in the **target repository's "
-    "root** (the repo you're editing — not this agent's config). "
-    "Create the file if it doesn't exist. The format is the standard "
-    "Anthropic `CLAUDE.md` convention: short, project-specific rules "
-    "in markdown, grouped under a heading, no general programming "
-    "advice. Keep each rule to one bullet — the *what* and a brief "
-    "*why* if it isn't obvious from the rule itself. Skip this step "
-    "only if the feedback was clearly about a one-off bug rather than "
-    "a project convention.\n\n"
+    "`CLAUDE.md` in the **target repository's root** (the repo you're "
+    "editing — not this agent's config) is read by every future "
+    "session in that repo. It is the project's convention book, NOT a "
+    "review log: an entry earns its place only if it stays useful to "
+    "someone working on a completely different task. Along with the "
+    "code fix, distil the feedback into such a convention and record "
+    "it. Create the file if it doesn't exist; format is the standard "
+    "Anthropic `CLAUDE.md` convention — short markdown rules grouped "
+    "under headings.\n\n"
+    "How to distil:\n"
+    "1. **Generalise first.** Strip everything tied to the current "
+    "MR: its variable/class/file names, its numbers. State the "
+    "underlying rule the reviewer applied, not the instance of it.\n"
+    "2. **Then check the rule earns its place.** Record it only if "
+    "all hold:\n"
+    "   * It would change how you act in a future, unrelated task in "
+    "this repo.\n"
+    "   * It is specific to THIS project. Advice that is true in any "
+    "repository (\"keep abstractions minimal\", \"test behaviour, not "
+    "implementation\") is general engineering wisdom you already know "
+    "— recording it is noise.\n"
+    "   * It is durable: no point-in-time facts (current config "
+    "values, versions, counts) — those rot the moment someone changes "
+    "them.\n"
+    "   * No linter / type-checker / CI job in this repo already "
+    "enforces it.\n"
+    "3. **If nothing project-specific survives generalisation** (a "
+    "typo, a one-off naming nit, a judgement call about this change "
+    "only) — skip the step. A skipped rule is cheap: a real "
+    "convention will come up in review again, and that repetition is "
+    "your signal to record it.\n\n"
+    "Editing etiquette:\n"
+    "* Read the whole file before writing. If an existing bullet "
+    "covers the same ground, refine that bullet in place instead of "
+    "appending a near-duplicate.\n"
+    "* One bullet per rule: the *what*, plus a short *why* when it "
+    "isn't obvious. No reviewer quotes verbatim, no ticket/MR ids.\n"
+    "* Keep the file short — every future session pays to read it.\n"
+    "* If a human complains about your CLAUDE.md entries, delete what "
+    "they point at and raise your bar, but never promise to stop "
+    "maintaining the file — that maintenance is part of your job. "
+    "Reply in one short sentence.\n\n"
     "Examples:\n"
-    "* Feedback: \"use double quotes\" → bullet under `## Style`: "
-    "`Use double quotes for strings (project ruff config: quote-style"
-    "=\"double\").`\n"
-    "* Feedback: \"don't import test helpers from src/\" → bullet "
-    "under `## Imports`: `Test helpers live in tests/_helpers.py; "
-    "never import from src/ in tests.`\n\n"
-    "Don't restate rules already in CLAUDE.md, don't dump the full "
-    "review comment verbatim, don't reference the ticket id."
+    "* «переименуй some_var в user_count» → skip: one-off naming "
+    "nit, nothing survives generalisation.\n"
+    "* «мы каждую env-настройку прокидываем через Helm values» → "
+    "bullet under `## Deployment`: `New env-var settings must also be "
+    "wired into the Helm chart (values.yaml + the template's env "
+    "block).`\n"
+    "* «не заводи иерархию классов, хватит одного dataclass» → skip: "
+    "true in any repo, general engineering wisdom.\n"
+    "* «дефолт в коде разъехался с задеплоенным значением 3» → "  # noqa: RUF001
+    "bullet under `## Settings`: `Keep code defaults aligned with the "
+    "deployed Helm values.` — the principle, without the value 3."
 )
 
 

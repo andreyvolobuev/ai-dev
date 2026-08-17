@@ -945,8 +945,14 @@ async def test_iteration_prompt_for_mr_review_extracts_rule_into_claude_md(
     add a generalised rule to the target repo's CLAUDE.md (so the next
     Claude Code session on that repo doesn't repeat the mistake).
 
-    The instruction must mention CLAUDE.md by name and tell the model
-    to create the file if it doesn't exist."""
+    The instruction must mention CLAUDE.md by name, tell the model to
+    create the file if it doesn't exist, and set the quality bar that
+    keeps the file a convention book rather than a review log: rules
+    must pay off in a future *unrelated* task, must not pin
+    point-in-time values, and must not restate what a linter already
+    enforces. The old prompt's "use double quotes → ## Style" example
+    taught the model to log linter-grade nits — teams complained, so
+    its absence is part of the contract."""
     await _insert_task(session_factory)
     await _insert_plan(session_factory)
     vcs = _FakeVcs(tmp_path / "workspace")
@@ -965,13 +971,60 @@ async def test_iteration_prompt_for_mr_review_extracts_rule_into_claude_md(
     prompt = dev._render_iteration_prompt(
         task_row=task_row,
         plan=plan,
-        feedback="please use double quotes for strings",
+        feedback="please rename some_var to user_count",
         feedback_kind="mr_review",
     )
 
     assert "CLAUDE.md" in prompt
     # Should tell the model to create the file if missing.
     assert "create" in prompt.lower() or "doesn't exist" in prompt.lower()
+    # Reusability bar: a rule must matter in a future, unrelated task.
+    assert "unrelated task" in prompt
+    # Durability bar: no point-in-time values that rot.
+    assert "point-in-time" in prompt
+    # No duplicating what tooling already enforces.
+    assert "linter" in prompt.lower()
+    # The linter-nit example must stay gone.
+    assert "use double quotes" not in prompt.lower()
+    assert "## Style" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_iteration_prompt_claude_md_hygiene_and_complaint_handling(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """The CLAUDE.md instruction must also cover file hygiene (refine
+    an overlapping bullet in place instead of appending a near-twin)
+    and how to react when a human complains about the entries: comply
+    with the specific request, but never swear off maintaining the
+    file — that maintenance is operator policy, not the reviewer's
+    call. Аида once promised «больше этот файл трогать не буду», which
+    contradicts why she exists."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _FakeVcs(tmp_path / "workspace")
+    code_agent = _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=0, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=code_agent, preset_submission=None,
+    )
+
+    task_row, plan_row = await dev._load("jira", "DM-7")
+    assert task_row is not None and plan_row is not None
+    plan = row_to_plan(plan_row)
+
+    prompt = dev._render_iteration_prompt(
+        task_row=task_row,
+        plan=plan,
+        feedback="всё про style удали и больше сама в этот файл ничего не добавляй",
+        feedback_kind="mr_review",
+    )
+
+    assert "instead of appending" in prompt
+    assert "never promise to stop" in prompt
 
 
 @pytest.mark.asyncio
