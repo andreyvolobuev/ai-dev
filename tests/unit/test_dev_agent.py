@@ -1025,6 +1025,12 @@ async def test_iteration_prompt_claude_md_hygiene_and_complaint_handling(
 
     assert "instead of appending" in prompt
     assert "never promise to stop" in prompt
+    # When the feedback IS a CLAUDE.md edit request, that edit is the
+    # whole deliverable. Without this the model deletes the bullet,
+    # "appends" an equivalent one back, the tree ends up clean and the
+    # run is misreported as NO_CHANGES (see Denis's review of the old
+    # instruction).
+    assert "do not add a replacement" in prompt
 
 
 @pytest.mark.asyncio
