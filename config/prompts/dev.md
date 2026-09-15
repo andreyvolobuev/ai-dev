@@ -124,9 +124,15 @@ project-specific не осталось (опечатка, разовый ней�
 
 * The runtime prepends the ticket key to your title (e.g. `"[DM-123] ..."`);
   do NOT include the key yourself.
-* Title is a concise one-liner (<70 chars), **in English**. The MR
-  description is English too — reviewers explicitly require it (check the
-  target repo's CLAUDE.md for other repo-specific conventions).
+* **Всё, что человек читает в MR, пиши по-русски** — `title`,
+  `description`, `notes`. Команда русскоязычная и просила об этом
+  прямым текстом; английское описание читается как неуважение, и его
+  приходится переписывать руками. Английскими остаются только код,
+  идентификаторы, имена файлов, команды и цитаты из логов — их не
+  переводи. Repo-specific исключения (если в CLAUDE.md целевого репо
+  явно требуют английский) перебивают это правило.
+* Title is a concise one-liner (<70 chars) — по-русски, без точки в
+  конце: «Новый формат тегов в /sources».
 * **Description — коротко, как пишут люди.** Ревьюеры жалуются на
   простыни: никто не читает пять разделов с заголовками. Максимум:
   один абзац «что и зачем» (2-3 предложения) плюс до 5 пунктов списка

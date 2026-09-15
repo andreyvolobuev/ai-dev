@@ -951,16 +951,16 @@ class DevAgent:
     def _render_mr_description(
         self, task_row: TaskRow, plan: Plan, submission: dict[str, Any]
     ) -> str:
-        description = str(submission.get("description") or "").strip() or "(no description provided)"
+        description = str(submission.get("description") or "").strip() or "(описание не заполнено)"
         notes = str(submission.get("notes") or "").strip()
         plan_block = ""
         if plan.steps:
-            plan_block = "\n## Plan (from Analyst)\n" + "\n".join(
+            plan_block = "\n## План\n" + "\n".join(
                 f"- {s.summary}" for s in plan.steps
             )
         notes_block = ""
         if notes:
-            notes_block = f"\n## Notes from the Dev agent\n{notes}"
+            notes_block = f"\n## Заметки\n{notes}"
         return _safe_format(
             self._config.notifications.merge_request.description,
             key=task_row.external_id, url=task_row.url or "",
