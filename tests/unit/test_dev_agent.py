@@ -1497,3 +1497,13 @@ def test_dev_prompt_requires_russian_mr_title_and_description() -> None:
     assert "**in English**" not in mr_section
     assert "description is English too" not in mr_section
     assert "по-русски" in mr_section
+
+
+def test_dev_prompt_forbids_inventing_mr_settings() -> None:
+    # The dev wrote "Target branch: tags-dev" into the description of an
+    # MR the runtime had opened into master — a setting it does not
+    # control, stated as fact.
+    prompt = (Path(__file__).parents[2] / "config" / "prompts" / "dev.md").read_text("utf-8")
+    mr_section = prompt.split("## MR submission", 1)[1]
+
+    assert "Не выдумывай настройки MR" in mr_section
