@@ -514,7 +514,10 @@ class ReviewerAgent:
         from datetime import datetime as _dt
         from datetime import timezone as _tz
 
-        from virtual_dev.application.agents.thread_responder import ResponderAction
+        from virtual_dev.application.agents.thread_responder import (
+            ResponderAction,
+            resolve_mr_branches,
+        )
         from virtual_dev.domain.models.chat import ChatMessage
 
         def _to_chat(c: ReviewComment) -> ChatMessage:
@@ -546,6 +549,11 @@ class ReviewerAgent:
                 "Reviewer: get_mr_diff failed for {}!{}", row.repo_key, row.iid,
             )
 
+        source_branch, target_branch = await resolve_mr_branches(
+            self._vcs, repo_key=row.repo_key, iid=row.iid,
+            fallback_source=row.source_branch, fallback_target=row.target_branch,
+        )
+
         decision = await self._responder.decide(   # type: ignore[union-attr]
             mr_title=row.title,
             mr_description=row.description or "",
@@ -555,6 +563,8 @@ class ReviewerAgent:
             latest_reply=latest_chat,
             repo_workspace=repo_workspace,
             mr_diff=mr_diff,
+            mr_source_branch=source_branch,
+            mr_target_branch=target_branch,
         )
         logger.info(
             "Reviewer: GitLab comment decision={} reasoning={!r}",

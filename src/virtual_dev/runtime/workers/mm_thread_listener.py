@@ -39,6 +39,7 @@ from virtual_dev.application.agents import (
     ResponderAction,
     ThreadResponderAgent,
 )
+from virtual_dev.application.agents.thread_responder import resolve_mr_branches
 from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.application.services.ticket_reset import reset_ticket_state
@@ -544,6 +545,10 @@ class MmThreadListener:
                     "MmThreadListener: get_mr_diff failed for {}!{}",
                     row.repo_key, row.iid,
                 )
+        source_branch, target_branch = await resolve_mr_branches(
+            self._vcs, repo_key=row.repo_key, iid=row.iid,
+            fallback_source=row.source_branch, fallback_target=row.target_branch,
+        )
 
         decision = await self._responder.decide(
             mr_title=row.title,
@@ -554,6 +559,8 @@ class MmThreadListener:
             latest_reply=event,
             repo_workspace=self._resolve_repo_workspace(row.repo_key),
             mr_diff=mr_diff,
+            mr_source_branch=source_branch,
+            mr_target_branch=target_branch,
         )
         logger.info(
             "MmThreadListener: decision={} reasoning={!r}",

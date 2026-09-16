@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -176,3 +177,42 @@ async def test_responder_emits_decision_activity_event_on_reply() -> None:
     assert e.payload.get("action") == "reply"
     assert e.payload.get("reply_text") == "вот объяснение"
     assert e.payload.get("reasoning") == "answers-the-question"
+
+
+@pytest.mark.asyncio
+async def test_prompt_carries_real_branches_as_verified_facts() -> None:
+    """Regression: the responder told humans the MR targeted `tags-dev`
+    and defended it three times. Its only branch "knowledge" was the
+    bot-written MR description, which the prompt itself labels
+    untrusted. The real branches come from GitLab via the MR row and
+    must be rendered as facts the model may not contradict."""
+    fake = _FakeCodeAgent()
+    responder = ThreadResponderAgent(
+        code_agent=fake,
+        config=_cfg(),
+        prompts_loader=PromptsLoader("/no-prompts-dir"),
+        injection_filter=InjectionFilter(),
+    )
+
+    await responder.decide(
+        mr_title="t",
+        mr_description="Target branch: tags-dev.",
+        mr_web_url="u",
+        mr_source_branch="ai-dev/dm-2911-back",
+        mr_target_branch="master",
+        plan=None, thread=[], latest_reply=_msg(id="p", author="a", text="куда льём?"),
+    )
+
+    assert fake.last_request is not None
+    prompt = fake.last_request.user_prompt
+    facts = prompt.split("## MR description", 1)[0]
+    # Branches live ABOVE the untrusted description, in the facts block.
+    assert "ai-dev/dm-2911-back" in facts
+    assert "master" in facts
+
+
+def test_responder_prompt_ranks_gitlab_facts_above_prose() -> None:
+    prompt = (
+        Path(__file__).parents[2] / "config" / "prompts" / "thread_responder.md"
+    ).read_text("utf-8")
+    assert "## Факты о MR" in prompt

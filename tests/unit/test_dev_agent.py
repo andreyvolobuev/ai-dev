@@ -1444,3 +1444,66 @@ async def test_concurrent_iterations_on_one_repo_serialize(
     assert code_agent.max_active == 1, (
         "two iterations ran concurrently in the same workspace"
     )
+
+
+@pytest.mark.asyncio
+async def test_mr_description_blocks_are_russian_and_hide_internal_roles(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    # Reviewers read the MR description in Russian; the section headers the
+    # runtime injects around the model's text must not drop back to English
+    # — nor name the internal Dev/Analyst roles the bot presents as one person.
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+
+    dev = _make_dev(
+        session_factory, vcs=_FakeVcs(tmp_path / "ws"),
+        code_agent=_FakeCodeAgent(CodeAgentResult(
+            final_text="", turns=1, input_tokens=0, output_tokens=0,
+            cost_usd=0.0, stopped_reason="end_turn",
+        )),
+        preset_submission=None,
+    )
+    dev._config.notifications.merge_request.description = (
+        "**Задача:** [{key}]({url})\n\n{description}\n{plan_block}\n{notes_block}"
+    )
+    async with session_factory() as session:
+        task_row = (await session.execute(
+            select(TaskRow).where(TaskRow.external_id == "DM-7")
+        )).scalar_one()
+        plan_row = (await session.execute(
+            select(PlanRow).where(PlanRow.task_external_id == "DM-7")
+        )).scalar_one()
+    plan = row_to_plan(plan_row)
+
+    description = dev._render_mr_description(
+        task_row, plan,
+        {"description": "Переделала формат тегов.", "notes": "Тесты зелёные."},
+    )
+
+    assert "## Plan (from Analyst)" not in description
+    assert "## Notes from the Dev agent" not in description
+    assert "Analyst" not in description and "Dev agent" not in description
+    assert "## План" in description
+    assert "## Заметки" in description
+
+
+def test_dev_prompt_requires_russian_mr_title_and_description() -> None:
+    # The root cause of MRs shipping in English: the prompt used to demand it.
+    prompt = (Path(__file__).parents[2] / "config" / "prompts" / "dev.md").read_text("utf-8")
+    mr_section = prompt.split("## MR submission", 1)[1]
+
+    assert "**in English**" not in mr_section
+    assert "description is English too" not in mr_section
+    assert "по-русски" in mr_section
+
+
+def test_dev_prompt_forbids_inventing_mr_settings() -> None:
+    # The dev wrote "Target branch: tags-dev" into the description of an
+    # MR the runtime had opened into master — a setting it does not
+    # control, stated as fact.
+    prompt = (Path(__file__).parents[2] / "config" / "prompts" / "dev.md").read_text("utf-8")
+    mr_section = prompt.split("## MR submission", 1)[1]
+
+    assert "Не выдумывай настройки MR" in mr_section
