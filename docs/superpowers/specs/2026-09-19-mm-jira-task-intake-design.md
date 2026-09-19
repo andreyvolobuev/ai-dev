@@ -204,9 +204,13 @@ catch-up sweep) реальна: строка вставляется до отв�
 жизнью после создания тикета; трактовать каждый реплай как правку — это
 гарантированные ложные срабатывания в чужом обсуждении.
 
-### Permalink на тред
+### Permalink на тред и email автора
 
-В `ChatPort` добавляется `post_permalink(post_id, channel_id) -> str | None`
+В `ChatPort` добавляется `get_user_by_id(user_id) -> ChatUser | None`: автор
+поста известен только по MM-id, а в Jira человека ищут по email — без этого
+метода исполнителя не резолвить.
+
+Там же `post_permalink(post_id, channel_id) -> str | None`
 (дефолтная реализация — `None`, чтобы тестовые фейки не ломались). MM-адаптер
 строит `{MATTERMOST_URL}/{team_name}/pl/{post_id}`, резолвя
 `channel_id → team_id → team_name` и кешируя результат по channel_id. Если
