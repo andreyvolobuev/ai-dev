@@ -110,6 +110,24 @@ class PipelinePolicyCfg(_StrictModel):
     max_infra_retries: int = 2
 
 
+class TaskIntakeCfg(_StrictModel):
+    """Создание задач по просьбе в Mattermost.
+
+    Сюда попадает работа, которую команде приносят соседние команды:
+    лейбл ``dmp-sup`` и активный спринт нужны, чтобы она была видна в
+    планировании, не растворяясь в «помог по-быстрому».
+
+    ``enabled`` по умолчанию False: дефолт не должен молча включать
+    запись в Jira на инсталляции, которая про эту фичу не знает.
+    """
+
+    enabled: bool = False
+    project: str = "DM"
+    issue_type: str = "Task"
+    labels: list[str] = Field(default_factory=lambda: ["dmp-sup"])
+    add_to_active_sprint: bool = True
+
+
 class EscalationCfg(_StrictModel):
     mattermost_user: str = ""
 
@@ -150,6 +168,22 @@ class MmTemplatesCfg(_StrictModel):
     #   commented in Jira; the lead is told what happened.
     stuck_escalation_to_lead: str = ""
     blocked_escalation_to_lead: str = ""
+
+    # --- Интейк задач (просьба в MM -> тикет в Jira) ---
+    # Факты подставляет раннер: {key}, {url}, {summary}, {assignee},
+    # {sprint}, {warnings_block} (уже отрендеренный текст или пустая строка).
+    intake_created: str = ""
+    # {changes} — перечисление того, что реально применилось.
+    intake_updated: str = ""
+    # {reason} — короткая причина, без стектрейса.
+    intake_failed: str = ""
+    # Если модель не дала текста для отказа — берём этот.
+    intake_busy_fallback: str = ""
+    # Фразы для {warnings_block}. Тикет при любой из них уже создан.
+    intake_warning_no_active_sprint: str = ""
+    intake_warning_sprint_failed: str = ""
+    intake_warning_assignee_not_found: str = ""
+    intake_warning_assignee_hint_unresolved: str = ""
 
 
 class JiraTemplatesCfg(_StrictModel):
@@ -223,6 +257,7 @@ class AgentsCfg(_StrictModel):
     agents: dict[str, AgentCfg] = Field(default_factory=dict)
     review_policy: ReviewPolicyCfg = Field(default_factory=ReviewPolicyCfg)
     pipeline_policy: PipelinePolicyCfg = Field(default_factory=PipelinePolicyCfg)
+    task_intake: TaskIntakeCfg = Field(default_factory=TaskIntakeCfg)
     escalation: EscalationCfg = Field(default_factory=EscalationCfg)
     clarification: ClarificationCfg = Field(default_factory=ClarificationCfg)
 

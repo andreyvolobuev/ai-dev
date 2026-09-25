@@ -107,6 +107,31 @@ mattermost:
 
     Помоги, пожалуйста, разобраться или подскажи, кому переадресовать.
 
+  # --- Интейк задач ---
+  # Ответ на просьбу завести задачу. Факты — от раннера, не от модели.
+  # {key}, {url}, {summary}, {assignee}, {sprint} (имя спринта или
+  # «без спринта»), {warnings_block}.
+  intake_created: |
+    Завела [{key}]({url}) — «{summary}». Исполнитель: {assignee}, спринт: {sprint}.{warnings_block}
+
+  # {changes} — что именно поменяла.
+  intake_updated: |
+    Готово: {changes}
+
+  # {reason} — короткая причина отказа Jira.
+  intake_failed: |
+    Не смогла завести задачу в Jira: {reason}. Повтори просьбу — попробую снова.
+
+  # Фолбэк, если модель не написала свой текст отказа.
+  intake_busy_fallback: |
+    Сейчас занята задачей, отвлечься не могу.
+
+  # Дописки к intake_created, когда что-то не доехало.
+  intake_warning_no_active_sprint: "активного спринта не нашла — положи в спринт сама"
+  intake_warning_sprint_failed: "в спринт положить не получилось"
+  intake_warning_assignee_not_found: "не нашла тебя в Jira по почте — поставь исполнителя руками"
+  intake_warning_assignee_hint_unresolved: "не поняла, кого назначить, поставила тебя"
+
 # --- Jira (комментарии к тикетам) ---
 # Доступные placeholders:
 #   {tracker}, {external_id}, {status}, {confidence}, {summary},
