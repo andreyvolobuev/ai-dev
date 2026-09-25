@@ -140,6 +140,7 @@ _GROUP_HEADERS: dict[str, str] = {
     "analyst": "Analyst tools (talk to humans, terminate the run)",
     "dev": "Dev tools (terminate the implementation run)",
     "responder": "Responder tools (terminate the review-reply decision)",
+    "intake": "Intake tools (terminate the task-intake decision)",
 }
 
 
