@@ -19,9 +19,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from virtual_dev.domain.models.task import (
+    CreatedTask,
+    NewTaskSpec,
     Task,
     TaskComment,
     TaskLink,
+    TaskPatch,
     TaskPriority,
     TaskStatus,
 )
@@ -87,6 +90,10 @@ class JiraTaskTracker(TaskTrackerPort):
         _install_retry_adapter(self._client._session)
         # For building web URLs to tickets.
         self._browse_base_url = (browse_base_url or url).rstrip("/")
+        # Резолвится один раз по имени поля ("Sprint") — id кастомного
+        # поля отличается от инстанса к инстансу Jira.
+        self._sprint_field_id: str | None = None
+        self._sprint_field_resolved = False
 
     async def fetch_tasks(self, jql: str, limit: int = 50) -> Sequence[Task]:
         def _fetch() -> list[dict[str, Any]]:
@@ -180,6 +187,154 @@ class JiraTaskTracker(TaskTrackerPort):
 
         await asyncio.to_thread(_run)
         logger.info("Jira {} commented ({} chars)", external_id, len(body))
+
+    async def create_task(self, spec: NewTaskSpec) -> CreatedTask:
+        def _run() -> CreatedTask:
+            fields: dict[str, Any] = {
+                "project": {"key": spec.project},
+                "issuetype": {"name": spec.issue_type},
+                "summary": spec.summary,
+                "description": spec.description,
+            }
+            if spec.labels:
+                fields["labels"] = list(spec.labels)
+            if spec.assignee:
+                fields["assignee"] = {"name": spec.assignee}
+            created = self._client.create_issue(fields=fields)
+            if not isinstance(created, dict) or not created.get("key"):
+                _raise_for_non_dict_response(created)
+            key = str(cast(dict[str, Any], created)["key"])
+
+            warnings: list[str] = []
+            sprint_name: str | None = None
+            if spec.add_to_active_sprint:
+                # Спринт — вторым шагом, через Agile-эндпоинт: формат
+                # записи sprint-поля через /issue отличается между
+                # версиями Jira, тогда как /sprint/<id>/issue стабилен.
+                try:
+                    sprint_id, sprint_name = self._active_sprint(spec.project)
+                    if sprint_id is None:
+                        warnings.append("no_active_sprint")
+                    else:
+                        self._client.add_issues_to_sprint(sprint_id, [key])
+                except Exception:
+                    logger.exception(
+                        "Jira: could not put {} into the active sprint of {}",
+                        key, spec.project,
+                    )
+                    warnings.append("sprint_failed")
+                    sprint_name = None
+
+            return CreatedTask(
+                key=key,
+                url=f"{self._browse_base_url}/browse/{key}",
+                assignee=spec.assignee,
+                sprint_name=sprint_name,
+                warnings=warnings,
+            )
+
+        task = await asyncio.to_thread(_run)
+        logger.info(
+            "Jira created {} (labels={}, assignee={}, sprint={}, warnings={})",
+            task.key, spec.labels, spec.assignee, task.sprint_name, task.warnings,
+        )
+        return task
+
+    async def update_task(self, external_id: str, patch: TaskPatch) -> None:
+        if patch.is_empty():
+            return
+
+        def _run() -> None:
+            fields: dict[str, Any] = {}
+            if patch.summary is not None:
+                fields["summary"] = patch.summary
+            if patch.description is not None:
+                fields["description"] = patch.description
+            if patch.assignee is not None:
+                # "" снимает исполнителя: Jira ждёт assignee=None.
+                fields["assignee"] = (
+                    {"name": patch.assignee} if patch.assignee else None
+                )
+            if patch.labels_add or patch.labels_remove:
+                current = self._client.issue_field_value(external_id, "labels")
+                labels = [str(x) for x in current] if isinstance(current, list) else []
+                for label in patch.labels_add:
+                    if label not in labels:
+                        labels.append(label)
+                labels = [x for x in labels if x not in set(patch.labels_remove)]
+                fields["labels"] = labels
+            if patch.sprint is False:
+                sprint_field = self._sprint_field()
+                if sprint_field:
+                    fields[sprint_field] = None
+            if fields:
+                self._client.update_issue_field(external_id, fields)
+            if patch.sprint is True:
+                project = external_id.split("-")[0]
+                sprint_id, _ = self._active_sprint(project)
+                if sprint_id is not None:
+                    self._client.add_issues_to_sprint(sprint_id, [external_id])
+
+        await asyncio.to_thread(_run)
+        logger.info("Jira {} patched", external_id)
+
+    async def find_tracker_user_by_email(self, email: str) -> str | None:
+        if not email.strip():
+            return None
+
+        def _run() -> str | None:
+            # Jira Server требует именно ``username``; матчится по
+            # username / displayName / emailAddress.
+            entries = self._client.user_find_by_user_string(
+                username=email, limit=10,
+            )
+            return _pick_tracker_username(entries, email)
+
+        return await asyncio.to_thread(_run)
+
+    # --- internals (write path) ---
+
+    def _sprint_field(self) -> str | None:
+        """id кастомного поля «Sprint», один раз на процесс."""
+        if self._sprint_field_resolved:
+            return self._sprint_field_id
+        self._sprint_field_resolved = True
+        try:
+            for field in self._client.get_all_fields() or []:
+                if (
+                    isinstance(field, dict)
+                    and str(field.get("name") or "") == _SPRINT_FIELD_NAME
+                ):
+                    self._sprint_field_id = str(field.get("id") or "") or None
+                    break
+        except Exception:
+            logger.exception("Jira: could not resolve the Sprint field id")
+            self._sprint_field_id = None
+        if self._sprint_field_id is None:
+            logger.warning("Jira: no custom field named {!r}", _SPRINT_FIELD_NAME)
+        return self._sprint_field_id
+
+    def _active_sprint(self, project: str) -> tuple[int | None, str | None]:
+        """``(id, name)`` активного спринта проекта.
+
+        Через JQL, не через id доски: доска может поменяться, или досок
+        может быть несколько, зато ``sprint in openSprints()`` спрашивает
+        именно то, что нужно — спринт, в котором команда работает сейчас.
+        """
+        sprint_field = self._sprint_field()
+        if not sprint_field:
+            return None, None
+        result = self._client.jql(
+            f'project = "{project}" AND sprint in openSprints() ORDER BY updated DESC',
+            limit=1,
+        )
+        if not isinstance(result, dict):
+            return None, None
+        issues = result.get("issues") or []
+        if not issues:
+            return None, None
+        fields = cast(dict[str, Any], issues[0]).get("fields") or {}
+        return _parse_sprint(cast(dict[str, Any], fields).get(sprint_field))
 
     def _purge_session_pool(self) -> None:
         """Clear pooled HTTP connections on the underlying Session.
@@ -398,6 +553,78 @@ def _fetch_comments(client: Jira, key: str) -> list[TaskComment]:
             external_id=str(entry.get("id") or "") or None,
         ))
     return out
+
+
+_SPRINT_FIELD_NAME = "Sprint"
+_LEGACY_SPRINT_ID_RE = re.compile(r"\bid=(\d+)")
+_LEGACY_SPRINT_STATE_RE = re.compile(r"\bstate=(\w+)")
+_LEGACY_SPRINT_NAME_RE = re.compile(r"\bname=([^,\]]+)")
+
+
+def _parse_sprint(raw: Any) -> tuple[int | None, str | None]:
+    """``(id, name)`` активного спринта из значения sprint-поля Jira.
+
+    Jira Server отдаёт это поле в двух разных форматах, и каждый живой:
+    список словарей (``{"id": 101, "state": "active", "name": ...}``) и
+    список строк-тострингов greenhopper
+    (``...Sprint@1a2b[id=567,state=ACTIVE,name=Sprint 42,...]``).
+    При нескольких значениях предпочитаем ``state=ACTIVE``; если
+    активного нет — первый распарсенный (тикет мог быть в закрытом
+    спринте, но нам важно не упасть).
+    """
+    entries = raw if isinstance(raw, list) else [raw]
+    fallback: tuple[int, str | None] | None = None
+    for entry in entries:
+        sprint_id: int | None = None
+        name: str | None = None
+        state = ""
+        if isinstance(entry, dict):
+            try:
+                sprint_id = int(entry["id"])
+            except (KeyError, TypeError, ValueError):
+                sprint_id = None
+            name = str(entry.get("name") or "") or None
+            state = str(entry.get("state") or "")
+        elif isinstance(entry, str):
+            id_match = _LEGACY_SPRINT_ID_RE.search(entry)
+            if id_match:
+                sprint_id = int(id_match.group(1))
+            name_match = _LEGACY_SPRINT_NAME_RE.search(entry)
+            name = name_match.group(1).strip() if name_match else None
+            state_match = _LEGACY_SPRINT_STATE_RE.search(entry)
+            state = state_match.group(1) if state_match else ""
+        if sprint_id is None:
+            continue
+        if state.upper() == "ACTIVE":
+            return sprint_id, name
+        if fallback is None:
+            fallback = (sprint_id, name)
+    if fallback is None:
+        return None, None
+    return fallback
+
+
+def _pick_tracker_username(entries: Any, email: str) -> str | None:
+    """Логин Jira по результату ``user/search``.
+
+    Приоритет — точное совпадение ``emailAddress``. Jira Server часто
+    скрывает email в выдаче (privacy setting): тогда единственный
+    результат по email-запросу считаем тем самым человеком; два и
+    более результата — уже неоднозначность (назначить наугад хуже, чем
+    не назначить).
+    """
+    if not isinstance(entries, list):
+        return None
+    target = email.strip().lower()
+    candidates: list[dict[str, Any]] = [e for e in entries if isinstance(e, dict)]
+    for entry in candidates:
+        if str(entry.get("emailAddress") or "").strip().lower() == target:
+            name = str(entry.get("name") or "")
+            if name:
+                return name
+    if len(candidates) == 1:
+        return str(candidates[0].get("name") or "") or None
+    return None
 
 
 def _install_retry_adapter(session: Any) -> None:
