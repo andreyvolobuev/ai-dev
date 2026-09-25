@@ -47,6 +47,10 @@ _WARNING_TEMPLATES: dict[str, str] = {
     "sprint_failed": "intake_warning_sprint_failed",
     "assignee_not_found": "intake_warning_assignee_not_found",
     "assignee_hint_unresolved": "intake_warning_assignee_hint_unresolved",
+    # Правка тикета не назначает исполнителя автору просьбы (в отличие от
+    # создания) — здесь текст другой: "не поняла, оставила как было"
+    # вместо "поставила тебя".
+    "assignee_hint_unresolved_update": "intake_warning_assignee_hint_unresolved_update",
 }
 
 
@@ -86,6 +90,18 @@ class TaskIntakeInbox:
         if self._tracker is None:
             logger.warning("TaskIntake: no task tracker configured — ignoring ask")
             return IntakeOutcome(action="skipped", reason="no_tracker")
+
+        # Дешёвая проверка ДО модели: повторная доставка одного и того же
+        # поста (WS-событие + catch-up sweep) не должна ни звать агента
+        # заново, ни постить второй ответ — тикет по нему уже (или вот-вот
+        # будет) заведён. Атомарная гарантия остаётся на UNIQUE-инсерте в
+        # ``_claim``; это только фильтр перед ним.
+        if await self._already_claimed(event.id):
+            logger.info(
+                "TaskIntake: post {} already claimed — skipping re-delivery",
+                event.id,
+            )
+            return IntakeOutcome(action="skipped", reason="duplicate_post")
 
         # Пост без треда сам становится корнем: ответ бота создаст тред,
         # и правки прилетят реплаями внутри него — тот же root_id.
@@ -151,13 +167,21 @@ class TaskIntakeInbox:
         except Exception as exc:
             logger.exception("TaskIntake: create_task failed for post {}", event.id)
             await self._release(claim_id)
-            await self._reply(
+            sent = await self._reply(
                 event, root_id,
                 self._templates.intake_failed.format(reason=_short_cause(exc)),
             )
-            return IntakeOutcome(action="failed", reply_sent=True)
+            return IntakeOutcome(action="failed", reply_sent=sent)
 
-        await self._store_key(claim_id, created.key)
+        try:
+            await self._store_key(claim_id, created.key)
+        except Exception:
+            # Тикет уже создан в Jira. Теряем только возможность найти
+            # тикет по треду для будущих правок.
+            logger.exception(
+                "TaskIntake: failed to persist issue_key {} for claim {}",
+                created.key, claim_id,
+            )
         all_warnings = [*created.warnings, *warnings]
         text = self._templates.intake_created.format(
             key=created.key,
@@ -188,13 +212,13 @@ class TaskIntakeInbox:
     ) -> IntakeOutcome:
         assert self._tracker is not None
         if existing is None:
-            await self._reply(
+            sent = await self._reply(
                 event, root_id,
                 self._templates.intake_failed.format(
                     reason="не нашла тикет, который надо поправить",
                 ),
             )
-            return IntakeOutcome(action="failed", reply_sent=True, reason="no_ticket")
+            return IntakeOutcome(action="failed", reply_sent=sent, reason="no_ticket")
 
         changes = decision.changes
         patch = TaskPatch()
@@ -210,13 +234,18 @@ class TaskIntakeInbox:
             patch.description = description
             applied.append("обновила описание")
         hint = str(changes.get("assignee_hint") or "").strip()
+        hint_unresolved = False
         if hint:
             username = await self._resolve_named_user(hint)
             if username:
                 patch.assignee = username
                 applied.append(f"переназначила на {username}")
             else:
-                warnings.append("assignee_hint_unresolved")
+                # Отдельный код от "assignee_hint_unresolved": на создании
+                # неразрешённая подсказка означает "поставила тебя", тогда
+                # как на правке исполнителя вообще не тронули.
+                warnings.append("assignee_hint_unresolved_update")
+                hint_unresolved = True
         if "sprint" in changes:
             patch.sprint = bool(changes["sprint"])
             applied.append(
@@ -224,27 +253,33 @@ class TaskIntakeInbox:
             )
 
         if patch.is_empty():
-            await self._reply(
+            # Если единственной запрошенной правкой был исполнитель и подсказку
+            # не удалось разрешить — ответ должен называть настоящую причину,
+            # не общее "не поняла, что именно поправить".
+            reason = (
+                self._templates.intake_warning_assignee_hint_unresolved_update
+                if hint_unresolved
+                else "не поняла, что именно поправить"
+            )
+            sent = await self._reply(
                 event, root_id,
-                self._templates.intake_failed.format(
-                    reason="не поняла, что именно поправить",
-                ),
+                self._templates.intake_failed.format(reason=reason),
             )
             return IntakeOutcome(
                 action="failed", issue_key=existing.key,
-                reply_sent=True, reason="empty_patch",
+                reply_sent=sent, reason="empty_patch",
             )
 
         try:
             await self._tracker.update_task(existing.key, patch)
         except Exception as exc:
             logger.exception("TaskIntake: update_task failed for {}", existing.key)
-            await self._reply(
+            sent = await self._reply(
                 event, root_id,
                 self._templates.intake_failed.format(reason=_short_cause(exc)),
             )
             return IntakeOutcome(
-                action="failed", issue_key=existing.key, reply_sent=True,
+                action="failed", issue_key=existing.key, reply_sent=sent,
             )
 
         text = self._templates.intake_updated.format(changes="; ".join(applied))
@@ -300,7 +335,7 @@ class TaskIntakeInbox:
         if not requester_email:
             warnings.append("assignee_not_found")
             return None, warnings
-        username = await self._tracker.find_tracker_user_by_email(requester_email)
+        username = await self._safe_find_by_email(requester_email)
         if username is None:
             warnings.append("assignee_not_found")
         return username, warnings
@@ -316,7 +351,20 @@ class TaskIntakeInbox:
         if len(with_email) != 1:
             return None
         email = with_email[0].email or ""
-        return await self._tracker.find_tracker_user_by_email(email)
+        return await self._safe_find_by_email(email)
+
+    async def _safe_find_by_email(self, email: str) -> str | None:
+        """``find_tracker_user_by_email`` raises loudly on transport/auth
+        errors (real Jira adapter) — a Jira 5xx here must degrade into
+        "assignee not found", never abort ticket creation entirely."""
+        assert self._tracker is not None
+        try:
+            return await self._tracker.find_tracker_user_by_email(email)
+        except Exception:
+            logger.warning(
+                "TaskIntake: find_tracker_user_by_email({!r}) failed", email,
+            )
+            return None
 
     def _render_warnings(self, codes: Sequence[str]) -> str:
         phrases: list[str] = []
@@ -336,6 +384,24 @@ class TaskIntakeInbox:
         return outcome.sent
 
     # --- storage ---
+
+    async def _already_claimed(self, source_post_id: str) -> bool:
+        """Cheap pre-check for a re-delivered post — before the agent runs.
+
+        The unique insert in ``_claim`` is the atomic guarantee against a
+        race between two concurrent deliveries; this is just the guard in
+        front of it so a *sequential* re-delivery (WS event, then the same
+        post again via catch-up sweep) neither re-calls the model nor
+        re-evaluates update/busy against the ticket the first delivery
+        already created.
+        """
+        async with self._session_factory() as session:
+            stmt = (
+                select(IntakeRequestRow.id)
+                .where(IntakeRequestRow.source_post_id == source_post_id)
+                .limit(1)
+            )
+            return (await session.execute(stmt)).scalar_one_or_none() is not None
 
     async def _claim(self, event: ChatMessage, root_id: str) -> int | None:
         async with self._session_factory() as session:

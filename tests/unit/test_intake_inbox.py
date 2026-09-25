@@ -99,10 +99,12 @@ class _FakeTracker(TaskTrackerPort):
         username_by_email: dict[str, str] | None = None,
         created: CreatedTask | None = None,
         create_raises: Exception | None = None,
+        find_by_email_raises: Exception | None = None,
     ) -> None:
         self._username_by_email = username_by_email or {}
         self._created = created
         self._create_raises = create_raises
+        self._find_by_email_raises = find_by_email_raises
         self.specs: list[NewTaskSpec] = []
         self.patches: list[tuple[str, TaskPatch]] = []
 
@@ -135,6 +137,8 @@ class _FakeTracker(TaskTrackerPort):
         self.patches.append((external_id, patch))
 
     async def find_tracker_user_by_email(self, email: str) -> str | None:
+        if self._find_by_email_raises is not None:
+            raise self._find_by_email_raises
         return self._username_by_email.get(email)
 
 
@@ -186,6 +190,9 @@ def _cfg(*, enabled: bool = True) -> AppConfig:
         intake_warning_sprint_failed="в спринт положить не получилось",
         intake_warning_assignee_not_found="не нашла тебя в Jira по почте",
         intake_warning_assignee_hint_unresolved="не поняла, кого назначить",
+        intake_warning_assignee_hint_unresolved_update=(
+            "не поняла, кого назначить — исполнителя не тронула"
+        ),
     )
     return AppConfig(
         repositories=[],
@@ -487,3 +494,147 @@ async def test_disabled_intake_does_nothing(
     assert outcome.reason == "disabled"
     assert agent.calls == []
     assert chat.sent == []
+
+
+async def test_no_tracker_short_circuits(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Task 7 branches on exactly this reason to decide what to do next."""
+    chat = _FakeChat(users={"u1": _user()})
+    agent = _FakeAgent([])
+    outcome = await _inbox(
+        agent=agent, tracker=None, chat=chat, session_factory=session_factory,
+    ).handle(_ask())
+
+    assert outcome.action == "skipped"
+    assert outcome.reason == "no_tracker"
+    assert agent.calls == []
+    assert chat.sent == []
+
+
+async def test_update_with_only_ambiguous_assignee_hint_reports_the_real_reason(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """«переназначь на Петю» при двух тёзках: патч пуст, но причина отказа
+    должна называть настоящую проблему — не общее «не поняла, что
+    поправить»."""
+    chat = _FakeChat(
+        users={"u1": _user()},
+        search_hits=[
+            ChatUser(id="u2", username="petrov", email="petr.petrov@2gis.ru"),
+            ChatUser(id="u3", username="petrovsky", email="petr.petrovsky@2gis.ru"),
+        ],
+    )
+    tracker = _FakeTracker(username_by_email={"petr.petrov@2gis.ru": "petr.petrov"})
+    agent = _FakeAgent([
+        _create_decision(),
+        IntakeDecision(
+            action=IntakeAction.UPDATE,
+            changes={"assignee_hint": "Петя"},
+            reasoning="просят переназначить",
+        ),
+    ])
+    inbox = _inbox(
+        agent=agent, tracker=tracker, chat=chat, session_factory=session_factory,
+    )
+
+    await inbox.handle(_ask(post_id="p-1"))
+    outcome = await inbox.handle(
+        _ask("@aida переназначь на Петю", post_id="p-2", root="p-1"),
+    )
+
+    assert outcome.action == "failed"
+    assert outcome.reason == "empty_patch"
+    assert tracker.patches == []
+    assert "исполнителя не тронула" in chat.sent[-1][1]
+    assert "что именно поправить" not in chat.sent[-1][1]
+
+
+async def test_update_with_rename_and_ambiguous_assignee_warns_honestly(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """«переименуй, исполнителем поставь Петю» при двух тёзках:
+    переименование применяется; предупреждение не должно врать, что
+    исполнителя назначили автору просьбы (как на создании) — исполнителя
+    вообще не тронули."""
+    chat = _FakeChat(
+        users={"u1": _user()},
+        search_hits=[
+            ChatUser(id="u2", username="petrov", email="petr.petrov@2gis.ru"),
+            ChatUser(id="u3", username="petrovsky", email="petr.petrovsky@2gis.ru"),
+        ],
+    )
+    tracker = _FakeTracker(username_by_email={"petr.petrov@2gis.ru": "petr.petrov"})
+    agent = _FakeAgent([
+        _create_decision(),
+        IntakeDecision(
+            action=IntakeAction.UPDATE,
+            changes={"summary": "Жёлтые карточки", "assignee_hint": "Петя"},
+            reasoning="просят переименовать и переназначить",
+        ),
+    ])
+    inbox = _inbox(
+        agent=agent, tracker=tracker, chat=chat, session_factory=session_factory,
+    )
+
+    await inbox.handle(_ask(post_id="p-1"))
+    outcome = await inbox.handle(
+        _ask("@aida переименуй и переназначь на Петю", post_id="p-2", root="p-1"),
+    )
+
+    assert outcome.action == "updated"
+    _key, patch = tracker.patches[0]
+    assert patch.summary == "Жёлтые карточки"
+    assert patch.assignee is None
+    assert "исполнителя не тронула" in chat.sent[-1][1]
+    assert "поставила тебя" not in chat.sent[-1][1]
+
+
+async def test_redelivered_post_is_skipped_before_the_agent_runs(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Второй заход по тому же посту (WS-событие + catch-up sweep) не
+    должен даже спрашивать модель — иначе ``_existing_ticket`` уже видит
+    тикет первой доставки, и модель может честно ответить update/busy на
+    дублирующую доставку."""
+    chat = _FakeChat(users={"u1": _user()})
+    tracker = _FakeTracker(username_by_email={"ivan.ivanov@2gis.ru": "ivan.ivanov"})
+    agent = _FakeAgent([
+        _create_decision(),
+        IntakeDecision(
+            action=IntakeAction.UPDATE,
+            changes={"summary": "Новое имя"},
+            reasoning="агент не должен был увидеть этот пост дважды",
+        ),
+    ])
+    inbox = _inbox(
+        agent=agent, tracker=tracker, chat=chat, session_factory=session_factory,
+    )
+
+    first = await inbox.handle(_ask())
+    second = await inbox.handle(_ask())
+
+    assert first.action == "created"
+    assert second.action == "skipped"
+    assert second.reason == "duplicate_post"
+    assert len(agent.calls) == 1
+    assert len(chat.sent) == 1
+    assert tracker.patches == []
+
+
+async def test_email_lookup_failure_still_creates_the_ticket(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Jira 5xx на резолве исполнителя по почте не должен блокировать
+    создание тикета — деградируем в assignee_not_found, как при пустом
+    ответе."""
+    chat = _FakeChat(users={"u1": _user()})
+    tracker = _FakeTracker(find_by_email_raises=RuntimeError("Jira 500"))
+    outcome = await _inbox(
+        agent=_FakeAgent([_create_decision()]), tracker=tracker, chat=chat,
+        session_factory=session_factory,
+    ).handle(_ask())
+
+    assert outcome.action == "created"
+    assert tracker.specs[0].assignee is None
+    assert "не нашла тебя в Jira по почте" in chat.sent[0][1]

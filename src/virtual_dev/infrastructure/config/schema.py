@@ -184,6 +184,10 @@ class MmTemplatesCfg(_StrictModel):
     intake_warning_sprint_failed: str = ""
     intake_warning_assignee_not_found: str = ""
     intake_warning_assignee_hint_unresolved: str = ""
+    # Для правки логика другая: неразрешённая подсказка не назначает
+    # исполнителя автору просьбы (в отличие от создания) — текст должен
+    # честно говорить "не поняла, оставила как было".
+    intake_warning_assignee_hint_unresolved_update: str = ""
 
 
 class JiraTemplatesCfg(_StrictModel):
