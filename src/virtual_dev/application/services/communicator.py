@@ -146,9 +146,19 @@ class CommunicatorService:
         text: str,
         *,
         thread_root_id: str | None = None,
+        reactive: bool = False,
     ) -> SendOutcome:
-        """Post to channel (optionally inside a thread)."""
-        return await self._send("chan", channel_id, text, channel_id=channel_id, thread_root_id=thread_root_id)
+        """Post to channel (optionally inside a thread).
+
+        ``reactive=True`` — direct response to a human's mention or request.
+        Such a response bypasses working-hours gate: the person is waiting now,
+        silence reads as broken. Rate limit still applies.
+        """
+        return await self._send(
+            "chan", channel_id, text,
+            channel_id=channel_id, thread_root_id=thread_root_id,
+            reactive=reactive,
+        )
 
     async def _send(
         self,
@@ -158,13 +168,18 @@ class CommunicatorService:
         *,
         channel_id: str | None,
         thread_root_id: str | None,
+        reactive: bool = False,
     ) -> SendOutcome:
         if self._chat is None:
             logger.debug("Communicator: chat not configured; skipping {}", kind)
             return SendOutcome(sent=False, skip_reason="chat_not_configured")
 
         now = datetime.now(timezone.utc)
-        if self._respect_working_hours and not _is_within_working_hours(now, self._working_hours):
+        if (
+            self._respect_working_hours
+            and not reactive
+            and not _is_within_working_hours(now, self._working_hours)
+        ):
             logger.info(
                 "Communicator: outside working hours ({}), dropping {} to {!r}",
                 self._working_hours.timezone, kind, target_key,
