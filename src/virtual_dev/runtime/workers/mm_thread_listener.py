@@ -25,6 +25,7 @@ should not stop the listener.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -888,7 +889,11 @@ class MmThreadListener:
         handle = (self._settings.mattermost_bot_username or "").strip().lstrip("@")
         if not handle:
             return False
-        return f"@{handle.lower()}" in (text or "").lower()
+        # Boundary on both sides: "@aidanov", "@aida.petrov" (another user)
+        # and "x@aida.com" (an e-mail) are not mentions, while "@aida," or a
+        # sentence-final "@aida." are.
+        pattern = rf"(?<!\w)@{re.escape(handle)}(?![\w-])(?!\.\w)"
+        return re.search(pattern, text or "", re.IGNORECASE) is not None
 
     async def _belongs_to_bot_thread(self, thread_root_id: str | None) -> bool:
         """A thread the bot runs itself: MR review, CI escalation, analyst
@@ -952,6 +957,27 @@ class MmThreadListener:
             # claim so a feature enabled later does not see the post as done.
             await self._release_post_claim(event.id)
             return
+
+        if not outcome.reply_sent and outcome.action in ("failed", "busy"):
+            # Same contract as the responder path: a dropped reply releases
+            # the claim and leaves the post unreacted so catch-up retries.
+            # Nothing was created, so a retry is safe and is the only way
+            # the person hears back.
+            logger.warning(
+                "MmThreadListener: intake {} on post {} but reply not delivered "
+                "- releasing claim for retry",
+                outcome.action, event.id,
+            )
+            await self._release_post_claim(event.id)
+            return
+        if not outcome.reply_sent and outcome.action in ("created", "updated"):
+            # The ticket already exists in Jira; a retry would hit the inbox
+            # duplicate guard and post nothing anyway. Keep claim and mark.
+            logger.warning(
+                "MmThreadListener: intake {} {} for post {} but the reply "
+                "never landed",
+                outcome.action, outcome.issue_key, event.id,
+            )
 
         try:
             await self._chat.add_reaction(event.id, _PROCESSED_REACTION)

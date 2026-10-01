@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents.thread_responder import (
@@ -89,6 +90,32 @@ class _IntakeStub:
         return self._outcome
 
 
+class _AnalystStub:
+    """Only the methods the listener calls on analyst_inbox."""
+
+    def __init__(
+        self, *, by_thread: object | None = None, by_channel: object | None = None,
+    ) -> None:
+        self._by_thread = by_thread
+        self._by_channel = by_channel
+        self.fragments: list[str] = []
+
+    async def find_task_by_thread(self, thread_root_id: str) -> object | None:
+        return self._by_thread
+
+    async def find_task_by_channel(
+        self, *, mm_channel_id: str, mm_user_id: str,
+    ) -> object | None:
+        return self._by_channel
+
+    async def append_fragment(self, task_id: int, event: ChatMessage) -> None:
+        self.fragments.append(event.id)
+
+
+class _TaskRow:
+    id = 42
+
+
 class _ResponderStub:
     def __init__(self) -> None:
         self.calls = 0
@@ -120,6 +147,7 @@ def _listener(
     session_factory: async_sessionmaker[AsyncSession],
     intake: _IntakeStub | None,
     responder: _ResponderStub | None = None,
+    analyst: _AnalystStub | None = None,
 ) -> MmThreadListener:
     return MmThreadListener(
         chat=chat,
@@ -133,6 +161,7 @@ def _listener(
             repositories=[], agents=AgentsCfg(), mappings=MappingsCfg(),
         ),
         settings=Settings(mattermost_bot_username="aida"),
+        analyst_inbox=analyst,  # type: ignore[arg-type]
         intake_inbox=intake,  # type: ignore[arg-type]
     )
 
@@ -263,3 +292,109 @@ async def test_bot_own_post_is_ignored(
     )._dispatch(event)
 
     assert intake.calls == []
+
+
+@pytest.mark.parametrize(
+    "text", ["@aidanov заведи задачу", "напиши x@aida.com", "@aida.petrov глянь"],
+)
+async def test_near_miss_handles_are_not_mentions(
+    session_factory: async_sessionmaker[AsyncSession], text: str,
+) -> None:
+    chat = _Chat()
+    event = _post("p-8", text)
+    chat.posts["p-8"] = event
+    intake = _IntakeStub()
+
+    await _listener(
+        chat=chat, session_factory=session_factory, intake=intake,
+    )._dispatch(event)
+
+    assert intake.calls == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["@aida, заведи задачу", "Заведи задачу, @aida.", "@AIDA заведи", "please @aida: задачу"],
+)
+async def test_exact_mention_with_punctuation_matches(
+    session_factory: async_sessionmaker[AsyncSession], text: str,
+) -> None:
+    chat = _Chat()
+    event = _post("p-9", text)
+    chat.posts["p-9"] = event
+    intake = _IntakeStub()
+
+    await _listener(
+        chat=chat, session_factory=session_factory, intake=intake,
+    )._dispatch(event)
+
+    assert [e.id for e in intake.calls] == ["p-9"]
+
+
+async def test_mention_in_analyst_question_thread_yields_to_analyst(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _Chat()
+    event = _post("p-10", "@aida вот ответ", root="root-q")
+    chat.posts["p-10"] = event
+    intake = _IntakeStub()
+    analyst = _AnalystStub(by_thread=_TaskRow())
+
+    await _listener(
+        chat=chat, session_factory=session_factory, intake=intake, analyst=analyst,
+    )._dispatch(event)
+
+    assert intake.calls == []
+    assert analyst.fragments == ["p-10"]
+
+
+async def test_channel_fallback_does_not_swallow_mention(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The reason intake sits above the analyst route: the channel-level
+    fallback must not eat a mention outside the analyst's thread."""
+    chat = _Chat()
+    event = _post("p-11", "@aida заведи задачу")
+    chat.posts["p-11"] = event
+    intake = _IntakeStub()
+    analyst = _AnalystStub(by_thread=None, by_channel=_TaskRow())
+
+    await _listener(
+        chat=chat, session_factory=session_factory, intake=intake, analyst=analyst,
+    )._dispatch(event)
+
+    assert [e.id for e in intake.calls] == ["p-11"]
+    assert analyst.fragments == []
+
+
+async def test_failed_intake_with_undelivered_reply_releases_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _Chat()
+    event = _post("p-12", "@aida заведи задачу")
+    chat.posts["p-12"] = event
+    intake = _IntakeStub(IntakeOutcome(action="failed", reply_sent=False))
+    listener = _listener(chat=chat, session_factory=session_factory, intake=intake)
+
+    await listener._dispatch(event)
+
+    assert len(intake.calls) == 1
+    assert chat.added_reactions == []
+    assert not await listener._post_already_claimed("p-12")
+
+
+async def test_created_with_undelivered_reply_keeps_claim_and_reaction(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _Chat()
+    event = _post("p-13", "@aida заведи задачу")
+    chat.posts["p-13"] = event
+    intake = _IntakeStub(
+        IntakeOutcome(action="created", issue_key="DM-1", reply_sent=False),
+    )
+    listener = _listener(chat=chat, session_factory=session_factory, intake=intake)
+
+    await listener._dispatch(event)
+
+    assert ("p-13", _PROCESSED_REACTION) in chat.added_reactions
+    assert await listener._post_already_claimed("p-13")
