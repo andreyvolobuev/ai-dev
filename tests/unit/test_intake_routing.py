@@ -9,7 +9,7 @@ returned on "no thread_root_id".
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -21,6 +21,7 @@ from virtual_dev.application.agents.thread_responder import (
 )
 from virtual_dev.application.services import CommunicatorService, InjectionFilter
 from virtual_dev.domain.models.chat import ChatMessage, ChatUser
+from virtual_dev.domain.models.task import TaskStatus
 from virtual_dev.domain.ports.chat import ChatPort
 from virtual_dev.infrastructure.config import (
     AgentsCfg,
@@ -28,7 +29,11 @@ from virtual_dev.infrastructure.config import (
     MappingsCfg,
     Settings,
 )
-from virtual_dev.infrastructure.db import MergeRequestRow
+from virtual_dev.infrastructure.db import (
+    IntakeRequestRow,
+    MergeRequestRow,
+    TaskRow,
+)
 from virtual_dev.runtime.workers.intake_inbox import IntakeOutcome
 from virtual_dev.runtime.workers.mm_thread_listener import (
     _PROCESSED_REACTION,
@@ -37,11 +42,18 @@ from virtual_dev.runtime.workers.mm_thread_listener import (
 
 
 class _Chat(ChatPort):
-    def __init__(self, *, reactions: dict[str, list[str]] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        reactions: dict[str, list[str]] | None = None,
+        catchup_posts: dict[str, list[ChatMessage]] | None = None,
+    ) -> None:
         self._reactions = reactions or {}
+        self._catchup_posts = catchup_posts or {}
         self.sent: list[tuple[str, str]] = []
         self.added_reactions: list[tuple[str, str]] = []
         self.posts: dict[str, ChatMessage] = {}
+        self.read_channel_calls: list[tuple[str, datetime]] = []
 
     async def send_direct(self, user_id: str, text: str) -> ChatMessage:
         return _post("bot", text, author="bot", trusted=True)
@@ -70,6 +82,15 @@ class _Chat(ChatPort):
             return None
         stored.bot_reactions = list(self._reactions.get(post_id, []))
         return stored
+
+    async def read_channel_since(
+        self, channel_id: str, since: datetime,
+    ) -> list[ChatMessage]:
+        self.read_channel_calls.append((channel_id, since))
+        return [
+            m for m in self._catchup_posts.get(channel_id, [])
+            if m.timestamp > since
+        ]
 
     def subscribe(self) -> AsyncIterator[ChatMessage]:
         async def _empty() -> AsyncIterator[ChatMessage]:
@@ -420,9 +441,11 @@ async def test_busy_falls_through_to_the_analyst_that_awaits_this_post(
 
     assert [e.id for e in intake.calls] == ["p-14"]
     assert analyst.fragments == ["p-14"]
-    # Ни ✅, ни claim: пост остаётся доступным маршрутам ниже.
+    # Без ✅: для живых маршрутов ниже пост не помечен обработанным.
+    # Claim при этом остаётся: он управляет только повторной доставкой,
+    # которая уже не нужна (см. тест на цикл дублей ниже).
     assert chat.added_reactions == []
-    assert not await listener._post_already_claimed("p-14")
+    assert await listener._post_already_claimed("p-14")
 
 
 async def test_busy_in_the_analyst_question_thread_also_falls_through(
@@ -449,7 +472,6 @@ async def test_busy_in_the_analyst_question_thread_also_falls_through(
     # проверяем именно ветку "busy" внутри `_handle_intake`.
     assert await listener._handle_intake(event) is False
     assert analyst.fragments == []
-    assert not await listener._post_already_claimed("p-15")
 
 
 async def test_busy_without_a_waiting_analyst_task_is_still_final(
@@ -487,3 +509,68 @@ async def test_busy_with_no_analyst_inbox_at_all_is_still_final(
 
     assert ("p-17", _PROCESSED_REACTION) in chat.added_reactions
     assert await listener._post_already_claimed("p-17")
+
+
+async def test_fallthrough_post_is_not_replayed_by_the_catchup_sweep(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Защита от цикла дублей.
+
+    Внутри канала сегодня уже заводили задачу, поэтому intake-курсор
+    свипа стоит на `now - 24h` и перебивает курсор аналитика (берётся
+    минимум). Пост, который ветка "busy" намеренно отдала аналитику,
+    свип тянул снова на каждом тике: intake-агент крутился заново и
+    публиковал ещё одно «занята», примерно каждую минуту всё
+    coalescer-окно.
+    """
+    # Канал, где сегодня заводили задачу -> intake-курсор на 24 часа.
+    async with session_factory() as session:
+        session.add(IntakeRequestRow(
+            source_post_id="p-earlier",
+            mm_root_id="p-earlier",
+            mm_channel_id="chan-1",
+            requester_mm_user_id="u1",
+            issue_key="DM-100",
+            created_at=datetime.now(UTC) - timedelta(hours=2),
+        ))
+        session.add(TaskRow(
+            tracker="jira", external_id="DM-101",
+            title="t", description="", url="",
+            priority="medium", external_status="To Do",
+            internal_status=TaskStatus.PLANNING.value,
+            awaiting_post_id="bot-post-q",
+            awaiting_user_id="u1",
+            awaiting_username="alice",
+            awaiting_channel_id="chan-1",
+            coalesce_window_seconds=600,
+        ))
+        await session.commit()
+
+    event = _post("p-18", "@aida да, только жёлтые карточки")
+    chat = _Chat(catchup_posts={"chan-1": [event]})
+    chat.posts["p-18"] = event
+
+    class _BusyIntake(_IntakeStub):
+        """Настоящий инбокс на "busy" сам публикует «занята» в канал —
+        дубли, которые ловит этот тест, видны именно в чате."""
+
+        async def handle(self, incoming: ChatMessage) -> IntakeOutcome:
+            await chat.send_to_channel(incoming.channel_id, "Я сейчас занята")
+            return await super().handle(incoming)
+
+    intake = _BusyIntake(IntakeOutcome(action="busy", reply_sent=True))
+    analyst = _AnalystStub(by_thread=None, by_channel=_TaskRow())
+    listener = _listener(
+        chat=chat, session_factory=session_factory, intake=intake, analyst=analyst,
+    )
+
+    # Живая доставка: fall-through сработал, аналитик получил фрагмент (B).
+    await listener._dispatch(event)
+    assert analyst.fragments == ["p-18"]
+
+    await listener.catch_up()
+
+    # Свип канал опрашивает (пункт A не ослаблен), но пост уже под claim-ом.
+    assert [c for c, _since in chat.read_channel_calls] == ["chan-1"]
+    assert [e.id for e in intake.calls] == ["p-18"]
+    assert len(chat.sent) == 1

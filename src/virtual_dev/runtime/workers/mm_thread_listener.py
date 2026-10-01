@@ -999,17 +999,25 @@ class MmThreadListener:
             # The model read this as "not a ticket request" while the
             # analyst is waiting for exactly this person in exactly this
             # channel — so it is almost certainly an answer to the
-            # analyst's question, and "занята" was the wrong reply. Keep
-            # the post available: no claim, no ✅, and the analyst route
-            # below still gets the answer. The claim is safe to drop —
-            # busy created nothing — and appending the fragment moves the
-            # catch-up cursor past the post, so it is not re-delivered.
+            # analyst's question, and the "busy" reply was wrong. Let the
+            # post fall through to the analyst route below, which runs in
+            # THIS same _dispatch_inner call — so the fragment is
+            # delivered without releasing the claim.
+            #
+            # The claim stays precisely because it governs RETRIES, not
+            # this first delivery. Releasing it fed a duplicate loop: a
+            # channel where any ticket was filed in the last 24h gets the
+            # `now - 24h` intake cursor, and _gather_channel_cursors takes
+            # the minimum per channel, so that cursor overrides the
+            # analyst's last_fragment_at one. An unclaimed, un-reacted
+            # post was therefore re-pulled by every catch-up tick: the
+            # intake agent re-ran and posted another "busy" roughly once a
+            # minute for the whole coalescer window.
             logger.info(
                 "MmThreadListener: intake declined post {} but the analyst "
                 "awaits this channel/user — letting it fall through",
                 event.id,
             )
-            await self._release_post_claim(event.id)
             return False
 
         if not outcome.reply_sent and outcome.action in ("failed", "busy"):
