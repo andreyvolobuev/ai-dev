@@ -34,7 +34,7 @@ from virtual_dev.application.agents.task_intake import (
     TaskIntakeAgent,
 )
 from virtual_dev.application.services.communicator import CommunicatorService
-from virtual_dev.domain.models.chat import ChatMessage
+from virtual_dev.domain.models.chat import ChatMessage, ChatUser
 from virtual_dev.domain.models.task import NewTaskSpec, TaskPatch
 from virtual_dev.domain.ports.chat import ChatPort
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
@@ -52,6 +52,12 @@ _WARNING_TEMPLATES: dict[str, str] = {
     # вместо "поставила тебя".
     "assignee_hint_unresolved_update": "intake_warning_assignee_hint_unresolved_update",
 }
+
+# Предел длины отказа «занята». Текст пишет модель, прочитавшая чужой
+# тред, и он уходит в командный канал как есть — поэтому и кап, и
+# подмена шаблоном: длинная простыня ломает голос бота (1-3 фразы) и
+# превращает бота в рупор для инъекции.
+_MAX_BUSY_REPLY_CHARS = 300
 
 
 @dataclass
@@ -107,7 +113,7 @@ class TaskIntakeInbox:
         # и правки прилетят реплаями внутри него — тот же root_id.
         root_id = event.thread_root_id or event.id
         thread = await self._read_thread(root_id, event)
-        permalink = await self._safe_permalink(event)
+        permalink = await self._safe_permalink(event.id, event.channel_id)
         existing = await self._existing_ticket(root_id)
 
         decision = await self._agent.decide(
@@ -115,8 +121,7 @@ class TaskIntakeInbox:
         )
 
         if decision.action is IntakeAction.BUSY:
-            text = decision.reply_text or self._templates.intake_busy_fallback
-            sent = await self._reply(event, root_id, text)
+            sent = await self._reply(event, root_id, self._busy_text(decision.reply_text))
             return IntakeOutcome(action="busy", reply_sent=sent)
 
         if decision.action is IntakeAction.UPDATE:
@@ -139,10 +144,7 @@ class TaskIntakeInbox:
             return IntakeOutcome(action="skipped", reason="duplicate_post")
 
         requester = await self._chat.get_user_by_id(event.author_id)
-        requester_label = (
-            f"@{requester.username}" if requester and requester.username
-            else event.author_id
-        )
+        requester_label = _requester_label(requester, event.author_id)
         assignee, warnings = await self._resolve_assignee(
             requester_email=(requester.email if requester else None),
             hint=decision.assignee_hint,
@@ -169,7 +171,7 @@ class TaskIntakeInbox:
             await self._release(claim_id)
             sent = await self._reply(
                 event, root_id,
-                self._templates.intake_failed.format(reason=_short_cause(exc)),
+                self._templates.intake_failed.format(reason=_public_cause(exc)),
             )
             return IntakeOutcome(action="failed", reply_sent=sent)
 
@@ -231,7 +233,13 @@ class TaskIntakeInbox:
             applied.append(f"переименовала в «{summary}»")
         description = str(changes.get("description") or "").strip()
         if description:
-            patch.description = description
+            # Патч описания в Jira заменяет поле целиком, но футер
+            # («Просьба от», «Обсуждение») дописываем мы — значит надо
+            # собрать заново, иначе одно «допиши про Армению» уносит
+            # ссылку на тред-источник, которую гарантирует спека.
+            patch.description = await self._recompose_description(
+                description, issue_key=existing.key,
+            )
             applied.append("обновила описание")
         hint = str(changes.get("assignee_hint") or "").strip()
         hint_unresolved = False
@@ -246,10 +254,22 @@ class TaskIntakeInbox:
                 # как на правке исполнителя вообще не тронули.
                 warnings.append("assignee_hint_unresolved_update")
                 hint_unresolved = True
-        if "sprint" in changes:
-            patch.sprint = bool(changes["sprint"])
+        # Только настоящий bool. SDK не валидирует JSON Schema тула, так что
+        # модель спокойно пришлёт "sprint": null как заполнитель «не
+        # меняем»; bool(None) выкинул бы тикет из спринта, и бот бы
+        # отрапортовал «убрала из спринта», хотя никто не просил. Строка
+        # "false" ошиблась бы в другую сторону. Видимость в спринте — весь
+        # смысл фичи, поэтому неоднозначное значение игнорируем.
+        raw_sprint = changes.get("sprint")
+        if isinstance(raw_sprint, bool):
+            patch.sprint = raw_sprint
             applied.append(
-                "вернула в спринт" if patch.sprint else "убрала из спринта"
+                "вернула в спринт" if raw_sprint else "убрала из спринта"
+            )
+        elif "sprint" in changes:
+            logger.warning(
+                "TaskIntake: ignoring non-boolean sprint change {!r} for {}",
+                raw_sprint, existing.key,
             )
 
         if patch.is_empty():
@@ -276,7 +296,7 @@ class TaskIntakeInbox:
             logger.exception("TaskIntake: update_task failed for {}", existing.key)
             sent = await self._reply(
                 event, root_id,
-                self._templates.intake_failed.format(reason=_short_cause(exc)),
+                self._templates.intake_failed.format(reason=_public_cause(exc)),
             )
             return IntakeOutcome(
                 action="failed", issue_key=existing.key, reply_sent=sent,
@@ -308,12 +328,60 @@ class TaskIntakeInbox:
         # оно только дублировалось бы.
         return [msg for msg in thread if msg.id != event.id]
 
-    async def _safe_permalink(self, event: ChatMessage) -> str:
+    async def _safe_permalink(self, post_id: str, channel_id: str) -> str:
         try:
-            return await self._chat.post_permalink(event.id, event.channel_id) or ""
+            return await self._chat.post_permalink(post_id, channel_id) or ""
         except Exception:
-            logger.warning("TaskIntake: permalink for post {} failed", event.id)
+            logger.warning("TaskIntake: permalink for post {} failed", post_id)
             return ""
+
+    def _busy_text(self, reply_text: str) -> str:
+        """Текст отказа «занята».
+
+        Прозу модели в канал пускаем только короткой: пустую и слишком
+        длинную заменяем своим шаблоном (см. ``_MAX_BUSY_REPLY_CHARS``).
+        """
+        text = reply_text.strip()
+        if not text:
+            return self._templates.intake_busy_fallback
+        if len(text) > _MAX_BUSY_REPLY_CHARS:
+            logger.warning(
+                "TaskIntake: busy reply_text is {} chars (cap {}) — posting the "
+                "template instead: {!r}",
+                len(text), _MAX_BUSY_REPLY_CHARS, text[:200],
+            )
+            return self._templates.intake_busy_fallback
+        return text
+
+    async def _recompose_description(self, body: str, *, issue_key: str) -> str:
+        """Описание тикета заново: текст от модели + наш футер.
+
+        Заказчика и ссылку на тред восстанавливаем из сохранённой заявки —
+        модель их не знает, но патч описания в Jira перезаписывает поле
+        целиком.
+        """
+        row = await self._origin_row(issue_key)
+        if row is None:
+            logger.warning(
+                "TaskIntake: no intake row for {} — description footer will be "
+                "rebuilt without the source link", issue_key,
+            )
+            return _compose_description(body, requester_label="", permalink="")
+        requester: ChatUser | None = None
+        try:
+            requester = await self._chat.get_user_by_id(row.requester_mm_user_id)
+        except Exception:
+            logger.warning(
+                "TaskIntake: get_user_by_id({}) failed while rebuilding the "
+                "description", row.requester_mm_user_id,
+            )
+        return _compose_description(
+            body,
+            requester_label=_requester_label(requester, row.requester_mm_user_id),
+            permalink=await self._safe_permalink(
+                row.source_post_id, row.mm_channel_id,
+            ),
+        )
 
     async def _resolve_assignee(
         self, *, requester_email: str | None, hint: str,
@@ -441,6 +509,21 @@ class TaskIntakeInbox:
             )
             await session.commit()
 
+    async def _origin_row(self, issue_key: str) -> IntakeRequestRow | None:
+        """Заявка, по которой этот тикет и был заведён (самая первая).
+
+        Нужна, чтобы восстановить футер описания: автора просьбы и
+        ссылку на пост-источник.
+        """
+        async with self._session_factory() as session:
+            stmt = (
+                select(IntakeRequestRow)
+                .where(IntakeRequestRow.issue_key == issue_key)
+                .order_by(IntakeRequestRow.id.asc())
+                .limit(1)
+            )
+            return (await session.execute(stmt)).scalar_one_or_none()
+
     async def _existing_ticket(self, root_id: str) -> IntakeTicketState | None:
         """Последний тикет, заведённый по этому треду (для правок)."""
         async with self._session_factory() as session:
@@ -481,7 +564,8 @@ def _compose_description(
     она их не знает, и угадывать такое нельзя.
     """
     parts = [body.strip() or "(без описания)", ""]
-    parts.append(f"Просьба от: {requester_label}")
+    if requester_label:
+        parts.append(f"Просьба от: {requester_label}")
     if permalink:
         parts.append(f"Обсуждение: {permalink}")
     parts.append("")
@@ -489,11 +573,46 @@ def _compose_description(
     return "\n".join(parts)
 
 
-def _short_cause(exc: Exception) -> str:
-    text = " ".join(str(exc).split())
-    if len(text) > 160:
-        text = text[:160] + "..."
-    return text or type(exc).__name__
+def _requester_label(user: ChatUser | None, fallback_id: str) -> str:
+    return f"@{user.username}" if user and user.username else fallback_id
+
+
+# Причина отказа для канала. Текст исключения туда уходить не должен:
+# ``requests.HTTPError`` несёт полный внутренний REST-URL, но канал
+# читают соседние команды. Подробности остаются в логе.
+_CAUSE_UNAVAILABLE = "Jira не ответила"
+_CAUSE_FORBIDDEN = "нет прав"
+_CAUSE_NOT_FOUND = "не нашла проект"
+_CAUSE_REJECTED = "Jira не приняла поля задачи"
+_CAUSE_UNKNOWN = "что-то сломалось на стороне Jira"
+
+
+def _public_cause(exc: Exception) -> str:
+    """Короткая человеческая причина для ответа в тред.
+
+    Маппинг живёт в коде, не в ``config/notifications.yaml``: это
+    классификация исключений, не настраиваемый текст.
+    """
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    cause = _CAUSE_UNKNOWN
+    if isinstance(status, int):
+        if status in (401, 403):
+            cause = _CAUSE_FORBIDDEN
+        elif status == 404:
+            cause = _CAUSE_NOT_FOUND
+        elif status >= 500:
+            cause = _CAUSE_UNAVAILABLE
+        elif status >= 400:
+            cause = _CAUSE_REJECTED
+    elif isinstance(exc, (TimeoutError, OSError)):
+        # requests.ConnectionError / requests.Timeout наследуют OSError —
+        # обрыв связи и таймаут для человека это одно и то же.
+        cause = _CAUSE_UNAVAILABLE
+    logger.warning(
+        "TaskIntake: tracker error reported as {!r} — {}: {}",
+        cause, type(exc).__name__, " ".join(str(exc).split()),
+    )
+    return cause
 
 
 __all__ = ["IntakeOutcome", "TaskIntakeInbox"]

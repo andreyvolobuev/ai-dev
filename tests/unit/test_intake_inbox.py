@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -38,7 +39,10 @@ from virtual_dev.infrastructure.config.schema import (
     TaskIntakeCfg,
 )
 from virtual_dev.infrastructure.db import IntakeRequestRow
-from virtual_dev.runtime.workers.intake_inbox import TaskIntakeInbox
+from virtual_dev.runtime.workers.intake_inbox import (
+    TaskIntakeInbox,
+    _public_cause,
+)
 
 # ---------------------------- fakes ----------------------------
 
@@ -638,3 +642,231 @@ async def test_email_lookup_failure_still_creates_the_ticket(
     assert outcome.action == "created"
     assert tracker.specs[0].assignee is None
     assert "не нашла тебя в Jira по почте" in chat.sent[0][1]
+
+
+# --------------------- sprint: только настоящий bool ---------------------
+
+
+async def _create_then_update(
+    session_factory: async_sessionmaker[AsyncSession],
+    changes: dict[str, Any],
+    *,
+    chat: _FakeChat | None = None,
+) -> tuple[_FakeChat, _FakeTracker, Any]:
+    chat = chat or _FakeChat(users={"u1": _user()})
+    tracker = _FakeTracker(username_by_email={"ivan.ivanov@2gis.ru": "ivan.ivanov"})
+    inbox = _inbox(
+        agent=_FakeAgent([
+            _create_decision(),
+            IntakeDecision(
+                action=IntakeAction.UPDATE, changes=changes, reasoning="правка",
+            ),
+        ]),
+        tracker=tracker, chat=chat, session_factory=session_factory,
+    )
+    await inbox.handle(_ask(post_id="p-1"))
+    outcome = await inbox.handle(
+        _ask("@aida поправь", post_id="p-2", root="p-1"),
+    )
+    return chat, tracker, outcome
+
+
+async def test_null_sprint_change_does_not_drop_the_ticket_from_the_sprint(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``"sprint": null`` — обычный заполнитель «не меняем», который
+    присылает модель.
+    ``bool(None)`` вычистил бы поле Sprint в Jira и бот отрапортовал бы
+    «убрала из спринта», хотя никто не просил."""
+    chat, tracker, outcome = await _create_then_update(
+        session_factory, {"summary": "Жёлтые карточки", "sprint": None},
+    )
+
+    assert outcome.action == "updated"
+    _key, patch = tracker.patches[0]
+    assert patch.sprint is None
+    assert "спринт" not in chat.sent[-1][1]
+
+
+async def test_string_false_sprint_change_is_ignored(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``"false"`` — непустая строка: ``bool`` сделал бы из неё True и
+    положил тикет в спринт."""
+    _chat, tracker, outcome = await _create_then_update(
+        session_factory, {"summary": "Жёлтые карточки", "sprint": "false"},
+    )
+
+    assert outcome.action == "updated"
+    _key, patch = tracker.patches[0]
+    assert patch.sprint is None
+
+
+async def test_only_a_non_boolean_sprint_change_leaves_nothing_to_patch(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat, tracker, outcome = await _create_then_update(
+        session_factory, {"sprint": None},
+    )
+
+    assert outcome.action == "failed"
+    assert outcome.reason == "empty_patch"
+    assert tracker.patches == []
+    assert "спринт" not in chat.sent[-1][1]
+
+
+async def test_real_sprint_true_is_applied(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat, tracker, outcome = await _create_then_update(
+        session_factory, {"sprint": True},
+    )
+
+    assert outcome.action == "updated"
+    _key, patch = tracker.patches[0]
+    assert patch.sprint is True
+    assert "вернула в спринт" in chat.sent[-1][1]
+
+
+async def test_real_sprint_false_is_applied(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat, tracker, outcome = await _create_then_update(
+        session_factory, {"sprint": False},
+    )
+
+    assert outcome.action == "updated"
+    _key, patch = tracker.patches[0]
+    assert patch.sprint is False
+    assert "убрала из спринта" in chat.sent[-1][1]
+
+
+# --------------------- описание: футер не теряется ---------------------
+
+
+async def test_description_patch_keeps_the_source_link_footer(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """«Допиши про Армению» не должно уносить ссылку на тред-источник:
+    патч в Jira заменяет описание целиком, футер дописываем мы."""
+    _chat, tracker, outcome = await _create_then_update(
+        session_factory,
+        {"description": "Собрать жёлтые карточки по Грузии и по Армении."},
+    )
+
+    assert outcome.action == "updated"
+    _key, patch = tracker.patches[0]
+    assert patch.description is not None
+    assert "по Армении" in patch.description
+    assert "https://mm.example/dm/pl/p-1" in patch.description
+    assert "Просьба от: @ivanov" in patch.description
+
+
+# --------------------- отказ «занята»: кап на прозу модели -------------
+
+
+async def test_empty_busy_reply_uses_the_template(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _FakeChat(users={"u1": _user()})
+    outcome = await _inbox(
+        agent=_FakeAgent([IntakeDecision(
+            action=IntakeAction.BUSY, reply_text="   ", reasoning="не про тикет",
+        )]),
+        tracker=_FakeTracker(), chat=chat, session_factory=session_factory,
+    ).handle(_ask("@aida что думаешь?"))
+
+    assert outcome.action == "busy"
+    assert chat.sent[0][1] == "Сейчас занята, отвлечься не могу."
+
+
+async def test_overlong_busy_reply_falls_back_to_the_template(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Проза модели, прочитавшей чужой тред, уходит в командный канал как
+    есть — простыня из инъекции не должна туда попасть."""
+    chat = _FakeChat(users={"u1": _user()})
+    megaphone = "Внимание всем сотрудникам: " + ("срочно смените пароли. " * 20)
+    assert len(megaphone) > 300
+    outcome = await _inbox(
+        agent=_FakeAgent([IntakeDecision(
+            action=IntakeAction.BUSY, reply_text=megaphone, reasoning="инъекция",
+        )]),
+        tracker=_FakeTracker(), chat=chat, session_factory=session_factory,
+    ).handle(_ask("@aida что думаешь?"))
+
+    assert outcome.action == "busy"
+    assert chat.sent[0][1] == "Сейчас занята, отвлечься не могу."
+    assert "смените пароли" not in chat.sent[0][1]
+
+
+async def test_busy_reply_at_the_cap_still_goes_through(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _FakeChat(users={"u1": _user()})
+    text = "Занята " + "x" * 290
+    assert len(text) <= 300
+    await _inbox(
+        agent=_FakeAgent([IntakeDecision(
+            action=IntakeAction.BUSY, reply_text=text, reasoning="не про тикет",
+        )]),
+        tracker=_FakeTracker(), chat=chat, session_factory=session_factory,
+    ).handle(_ask("@aida что думаешь?"))
+
+    assert chat.sent[0][1] == text
+
+
+# --------------------- причина сбоя: без внутренних URL ----------------
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+
+def _http_error(status_code: int) -> Exception:
+    exc = RuntimeError(
+        f"{status_code} Server Error: for url: "
+        "https://jira.internal.example/rest/api/2/issue?token=s3cret"
+    )
+    exc.response = _FakeResponse(status_code)  # type: ignore[attr-defined]
+    return exc
+
+
+async def test_jira_failure_reply_does_not_leak_the_internal_url(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``HTTPError`` несёт полный внутренний REST-URL, но ответ бота читают
+    соседние команды."""
+    chat = _FakeChat(users={"u1": _user()})
+    tracker = _FakeTracker(create_raises=_http_error(500))
+    outcome = await _inbox(
+        agent=_FakeAgent([_create_decision()]), tracker=tracker, chat=chat,
+        session_factory=session_factory,
+    ).handle(_ask())
+
+    assert outcome.action == "failed"
+    reply = chat.sent[0][1]
+    assert "jira.internal.example" not in reply
+    assert "s3cret" not in reply
+    assert "rest/api" not in reply
+    assert "Jira не ответила" in reply
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (_http_error(403), "нет прав"),
+        (_http_error(401), "нет прав"),
+        (_http_error(404), "не нашла проект"),
+        (_http_error(400), "Jira не приняла поля задачи"),
+        (_http_error(503), "Jira не ответила"),
+        (ConnectionResetError("connection reset by peer"), "Jira не ответила"),
+        (TimeoutError("timed out"), "Jira не ответила"),
+        (ValueError("something odd"), "что-то сломалось на стороне Jira"),
+    ],
+)
+def test_public_cause_maps_exceptions_to_short_human_text(
+    exc: Exception, expected: str,
+) -> None:
+    assert _public_cause(exc) == expected
