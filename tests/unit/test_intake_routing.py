@@ -398,3 +398,92 @@ async def test_created_with_undelivered_reply_keeps_claim_and_reaction(
 
     assert ("p-13", _PROCESSED_REACTION) in chat.added_reactions
     assert await listener._post_already_claimed("p-13")
+
+
+async def test_busy_falls_through_to_the_analyst_that_awaits_this_post(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Задача ждёт ответа от этого человека в этом канале, он пишет
+    «@aida да, только жёлтые карточки» — интейк выигрывает маршрут по
+    замыслу, но ответом «занята» он не имеет права пост съесть: без
+    fall-through аналитик ждёт вечно."""
+    chat = _Chat()
+    event = _post("p-14", "@aida да, только жёлтые карточки")
+    chat.posts["p-14"] = event
+    intake = _IntakeStub(IntakeOutcome(action="busy", reply_sent=True))
+    analyst = _AnalystStub(by_thread=None, by_channel=_TaskRow())
+    listener = _listener(
+        chat=chat, session_factory=session_factory, intake=intake, analyst=analyst,
+    )
+
+    await listener._dispatch(event)
+
+    assert [e.id for e in intake.calls] == ["p-14"]
+    assert analyst.fragments == ["p-14"]
+    # Ни ✅, ни claim: пост остаётся доступным маршрутам ниже.
+    assert chat.added_reactions == []
+    assert not await listener._post_already_claimed("p-14")
+
+
+async def test_busy_in_the_analyst_question_thread_also_falls_through(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Тред-вариант того же: совпадение по ``find_task_by_thread``."""
+    chat = _Chat()
+    event = _post("p-15", "@aida да, только жёлтые", root="root-q")
+    chat.posts["p-15"] = event
+    intake = _IntakeStub(IntakeOutcome(action="busy", reply_sent=True))
+
+    class _ThreadOnlyAnalyst(_AnalystStub):
+        """Совпадает по треду, по каналу — нет: интейк-маршрут вообще
+        дошёл бы сюда только из канала, не из вопроса бота."""
+
+        async def find_task_by_thread(self, thread_root_id: str) -> object | None:
+            return _TaskRow() if thread_root_id == "root-q" else None
+
+    analyst = _ThreadOnlyAnalyst(by_thread=None, by_channel=None)
+    listener = _listener(
+        chat=chat, session_factory=session_factory, intake=intake, analyst=analyst,
+    )
+    # Маршрут выше интейка (`_belongs_to_bot_thread`) здесь не срабатывает:
+    # проверяем именно ветку "busy" внутри `_handle_intake`.
+    assert await listener._handle_intake(event) is False
+    assert analyst.fragments == []
+    assert not await listener._post_already_claimed("p-15")
+
+
+async def test_busy_without_a_waiting_analyst_task_is_still_final(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Обычный «занята»: пост обработан, ✅ стоит, claim держится — иначе
+    catch-up принёс бы пост снова и бот отказал бы второй раз."""
+    chat = _Chat()
+    event = _post("p-16", "@aida что думаешь про парсер?")
+    chat.posts["p-16"] = event
+    intake = _IntakeStub(IntakeOutcome(action="busy", reply_sent=True))
+    analyst = _AnalystStub(by_thread=None, by_channel=None)
+    listener = _listener(
+        chat=chat, session_factory=session_factory, intake=intake, analyst=analyst,
+    )
+
+    await listener._dispatch(event)
+
+    assert [e.id for e in intake.calls] == ["p-16"]
+    assert analyst.fragments == []
+    assert ("p-16", _PROCESSED_REACTION) in chat.added_reactions
+    assert await listener._post_already_claimed("p-16")
+
+
+async def test_busy_with_no_analyst_inbox_at_all_is_still_final(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _Chat()
+    event = _post("p-17", "@aida что думаешь про парсер?")
+    chat.posts["p-17"] = event
+    intake = _IntakeStub(IntakeOutcome(action="busy", reply_sent=True))
+    listener = _listener(chat=chat, session_factory=session_factory, intake=intake)
+
+    await listener._dispatch(event)
+
+    assert ("p-17", _PROCESSED_REACTION) in chat.added_reactions
+    assert await listener._post_already_claimed("p-17")

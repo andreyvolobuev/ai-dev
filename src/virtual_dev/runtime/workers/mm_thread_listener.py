@@ -53,6 +53,7 @@ from pathlib import Path
 
 from virtual_dev.infrastructure.config import AppConfig, Settings
 from virtual_dev.infrastructure.db import (
+    IntakeRequestRow,
     MergeRequestRow,
     PlanRow,
     ProcessedThreadPostRow,
@@ -94,6 +95,16 @@ _CATCHUP_MAX_LOOKBACK = timedelta(days=7)
 # lookback: replaying week-old destructive commands after a long outage
 # is worse than asking the lead to repeat one.
 _DM_COMMAND_LOOKBACK = timedelta(hours=24)
+
+# How far back the catch-up sweep looks in a channel where someone asked
+# the bot for a ticket. Without this cursor such a channel is never swept
+# at all — it has no open MR review thread, no analyst-awaiting task and
+# is not the lead's DM — so an ask whose reply was dropped (communicator
+# rate limit, MM 5xx) or that arrived while the WS was down got total
+# silence. Fixed and narrow, like the lead-DM cursor: the point is to
+# recover the last outage, not to replay a week of channel chatter in
+# every channel that ever used intake.
+_INTAKE_CHANNEL_LOOKBACK = timedelta(hours=24)
 
 # How long a channel that answered 403 (read denied) is excluded from
 # catch-up sweeps. Permission errors don't heal on their own — retrying
@@ -359,6 +370,11 @@ class MmThreadListener:
                     TaskRow.awaiting_channel_id.is_not(None),
                 )
             )).scalars().all())
+            intake_channels = list((await session.execute(
+                select(IntakeRequestRow.mm_channel_id)
+                .where(IntakeRequestRow.created_at >= now - _INTAKE_CHANNEL_LOOKBACK)
+                .distinct()
+            )).scalars().all())
 
         # Active analyst sessions awaiting a reply.
         for q in qs:
@@ -388,6 +404,17 @@ class MmThreadListener:
             existing = out.get(ch)
             if existing is None or anchor < existing:
                 out[ch] = anchor
+
+        # Channels where someone recently asked for a ticket. Idempotency
+        # for the replay: the ✅-reaction guard plus the DB claim in
+        # _handle_intake, and the UNIQUE source_post_id in the inbox.
+        for channel_id in intake_channels:
+            if not channel_id:
+                continue
+            cursor = now - _INTAKE_CHANNEL_LOOKBACK
+            existing = out.get(channel_id)
+            if existing is None or cursor < existing:
+                out[channel_id] = cursor
 
         # Lead DM commands (/reset). Without this cursor a command sent
         # while the WS was down is lost forever — the lead expects the
@@ -479,8 +506,13 @@ class MmThreadListener:
             and self._mentions_bot(event.text)
             and not await self._belongs_to_bot_thread(event.thread_root_id)
         ):
-            await self._handle_intake(event)
-            return
+            # Route order is unchanged; what changed is that intake no
+            # longer SWALLOWS a post it declined. `_handle_intake` returns
+            # False when it answered "busy" on a post the analyst is
+            # waiting for, and the analyst route below then still gets it.
+            intake_owns_post = await self._handle_intake(event)
+            if intake_owns_post:
+                return
 
         # Phase 5.0 (analyst-driven): an MM event under a bot-asked
         # post is one fragment of the analyst's pending question. We
@@ -911,9 +943,14 @@ class MmThreadListener:
                 return True
         return False
 
-    async def _handle_intake(self, event: ChatMessage) -> None:
+    async def _handle_intake(self, event: ChatMessage) -> bool:
         """Hand the ask to intake, keeping the existing idempotency: the
-        check-mark reaction is the fast marker, the DB claim is the truth."""
+        check-mark reaction is the fast marker, the DB claim is the truth.
+
+        Returns False when the post must stay available to the routes
+        below (a declined ask the analyst is waiting for); True when
+        intake owns it, whatever the outcome.
+        """
         assert self._intake_inbox is not None
         fresh_post = await self._chat.get_post(event.id)
         if fresh_post is None:
@@ -921,18 +958,18 @@ class MmThreadListener:
                 "MmThreadListener: intake post {} unfetchable (deleted?) — skipping",
                 event.id,
             )
-            return
+            return True
         if _PROCESSED_REACTION in fresh_post.bot_reactions:
             logger.debug(
                 "MmThreadListener: intake post {} already processed", event.id,
             )
-            return
+            return True
         if not await self._claim_post(event.id):
             logger.info(
                 "MmThreadListener: intake post {} claimed elsewhere — skipping",
                 event.id,
             )
-            return
+            return True
         try:
             outcome = await self._intake_inbox.handle(event)
         except Exception:
@@ -941,7 +978,7 @@ class MmThreadListener:
             )
             await self._release_post_claim(event.id)
             self.stats.errors += 1
-            return
+            return True
 
         if outcome.action == "created":
             self.stats.intake_created += 1
@@ -956,7 +993,24 @@ class MmThreadListener:
             # Nothing was done and not because of a duplicate: release the
             # claim so a feature enabled later does not see the post as done.
             await self._release_post_claim(event.id)
-            return
+            return True
+
+        if outcome.action == "busy" and await self._analyst_awaits_post(event):
+            # The model read this as "not a ticket request" while the
+            # analyst is waiting for exactly this person in exactly this
+            # channel — so it is almost certainly an answer to the
+            # analyst's question, and "занята" was the wrong reply. Keep
+            # the post available: no claim, no ✅, and the analyst route
+            # below still gets the answer. The claim is safe to drop —
+            # busy created nothing — and appending the fragment moves the
+            # catch-up cursor past the post, so it is not re-delivered.
+            logger.info(
+                "MmThreadListener: intake declined post {} but the analyst "
+                "awaits this channel/user — letting it fall through",
+                event.id,
+            )
+            await self._release_post_claim(event.id)
+            return False
 
         if not outcome.reply_sent and outcome.action in ("failed", "busy"):
             # Same contract as the responder path: a dropped reply releases
@@ -969,7 +1023,7 @@ class MmThreadListener:
                 outcome.action, event.id,
             )
             await self._release_post_claim(event.id)
-            return
+            return True
         if not outcome.reply_sent and outcome.action in ("created", "updated"):
             # The ticket already exists in Jira; a retry would hit the inbox
             # duplicate guard and post nothing anyway. Keep claim and mark.
@@ -986,6 +1040,29 @@ class MmThreadListener:
                 "MmThreadListener: add_reaction failed for intake post {}",
                 event.id,
             )
+        return True
+
+    async def _analyst_awaits_post(self, event: ChatMessage) -> bool:
+        """Would the analyst-fragment route below match this post?
+
+        Same lookups, same order as that route — thread first, then the
+        channel+user fallback.
+        """
+        if self._analyst_inbox is None:
+            return False
+        try:
+            if event.thread_root_id and await self._analyst_inbox.find_task_by_thread(
+                event.thread_root_id,
+            ) is not None:
+                return True
+            return await self._analyst_inbox.find_task_by_channel(
+                mm_channel_id=event.channel_id, mm_user_id=event.author_id,
+            ) is not None
+        except Exception:
+            logger.exception(
+                "MmThreadListener: analyst lookup failed for post {}", event.id,
+            )
+            return False
 
     @staticmethod
     def _is_restart_command(text: str) -> bool:

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -521,3 +521,88 @@ async def test_reset_with_mr_closes_gitlab_mr_and_branch(
     async with session_factory() as session:
         remaining = await session.get(TaskRow, task_row.id)
         assert remaining is None
+
+
+# ============================================================
+#              Intake channels in the sweep
+# ============================================================
+
+
+async def _seed_intake_request(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    channel_id: str,
+    post_id: str,
+    age: timedelta,
+) -> None:
+    from virtual_dev.infrastructure.db import IntakeRequestRow
+
+    async with session_scope(session_factory) as session:
+        session.add(IntakeRequestRow(
+            source_post_id=post_id,
+            mm_root_id=post_id,
+            mm_channel_id=channel_id,
+            requester_mm_user_id="uid-bob",
+            issue_key="DM-99",
+            created_at=datetime.now(UTC) - age,
+        ))
+
+
+@pytest.mark.asyncio
+async def test_catchup_sweeps_a_channel_with_a_recent_intake_ask(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An ordinary channel has no open MR thread, no analyst-awaiting task
+    and is not the lead's DM — so before this cursor it was never swept at
+    all, and an ask whose reply got dropped (rate limit, MM 5xx) or that
+    arrived while the WS was down meant total silence."""
+    await _seed_intake_request(
+        session_factory, channel_id="chan-intake", post_id="p-old",
+        age=timedelta(hours=1),
+    )
+    chat = _CatchupChat()
+    listener = _listener(session_factory, chat, None)
+
+    cursors = await listener._gather_channel_cursors()
+
+    assert "chan-intake" in cursors
+
+
+@pytest.mark.asyncio
+async def test_catchup_ignores_a_channel_whose_intake_ask_is_old(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Bounded like the lead-DM cursor: recovering the last outage, not
+    replaying every channel that ever used intake."""
+    await _seed_intake_request(
+        session_factory, channel_id="chan-stale", post_id="p-stale",
+        age=timedelta(days=3),
+    )
+    chat = _CatchupChat()
+    listener = _listener(session_factory, chat, None)
+
+    cursors = await listener._gather_channel_cursors()
+
+    assert "chan-stale" not in cursors
+
+
+@pytest.mark.asyncio
+async def test_catchup_replays_a_missed_intake_mention(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_intake_request(
+        session_factory, channel_id="chan-intake", post_id="p-first",
+        age=timedelta(hours=2),
+    )
+    missed = ChatMessage(
+        id="p-missed", channel_id="chan-intake", author_id="uid-bob",
+        text="@aida заведи задачу на жёлтые карточки",
+        timestamp=datetime.now(UTC), trusted=False,
+    )
+    chat = _CatchupChat(catchup_posts={"chan-intake": [missed]})
+    listener = _listener(session_factory, chat, None)
+
+    total = await listener.catch_up()
+
+    assert total == 1
+    assert [c for c, _since in chat.read_channel_calls] == ["chan-intake"]
