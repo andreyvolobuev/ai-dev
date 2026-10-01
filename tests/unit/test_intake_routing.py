@@ -1,0 +1,265 @@
+"""Routing of bot mentions in MmThreadListener.
+
+Route order is the most fragile part of the feature: the bot's own threads
+(MR review, escalation, analyst question) must beat intake, and a mention in
+a channel root post must still reach intake even though the old code simply
+returned on "no thread_root_id".
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from virtual_dev.application.agents.thread_responder import (
+    ResponderAction,
+    ResponderDecision,
+)
+from virtual_dev.application.services import CommunicatorService, InjectionFilter
+from virtual_dev.domain.models.chat import ChatMessage, ChatUser
+from virtual_dev.domain.ports.chat import ChatPort
+from virtual_dev.infrastructure.config import (
+    AgentsCfg,
+    AppConfig,
+    MappingsCfg,
+    Settings,
+)
+from virtual_dev.infrastructure.db import MergeRequestRow
+from virtual_dev.runtime.workers.intake_inbox import IntakeOutcome
+from virtual_dev.runtime.workers.mm_thread_listener import (
+    _PROCESSED_REACTION,
+    MmThreadListener,
+)
+
+
+class _Chat(ChatPort):
+    def __init__(self, *, reactions: dict[str, list[str]] | None = None) -> None:
+        self._reactions = reactions or {}
+        self.sent: list[tuple[str, str]] = []
+        self.added_reactions: list[tuple[str, str]] = []
+        self.posts: dict[str, ChatMessage] = {}
+
+    async def send_direct(self, user_id: str, text: str) -> ChatMessage:
+        return _post("bot", text, author="bot", trusted=True)
+
+    async def send_to_channel(
+        self, channel_id: str, text: str, thread_root_id: str | None = None,
+    ) -> ChatMessage:
+        self.sent.append((channel_id, text))
+        return _post("bot", text, author="bot", trusted=True)
+
+    async def read_thread(self, thread_root_id: str) -> Sequence[ChatMessage]:
+        return []
+
+    async def find_user_by_email(self, email: str) -> ChatUser | None:
+        return None
+
+    async def find_user_by_username(self, username: str) -> ChatUser | None:
+        return None
+
+    async def add_reaction(self, post_id: str, emoji_name: str) -> None:
+        self.added_reactions.append((post_id, emoji_name))
+
+    async def get_post(self, post_id: str) -> ChatMessage | None:
+        stored = self.posts.get(post_id)
+        if stored is None:
+            return None
+        stored.bot_reactions = list(self._reactions.get(post_id, []))
+        return stored
+
+    def subscribe(self) -> AsyncIterator[ChatMessage]:
+        async def _empty() -> AsyncIterator[ChatMessage]:
+            if False:
+                yield _post("x", "")
+        return _empty()
+
+
+class _IntakeStub:
+    def __init__(self, outcome: IntakeOutcome | None = None) -> None:
+        self.calls: list[ChatMessage] = []
+        self._outcome = outcome or IntakeOutcome(
+            action="created", issue_key="DM-4821", reply_sent=True,
+        )
+
+    async def handle(self, event: ChatMessage) -> IntakeOutcome:
+        self.calls.append(event)
+        return self._outcome
+
+
+class _ResponderStub:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def decide(self, **kwargs: Any) -> ResponderDecision:
+        self.calls += 1
+        return ResponderDecision(
+            action=ResponderAction.IGNORE, reasoning="stub",
+        )
+
+
+def _post(
+    post_id: str,
+    text: str,
+    *,
+    author: str = "u1",
+    root: str | None = None,
+    trusted: bool = False,
+) -> ChatMessage:
+    return ChatMessage(
+        id=post_id, channel_id="chan-1", author_id=author, text=text,
+        timestamp=datetime.now(UTC), thread_root_id=root, trusted=trusted,
+    )
+
+
+def _listener(
+    *,
+    chat: _Chat,
+    session_factory: async_sessionmaker[AsyncSession],
+    intake: _IntakeStub | None,
+    responder: _ResponderStub | None = None,
+) -> MmThreadListener:
+    return MmThreadListener(
+        chat=chat,
+        communicator=CommunicatorService(
+            chat, InjectionFilter(), respect_working_hours=False,
+        ),
+        responder=responder or _ResponderStub(),  # type: ignore[arg-type]
+        dev_agents={},
+        session_factory=session_factory,
+        config=AppConfig(
+            repositories=[], agents=AgentsCfg(), mappings=MappingsCfg(),
+        ),
+        settings=Settings(mattermost_bot_username="aida"),
+        intake_inbox=intake,  # type: ignore[arg-type]
+    )
+
+
+async def test_mention_in_root_post_reaches_intake(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Сценарий 1: тегнули в канале, треда нет. Старый код тут просто
+    выходил по `if not event.thread_root_id`."""
+    chat = _Chat()
+    event = _post("p-1", "@aida заведи задачу на жёлтые карточки")
+    chat.posts["p-1"] = event
+    intake = _IntakeStub()
+
+    await _listener(
+        chat=chat, session_factory=session_factory, intake=intake,
+    )._dispatch(event)
+
+    assert [e.id for e in intake.calls] == ["p-1"]
+    assert (("p-1", _PROCESSED_REACTION)) in chat.added_reactions
+
+
+async def test_mention_in_thread_reaches_intake(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Сценарий 2: обсуждение в треде, потом упоминание бота."""
+    chat = _Chat()
+    event = _post("p-2", "@aida прочитай тред и создай задачу", root="root-1")
+    chat.posts["p-2"] = event
+    intake = _IntakeStub()
+
+    await _listener(
+        chat=chat, session_factory=session_factory, intake=intake,
+    )._dispatch(event)
+
+    assert [e.id for e in intake.calls] == ["p-2"]
+
+
+async def test_post_without_mention_is_not_intake(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Правки в интейк-треде принимаются только по повторному упоминанию —
+    иначе бот вклинивался бы в живое обсуждение соседей."""
+    chat = _Chat()
+    event = _post("p-3", "исполнителем поставь Петю", root="root-1")
+    chat.posts["p-3"] = event
+    intake = _IntakeStub()
+
+    await _listener(
+        chat=chat, session_factory=session_factory, intake=intake,
+    )._dispatch(event)
+
+    assert intake.calls == []
+
+
+async def test_mention_in_review_thread_goes_to_responder(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A mention in an MR review thread is a review, not a ticket request."""
+    async with session_factory() as session:
+        # external_id и author_username — NOT NULL без дефолта, без них
+        # вставка падает на IntegrityError.
+        session.add(MergeRequestRow(
+            repo_key="repo-a", iid=7, external_id="7", title="MR",
+            description="", author_username="aida-bot",
+            web_url="https://gitlab.example/mr/7",
+            source_branch="feat/x", target_branch="main",
+            review_thread_root_id="root-mr", review_thread_channel_id="chan-1",
+        ))
+        await session.commit()
+
+    chat = _Chat()
+    event = _post("p-4", "@aida поправь тут нейминг", root="root-mr")
+    chat.posts["p-4"] = event
+    intake = _IntakeStub()
+    responder = _ResponderStub()
+
+    await _listener(
+        chat=chat, session_factory=session_factory,
+        intake=intake, responder=responder,
+    )._dispatch(event)
+
+    assert intake.calls == []
+    assert responder.calls == 1
+
+
+async def test_already_processed_post_is_not_reprocessed(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """✅ от бота = уже обработано (catch-up sweep приносит те же посты)."""
+    chat = _Chat(reactions={"p-5": [_PROCESSED_REACTION]})
+    event = _post("p-5", "@aida заведи задачу")
+    chat.posts["p-5"] = event
+    intake = _IntakeStub()
+
+    await _listener(
+        chat=chat, session_factory=session_factory, intake=intake,
+    )._dispatch(event)
+
+    assert intake.calls == []
+
+
+async def test_intake_not_wired_means_no_route(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Без инбокса (нет трекера / фича не собрана) маршрут не появляется."""
+    chat = _Chat()
+    event = _post("p-6", "@aida заведи задачу")
+    chat.posts["p-6"] = event
+
+    listener = _listener(chat=chat, session_factory=session_factory, intake=None)
+    await listener._dispatch(event)
+
+    assert chat.added_reactions == []
+
+
+async def test_bot_own_post_is_ignored(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Бот цитирует свой же хендл в ответе — не должен звать сам себя."""
+    chat = _Chat()
+    event = _post("p-7", "@aida заведи задачу", author="bot", trusted=True)
+    chat.posts["p-7"] = event
+    intake = _IntakeStub()
+
+    await _listener(
+        chat=chat, session_factory=session_factory, intake=intake,
+    )._dispatch(event)
+
+    assert intake.calls == []

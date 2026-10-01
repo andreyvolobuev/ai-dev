@@ -41,6 +41,7 @@ from virtual_dev.application.agents import (
 )
 from virtual_dev.application.agents.thread_responder import resolve_mr_branches
 from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
+from virtual_dev.runtime.workers.intake_inbox import TaskIntakeInbox
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.application.services.ticket_reset import reset_ticket_state
 from virtual_dev.domain.models.chat import ChatMessage
@@ -76,6 +77,10 @@ class MmListenerStats:
     catchup_runs: int = 0
     errors: int = 0
     subscription_restarts: int = 0
+    # Task intake: "create a task" asks from MM.
+    intake_created: int = 0
+    intake_updated: int = 0
+    intake_declined: int = 0
 
 
 # How far back catch-up will fetch a channel's history when a
@@ -111,6 +116,7 @@ class MmThreadListener:
         settings: Settings,
         vcs: VcsPort | None = None,
         analyst_inbox: AnalystInbox | None = None,
+        intake_inbox: TaskIntakeInbox | None = None,
         subscription_initial_backoff: float = 5.0,
         subscription_max_backoff: float = 300.0,
     ) -> None:
@@ -123,6 +129,7 @@ class MmThreadListener:
         self._settings = settings
         self._vcs = vcs
         self._analyst_inbox = analyst_inbox
+        self._intake_inbox = intake_inbox
         # Lead DM channel for command replay — resolved lazily, cached
         # only on success (see _lead_dm_channel_id).
         self._lead_dm_channel: str | None = None
@@ -455,6 +462,24 @@ class MmThreadListener:
                         return
                 await self._handle_autofix_restart(escalated, event)
                 return
+
+        # A direct mention of the bot outside its own threads -> task intake
+        # ("create a task", "read the thread and file a ticket", edits to an
+        # already created ticket).
+        #
+        # Sits ABOVE the `if not event.thread_root_id` exit below: the ask
+        # often arrives as a root post in a channel with no thread yet. And
+        # ABOVE the analyst fragments: that route has a channel fallback
+        # (find_task_by_channel) which would otherwise swallow the mention in
+        # a channel where the analyst awaits an answer from the same person.
+        # Thread ownership is still respected: see _belongs_to_bot_thread.
+        if (
+            self._intake_inbox is not None
+            and self._mentions_bot(event.text)
+            and not await self._belongs_to_bot_thread(event.thread_root_id)
+        ):
+            await self._handle_intake(event)
+            return
 
         # Phase 5.0 (analyst-driven): an MM event under a bot-asked
         # post is one fragment of the analyst's pending question. We
@@ -852,6 +877,89 @@ class MmThreadListener:
                 MergeRequestRow.autofix_escalation_root_id == thread_root_id,
             )
             return (await session.execute(stmt)).scalar_one_or_none()
+
+    def _mentions_bot(self, text: str) -> bool:
+        """True when the post addresses the bot by its handle.
+
+        A literal match is addressing, not meaning. WHAT the person asks for
+        is decided by the LLM in TaskIntakeAgent: phrasings are arbitrary
+        and any heuristic here would guess wrong.
+        """
+        handle = (self._settings.mattermost_bot_username or "").strip().lstrip("@")
+        if not handle:
+            return False
+        return f"@{handle.lower()}" in (text or "").lower()
+
+    async def _belongs_to_bot_thread(self, thread_root_id: str | None) -> bool:
+        """A thread the bot runs itself: MR review, CI escalation, analyst
+        question. A mention there is not a ticket request; the matching
+        route must handle it."""
+        if not thread_root_id:
+            return False
+        if await self._load_mr_by_thread(thread_root_id) is not None:
+            return True
+        if await self._load_mr_by_escalation_thread(thread_root_id) is not None:
+            return True
+        if self._analyst_inbox is not None:
+            task_row = await self._analyst_inbox.find_task_by_thread(thread_root_id)
+            if task_row is not None:
+                return True
+        return False
+
+    async def _handle_intake(self, event: ChatMessage) -> None:
+        """Hand the ask to intake, keeping the existing idempotency: the
+        check-mark reaction is the fast marker, the DB claim is the truth."""
+        assert self._intake_inbox is not None
+        fresh_post = await self._chat.get_post(event.id)
+        if fresh_post is None:
+            logger.info(
+                "MmThreadListener: intake post {} unfetchable (deleted?) — skipping",
+                event.id,
+            )
+            return
+        if _PROCESSED_REACTION in fresh_post.bot_reactions:
+            logger.debug(
+                "MmThreadListener: intake post {} already processed", event.id,
+            )
+            return
+        if not await self._claim_post(event.id):
+            logger.info(
+                "MmThreadListener: intake post {} claimed elsewhere — skipping",
+                event.id,
+            )
+            return
+        try:
+            outcome = await self._intake_inbox.handle(event)
+        except Exception:
+            logger.exception(
+                "MmThreadListener: intake crashed on post {}", event.id,
+            )
+            await self._release_post_claim(event.id)
+            self.stats.errors += 1
+            return
+
+        if outcome.action == "created":
+            self.stats.intake_created += 1
+        elif outcome.action == "updated":
+            self.stats.intake_updated += 1
+        elif outcome.action == "busy":
+            self.stats.intake_declined += 1
+
+        if outcome.action == "skipped" and outcome.reason in (
+            "disabled", "no_tracker",
+        ):
+            # Nothing was done and not because of a duplicate: release the
+            # claim so a feature enabled later does not see the post as done.
+            await self._release_post_claim(event.id)
+            return
+
+        try:
+            await self._chat.add_reaction(event.id, _PROCESSED_REACTION)
+        except Exception:
+            logger.warning(
+                "MmThreadListener: add_reaction failed for intake post {}",
+                event.id,
+            )
 
     @staticmethod
     def _is_restart_command(text: str) -> bool:

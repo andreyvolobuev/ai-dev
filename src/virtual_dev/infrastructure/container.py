@@ -28,6 +28,7 @@ from virtual_dev.application.agents.dev import DevAgent
 from virtual_dev.application.agents.devops import DevOpsAgent
 from virtual_dev.application.agents.orchestrator import dev_agent_key
 from virtual_dev.application.agents.reviewer import ReviewerAgent
+from virtual_dev.application.agents.task_intake import TaskIntakeAgent
 from virtual_dev.application.agents.thread_responder import ThreadResponderAgent
 from virtual_dev.application.services import (
     CommunicatorService,
@@ -63,6 +64,7 @@ from virtual_dev.infrastructure.config import (
 )
 from virtual_dev.infrastructure.db import make_engine, make_session_factory
 from virtual_dev.infrastructure.db.migrations import upgrade_to_head
+from virtual_dev.runtime.workers.intake_inbox import TaskIntakeInbox
 
 
 @dataclass
@@ -98,6 +100,9 @@ class Container:
     reviewer: ReviewerAgent
     devops: DevOpsAgent
     thread_responder: ThreadResponderAgent
+    task_intake: TaskIntakeAgent
+    # None when chat is not configured: without MM intake has nothing to listen to.
+    task_intake_inbox: TaskIntakeInbox | None
     # Phase 5.0: analyst is the only agent. Session state per ticket
     # lives on TaskRow + analyst_conversation_steps.
     analyst_session_repo: AnalystSessionRepository
@@ -358,6 +363,23 @@ def build_container(config_dir: Path | str = "config") -> Container:
         prompts_loader=prompts_loader,
         trace=trace,
     )
+    task_intake = TaskIntakeAgent(
+        code_agent=code_agent,
+        config=config,
+        injection_filter=injection_filter,
+        prompts_loader=prompts_loader,
+        trace=trace,
+    )
+    task_intake_inbox: TaskIntakeInbox | None = None
+    if chat is not None:
+        task_intake_inbox = TaskIntakeInbox(
+            agent=task_intake,
+            task_tracker=task_tracker,
+            chat=chat,
+            communicator=communicator,
+            session_factory=session_factory,
+            config=config,
+        )
 
     # Phase 5.0: analyst is the only agent.
     analyst_session_repo = AnalystSessionRepository(
@@ -441,6 +463,8 @@ def build_container(config_dir: Path | str = "config") -> Container:
         reviewer=reviewer,
         devops=devops,
         thread_responder=thread_responder,
+        task_intake=task_intake,
+        task_intake_inbox=task_intake_inbox,
         analyst_session_repo=analyst_session_repo,
         trace=trace,
         recovery_service=recovery_service,
