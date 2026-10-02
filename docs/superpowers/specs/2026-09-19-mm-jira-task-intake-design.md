@@ -178,13 +178,17 @@ sprint_name | None, warnings: list[str] — раннер превращает wa
 
 ```
 intake_requests
-  issue_key             text  PK
+  id                    integer PK autoincrement
+  source_post_id        text  UNIQUE     -- пост с просьбой
   mm_root_id            text  index      -- корень треда, где попросили
   mm_channel_id         text
-  source_post_id        text  UNIQUE     -- пост с просьбой
   requester_mm_user_id  text
+  issue_key             text  nullable   -- заполняется после create_task
   created_at            timestamptz
 ```
+
+Ключ тикета не может быть PK: строка-заявка вставляется до похода в Jira,
+иначе уникальность не защищает от дубля.
 
 `source_post_id UNIQUE` — основной страж от дублей. ✅-реакция ставится уже
 после создания тикета, а повторная доставка одного поста (WebSocket +

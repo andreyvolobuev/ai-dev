@@ -80,6 +80,11 @@ agents:
     # Отвечает на actionable-треды ревью и обсуждения через полный code-agent.
     model: default
 
+  task_intake:
+    # Пишет заголовок и описание тикета по треду — нужна модель,
+    # которая умеет вычленять суть из обсуждения на 30 сообщений.
+    model: default
+
 # Ревью-политика.
 review_policy:
   required_approvals: 1
@@ -95,6 +100,16 @@ review_policy:
 pipeline_policy:
   max_autofix_attempts: 3
   max_infra_retries: 2
+
+# Создание задач по просьбе в Mattermost (@бот «заведи задачу ...»).
+# Работа для соседних команд должна быть видна в спринте, поэтому
+# labels + активный спринт обязательны. project/issue_type — как в Jira.
+task_intake:
+  enabled: true
+  project: "DM"
+  issue_type: "Task"
+  labels: ["dmp-sup"]
+  add_to_active_sprint: true
 
 # Эскалация: куда писать, когда бот застрял.
 escalation:

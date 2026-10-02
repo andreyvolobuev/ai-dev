@@ -25,6 +25,7 @@ should not stop the listener.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -41,6 +42,7 @@ from virtual_dev.application.agents import (
 )
 from virtual_dev.application.agents.thread_responder import resolve_mr_branches
 from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
+from virtual_dev.runtime.workers.intake_inbox import TaskIntakeInbox
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.application.services.ticket_reset import reset_ticket_state
 from virtual_dev.domain.models.chat import ChatMessage
@@ -51,6 +53,7 @@ from pathlib import Path
 
 from virtual_dev.infrastructure.config import AppConfig, Settings
 from virtual_dev.infrastructure.db import (
+    IntakeRequestRow,
     MergeRequestRow,
     PlanRow,
     ProcessedThreadPostRow,
@@ -76,6 +79,10 @@ class MmListenerStats:
     catchup_runs: int = 0
     errors: int = 0
     subscription_restarts: int = 0
+    # Task intake: "create a task" asks from MM.
+    intake_created: int = 0
+    intake_updated: int = 0
+    intake_declined: int = 0
 
 
 # How far back catch-up will fetch a channel's history when a
@@ -88,6 +95,16 @@ _CATCHUP_MAX_LOOKBACK = timedelta(days=7)
 # lookback: replaying week-old destructive commands after a long outage
 # is worse than asking the lead to repeat one.
 _DM_COMMAND_LOOKBACK = timedelta(hours=24)
+
+# How far back the catch-up sweep looks in a channel where someone asked
+# the bot for a ticket. Without this cursor such a channel is never swept
+# at all — it has no open MR review thread, no analyst-awaiting task and
+# is not the lead's DM — so an ask whose reply was dropped (communicator
+# rate limit, MM 5xx) or that arrived while the WS was down got total
+# silence. Fixed and narrow, like the lead-DM cursor: the point is to
+# recover the last outage, not to replay a week of channel chatter in
+# every channel that ever used intake.
+_INTAKE_CHANNEL_LOOKBACK = timedelta(hours=24)
 
 # How long a channel that answered 403 (read denied) is excluded from
 # catch-up sweeps. Permission errors don't heal on their own — retrying
@@ -111,6 +128,7 @@ class MmThreadListener:
         settings: Settings,
         vcs: VcsPort | None = None,
         analyst_inbox: AnalystInbox | None = None,
+        intake_inbox: TaskIntakeInbox | None = None,
         subscription_initial_backoff: float = 5.0,
         subscription_max_backoff: float = 300.0,
     ) -> None:
@@ -123,6 +141,7 @@ class MmThreadListener:
         self._settings = settings
         self._vcs = vcs
         self._analyst_inbox = analyst_inbox
+        self._intake_inbox = intake_inbox
         # Lead DM channel for command replay — resolved lazily, cached
         # only on success (see _lead_dm_channel_id).
         self._lead_dm_channel: str | None = None
@@ -351,6 +370,11 @@ class MmThreadListener:
                     TaskRow.awaiting_channel_id.is_not(None),
                 )
             )).scalars().all())
+            intake_channels = list((await session.execute(
+                select(IntakeRequestRow.mm_channel_id)
+                .where(IntakeRequestRow.created_at >= now - _INTAKE_CHANNEL_LOOKBACK)
+                .distinct()
+            )).scalars().all())
 
         # Active analyst sessions awaiting a reply.
         for q in qs:
@@ -380,6 +404,17 @@ class MmThreadListener:
             existing = out.get(ch)
             if existing is None or anchor < existing:
                 out[ch] = anchor
+
+        # Channels where someone recently asked for a ticket. Idempotency
+        # for the replay: the ✅-reaction guard plus the DB claim in
+        # _handle_intake, and the UNIQUE source_post_id in the inbox.
+        for channel_id in intake_channels:
+            if not channel_id:
+                continue
+            cursor = now - _INTAKE_CHANNEL_LOOKBACK
+            existing = out.get(channel_id)
+            if existing is None or cursor < existing:
+                out[channel_id] = cursor
 
         # Lead DM commands (/reset). Without this cursor a command sent
         # while the WS was down is lost forever — the lead expects the
@@ -454,6 +489,29 @@ class MmThreadListener:
                     if fresh is not None and _PROCESSED_REACTION in fresh.bot_reactions:
                         return
                 await self._handle_autofix_restart(escalated, event)
+                return
+
+        # A direct mention of the bot outside its own threads -> task intake
+        # ("create a task", "read the thread and file a ticket", edits to an
+        # already created ticket).
+        #
+        # Sits ABOVE the `if not event.thread_root_id` exit below: the ask
+        # often arrives as a root post in a channel with no thread yet. And
+        # ABOVE the analyst fragments: that route has a channel fallback
+        # (find_task_by_channel) which would otherwise swallow the mention in
+        # a channel where the analyst awaits an answer from the same person.
+        # Thread ownership is still respected: see _belongs_to_bot_thread.
+        if (
+            self._intake_inbox is not None
+            and self._mentions_bot(event.text)
+            and not await self._belongs_to_bot_thread(event.thread_root_id)
+        ):
+            # Route order is unchanged; what changed is that intake no
+            # longer SWALLOWS a post it declined. `_handle_intake` returns
+            # False when it answered "busy" on a post the analyst is
+            # waiting for, and the analyst route below then still gets it.
+            intake_owns_post = await self._handle_intake(event)
+            if intake_owns_post:
                 return
 
         # Phase 5.0 (analyst-driven): an MM event under a bot-asked
@@ -852,6 +910,167 @@ class MmThreadListener:
                 MergeRequestRow.autofix_escalation_root_id == thread_root_id,
             )
             return (await session.execute(stmt)).scalar_one_or_none()
+
+    def _mentions_bot(self, text: str) -> bool:
+        """True when the post addresses the bot by its handle.
+
+        A literal match is addressing, not meaning. WHAT the person asks for
+        is decided by the LLM in TaskIntakeAgent: phrasings are arbitrary
+        and any heuristic here would guess wrong.
+        """
+        handle = (self._settings.mattermost_bot_username or "").strip().lstrip("@")
+        if not handle:
+            return False
+        # Boundary on both sides: "@aidanov", "@aida.petrov" (another user)
+        # and "x@aida.com" (an e-mail) are not mentions, while "@aida," or a
+        # sentence-final "@aida." are.
+        pattern = rf"(?<!\w)@{re.escape(handle)}(?![\w-])(?!\.\w)"
+        return re.search(pattern, text or "", re.IGNORECASE) is not None
+
+    async def _belongs_to_bot_thread(self, thread_root_id: str | None) -> bool:
+        """A thread the bot runs itself: MR review, CI escalation, analyst
+        question. A mention there is not a ticket request; the matching
+        route must handle it."""
+        if not thread_root_id:
+            return False
+        if await self._load_mr_by_thread(thread_root_id) is not None:
+            return True
+        if await self._load_mr_by_escalation_thread(thread_root_id) is not None:
+            return True
+        if self._analyst_inbox is not None:
+            task_row = await self._analyst_inbox.find_task_by_thread(thread_root_id)
+            if task_row is not None:
+                return True
+        return False
+
+    async def _handle_intake(self, event: ChatMessage) -> bool:
+        """Hand the ask to intake, keeping the existing idempotency: the
+        check-mark reaction is the fast marker, the DB claim is the truth.
+
+        Returns False when the post must stay available to the routes
+        below (a declined ask the analyst is waiting for); True when
+        intake owns it, whatever the outcome.
+        """
+        assert self._intake_inbox is not None
+        fresh_post = await self._chat.get_post(event.id)
+        if fresh_post is None:
+            logger.info(
+                "MmThreadListener: intake post {} unfetchable (deleted?) — skipping",
+                event.id,
+            )
+            return True
+        if _PROCESSED_REACTION in fresh_post.bot_reactions:
+            logger.debug(
+                "MmThreadListener: intake post {} already processed", event.id,
+            )
+            return True
+        if not await self._claim_post(event.id):
+            logger.info(
+                "MmThreadListener: intake post {} claimed elsewhere — skipping",
+                event.id,
+            )
+            return True
+        try:
+            outcome = await self._intake_inbox.handle(event)
+        except Exception:
+            logger.exception(
+                "MmThreadListener: intake crashed on post {}", event.id,
+            )
+            await self._release_post_claim(event.id)
+            self.stats.errors += 1
+            return True
+
+        if outcome.action == "created":
+            self.stats.intake_created += 1
+        elif outcome.action == "updated":
+            self.stats.intake_updated += 1
+        elif outcome.action == "busy":
+            self.stats.intake_declined += 1
+
+        if outcome.action == "skipped" and outcome.reason in (
+            "disabled", "no_tracker",
+        ):
+            # Nothing was done and not because of a duplicate: release the
+            # claim so a feature enabled later does not see the post as done.
+            await self._release_post_claim(event.id)
+            return True
+
+        if outcome.action == "busy" and await self._analyst_awaits_post(event):
+            # The model read this as "not a ticket request" while the
+            # analyst is waiting for exactly this person in exactly this
+            # channel — so it is almost certainly an answer to the
+            # analyst's question, and the "busy" reply was wrong. Let the
+            # post fall through to the analyst route below, which runs in
+            # THIS same _dispatch_inner call — so the fragment is
+            # delivered without releasing the claim.
+            #
+            # The claim stays precisely because it governs RETRIES, not
+            # this first delivery. Releasing it fed a duplicate loop: a
+            # channel where any ticket was filed in the last 24h gets the
+            # `now - 24h` intake cursor, and _gather_channel_cursors takes
+            # the minimum per channel, so that cursor overrides the
+            # analyst's last_fragment_at one. An unclaimed, un-reacted
+            # post was therefore re-pulled by every catch-up tick: the
+            # intake agent re-ran and posted another "busy" roughly once a
+            # minute for the whole coalescer window.
+            logger.info(
+                "MmThreadListener: intake declined post {} but the analyst "
+                "awaits this channel/user — letting it fall through",
+                event.id,
+            )
+            return False
+
+        if not outcome.reply_sent and outcome.action in ("failed", "busy"):
+            # Same contract as the responder path: a dropped reply releases
+            # the claim and leaves the post unreacted so catch-up retries.
+            # Nothing was created, so a retry is safe and is the only way
+            # the person hears back.
+            logger.warning(
+                "MmThreadListener: intake {} on post {} but reply not delivered "
+                "- releasing claim for retry",
+                outcome.action, event.id,
+            )
+            await self._release_post_claim(event.id)
+            return True
+        if not outcome.reply_sent and outcome.action in ("created", "updated"):
+            # The ticket already exists in Jira; a retry would hit the inbox
+            # duplicate guard and post nothing anyway. Keep claim and mark.
+            logger.warning(
+                "MmThreadListener: intake {} {} for post {} but the reply "
+                "never landed",
+                outcome.action, outcome.issue_key, event.id,
+            )
+
+        try:
+            await self._chat.add_reaction(event.id, _PROCESSED_REACTION)
+        except Exception:
+            logger.warning(
+                "MmThreadListener: add_reaction failed for intake post {}",
+                event.id,
+            )
+        return True
+
+    async def _analyst_awaits_post(self, event: ChatMessage) -> bool:
+        """Would the analyst-fragment route below match this post?
+
+        Same lookups, same order as that route — thread first, then the
+        channel+user fallback.
+        """
+        if self._analyst_inbox is None:
+            return False
+        try:
+            if event.thread_root_id and await self._analyst_inbox.find_task_by_thread(
+                event.thread_root_id,
+            ) is not None:
+                return True
+            return await self._analyst_inbox.find_task_by_channel(
+                mm_channel_id=event.channel_id, mm_user_id=event.author_id,
+            ) is not None
+        except Exception:
+            logger.exception(
+                "MmThreadListener: analyst lookup failed for post {}", event.id,
+            )
+            return False
 
     @staticmethod
     def _is_restart_command(text: str) -> bool:

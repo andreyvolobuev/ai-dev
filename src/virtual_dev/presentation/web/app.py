@@ -248,6 +248,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             settings=container.settings,
             vcs=container.vcs,
             analyst_inbox=analyst_inbox,
+            intake_inbox=container.task_intake_inbox,
         )
         # Catch-up tick — runs independently of the WS health, so
         # missed posts get replayed even if the listener's

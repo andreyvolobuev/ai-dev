@@ -107,9 +107,13 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
     async def _run_task_once(self, request: CodeAgentRequest) -> CodeAgentResult:
         mcp_servers = _as_mcp_servers(request.extras.get("mcp_servers"))
         allowed_tool_names = _as_allowed_tools(request.extras.get("allowed_tool_names"))
+        denied_tool_names = _as_tool_name_list(
+            request.extras.get("disallowed_tool_names"), "disallowed_tool_names",
+        )
         stderr_lines: list[str] = []
         options = self._build_options(
             request, mcp_servers, allowed_tool_names, stderr_lines,
+            denied_tool_names=denied_tool_names,
         )
 
         final_text_parts: list[str] = []
@@ -258,7 +262,12 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
     def stream_task(self, request: CodeAgentRequest) -> AsyncIterator[str]:
         mcp_servers = _as_mcp_servers(request.extras.get("mcp_servers"))
         allowed_tool_names = _as_allowed_tools(request.extras.get("allowed_tool_names"))
-        options = self._build_options(request, mcp_servers, allowed_tool_names, None)
+        options = self._build_options(
+            request, mcp_servers, allowed_tool_names, None,
+            denied_tool_names=_as_tool_name_list(
+                request.extras.get("disallowed_tool_names"), "disallowed_tool_names",
+            ),
+        )
 
         async def _iter() -> AsyncIterator[str]:
             async for event in query(prompt=request.user_prompt, options=options):
@@ -277,7 +286,20 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
         mcp_servers: dict[str, McpSdkServerConfig] | None,
         allowed_tool_names: Iterable[str] | None,
         stderr_sink: list[str] | None,
+        *,
+        denied_tool_names: list[str] | None = None,
     ) -> ClaudeAgentOptions:
+        """Translate a request into ``ClaudeAgentOptions``.
+
+        ``allowed_tools`` is an allow-RULE list, not a tool filter: under
+        ``permission_mode="bypassPermissions"`` every built-in (``Bash``,
+        ``Read``, ...) stays callable whatever it contains — measured, not
+        assumed. ``disallowed_tools`` emits ``--disallowedTools``, and deny
+        rules win over bypass, so that is the only way to actually shrink
+        the surface. A caller that passes no deny list gets byte-identical
+        options to before this knob existed: the key is omitted entirely
+        rather than set to ``[]``.
+        """
         kwargs: dict[str, Any] = {
             "system_prompt": request.system_prompt or None,
             "max_turns": request.max_turns,
@@ -290,6 +312,8 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
             kwargs["mcp_servers"] = mcp_servers
         if allowed_tool_names is not None:
             kwargs["allowed_tools"] = list(allowed_tool_names)
+        if denied_tool_names:
+            kwargs["disallowed_tools"] = list(denied_tool_names)
         if self._cli_path:
             kwargs["cli_path"] = self._cli_path
         if self._env:
@@ -359,10 +383,14 @@ def _as_mcp_servers(value: object) -> dict[str, McpSdkServerConfig] | None:
 
 
 def _as_allowed_tools(value: object) -> Iterable[str] | None:
+    return _as_tool_name_list(value, "allowed_tool_names")
+
+
+def _as_tool_name_list(value: object, key: str) -> list[str] | None:
     if value is None:
         return None
     if not isinstance(value, (list, tuple)):
         raise TypeError(
-            f"extras['allowed_tool_names'] must be list/tuple, got {type(value).__name__}"
+            f"extras[{key!r}] must be list/tuple, got {type(value).__name__}"
         )
     return cast(list[str], list(value))

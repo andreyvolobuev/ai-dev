@@ -117,3 +117,62 @@ class Task:
     internal_status: TaskStatus = TaskStatus.DISCOVERED
     target_repo_key: str | None = None  # определяется Analyst-агентом
     dor_satisfied: bool = False         # definition of ready — готова ли задача к кодингу
+
+
+@dataclass
+class NewTaskSpec:
+    """Что именно создать в трекере. Собирается раннером интейка:
+    project / issue_type / labels приходят из конфига, summary и
+    description — из решения модели, assignee уже резолвлен в
+    username трекера."""
+
+    project: str
+    issue_type: str
+    summary: str
+    description: str
+    labels: list[str] = field(default_factory=list)
+    assignee: str | None = None
+    add_to_active_sprint: bool = False
+
+
+@dataclass
+class TaskPatch:
+    """Точечная правка существующего тикета.
+
+    ``None`` в поле = «не трогать». ``assignee=""`` — снять исполнителя.
+    ``sprint``: True — положить в активный спринт, False — убрать из
+    спринта, None — не трогать.
+    """
+
+    summary: str | None = None
+    description: str | None = None
+    assignee: str | None = None
+    labels_add: list[str] = field(default_factory=list)
+    labels_remove: list[str] = field(default_factory=list)
+    sprint: bool | None = None
+
+    def is_empty(self) -> bool:
+        return (
+            self.summary is None
+            and self.description is None
+            and self.assignee is None
+            and not self.labels_add
+            and not self.labels_remove
+            and self.sprint is None
+        )
+
+
+@dataclass
+class CreatedTask:
+    """Результат создания тикета.
+
+    ``warnings`` — машинные коды частичных сбоев (``no_active_sprint``,
+    ``sprint_failed``); раннер превращает их в честный текст ответа.
+    Тикет при любом из них уже существует.
+    """
+
+    key: str
+    url: str
+    assignee: str | None = None
+    sprint_name: str | None = None
+    warnings: list[str] = field(default_factory=list)
