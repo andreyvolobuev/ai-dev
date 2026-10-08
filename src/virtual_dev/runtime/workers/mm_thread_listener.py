@@ -63,6 +63,9 @@ from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
 
 _PROCESSED_REACTION = "white_check_mark"
+# Transient "I heard you" marker: set once the post is claimed, removed on every
+# exit path. Purely cosmetic - the check mark and the DB claim are the real markers.
+_WORKING_REACTION = "loading"
 
 
 @dataclass
@@ -970,6 +973,28 @@ class MmThreadListener:
                 event.id,
             )
             return True
+        # Only after the claim: before it, two pods would both react during a
+        # rolling deploy. Before the model run, so the person sees it at once.
+        try:
+            await self._chat.add_reaction(event.id, _WORKING_REACTION)
+        except Exception:
+            logger.warning(
+                "MmThreadListener: working reaction failed for intake post {}", event.id,
+            )
+        try:
+            return await self._run_claimed_intake(event)
+        finally:
+            try:
+                await self._chat.remove_reaction(event.id, _WORKING_REACTION)
+            except Exception:
+                logger.warning(
+                    "MmThreadListener: removing working reaction failed for intake post {}",
+                    event.id,
+                )
+
+    async def _run_claimed_intake(self, event: ChatMessage) -> bool:
+        """The part of `_handle_intake` that runs once the post is claimed."""
+        assert self._intake_inbox is not None
         try:
             outcome = await self._intake_inbox.handle(event)
         except Exception:
