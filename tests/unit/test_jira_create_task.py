@@ -46,6 +46,7 @@ class _FakeJiraClient:
         boards: list[dict[str, Any]] | None = None,
         sprints_by_board: dict[int, list[dict[str, Any]]] | None = None,
         page_size: int = 50,
+        failing_boards: set[int] | None = None,
         sprint_field_id: str = "customfield_10005",
         user_entries: list[dict[str, Any]] | None = None,
         sprint_add_raises: bool = False,
@@ -54,9 +55,10 @@ class _FakeJiraClient:
         project_raises: bool = False,
     ) -> None:
         self._created_key = created_key
-        self._boards = boards if boards is not None else [{"id": 803}]
+        self._boards = boards if boards is not None else [{"id": 803, "type": "scrum"}]
         self._sprints_by_board = sprints_by_board or {}
         self._page_size = page_size
+        self._failing_boards = failing_boards or set()
         self._sprint_field_id = sprint_field_id
         self._user_entries = user_entries or []
         self._sprint_add_raises = sprint_add_raises
@@ -110,6 +112,8 @@ class _FakeJiraClient:
         self, board_id: int, state: str | None = None, start: int = 0, limit: int = 50,
     ) -> dict[str, Any]:
         self.sprint_list_calls.append(board_id)
+        if board_id in self._failing_boards:
+            raise requests.HTTPError("The board doesn't support sprints.")
         return self._page(self._sprints_by_board.get(board_id, []), start, limit)
 
     def add_issues_to_sprint(self, sprint_id: int, issues: list[str]) -> None:
@@ -226,7 +230,7 @@ async def test_create_task_resolves_sprint_by_name_and_adds_the_ticket() -> None
 
 async def test_create_task_finds_the_sprint_on_a_later_board_and_page() -> None:
     client = _FakeJiraClient(
-        boards=[{"id": 803}, {"id": 1804}],
+        boards=[{"id": 803, "type": "scrum"}, {"id": 1804, "type": "scrum"}],
         sprints_by_board={
             803: [{"id": i, "name": f"Other {i}", "state": "closed"} for i in range(5)],
             1804: [
@@ -398,3 +402,52 @@ async def test_create_task_looks_up_valid_types_and_reraises_the_original() -> N
     assert caught.value is original
     assert caught.value.response is response
     assert client.project_calls == ["DM"]
+
+
+_KANBAN_FIRST = [
+    {"id": 811, "type": "kanban"},
+    {"id": 1936, "type": "kanban"},
+    {"id": 803, "type": "scrum"},
+]
+
+
+async def test_kanban_board_listed_first_does_not_hide_the_scrum_sprint() -> None:
+    client = _FakeJiraClient(
+        boards=_KANBAN_FIRST, sprints_by_board=_queue_sprints(),
+        failing_boards={811, 1936},
+    )
+    created = await _tracker(client).create_task(_spec())
+
+    assert created.warnings == []
+    assert client.sprint_calls == [(3024, ["DM-4821"])]
+
+
+async def test_non_scrum_boards_are_not_asked_for_sprints() -> None:
+    client = _FakeJiraClient(boards=_KANBAN_FIRST, sprints_by_board=_queue_sprints())
+    await _tracker(client).create_task(_spec())
+
+    assert client.sprint_list_calls == [803]
+
+
+async def test_a_scrum_board_that_refuses_does_not_hide_the_next_one() -> None:
+    client = _FakeJiraClient(
+        boards=[{"id": 1, "type": "scrum"}, {"id": 803, "type": "scrum"}],
+        sprints_by_board=_queue_sprints(), failing_boards={1},
+    )
+    created = await _tracker(client).create_task(_spec())
+
+    assert created.warnings == []
+    assert client.sprint_list_calls == [1, 803]
+
+
+async def test_every_board_failing_means_not_found_and_the_ticket_survives() -> None:
+    client = _FakeJiraClient(
+        boards=[{"id": 1, "type": "scrum"}, {"id": 2, "type": "scrum"}],
+        failing_boards={1, 2},
+    )
+    tracker = _tracker(client)
+    assert tracker._find_sprint("DM", _QUEUE) is None
+    created = await tracker.create_task(_spec())
+
+    assert created.key == "DM-4821"
+    assert created.warnings == ["sprint_not_found"]

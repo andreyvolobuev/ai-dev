@@ -354,26 +354,37 @@ class JiraTaskTracker(TaskTrackerPort):
         if cached is not None:
             return cached
         for board_id in self._board_ids(project):
-            start = 0
-            while True:
-                page = self._client.get_all_sprints_from_board(
-                    board_id, start=start, limit=_AGILE_PAGE_SIZE,
-                )
-                values = page.get("values") or [] if isinstance(page, dict) else []
-                for sprint in values:
-                    if (
-                        isinstance(sprint, dict)
-                        and sprint.get("name") == name
-                        and str(sprint.get("state") or "").lower() != "closed"
-                        and sprint.get("id") is not None
-                    ):
-                        sprint_id = int(sprint["id"])
-                        self._sprint_ids[(project, name)] = sprint_id
-                        return sprint_id
-                if not values or not isinstance(page, dict) or page.get("isLast", True):
-                    break
-                start += len(values)
+            try:
+                found = self._find_sprint_on_board(board_id, name)
+            except Exception as exc:
+                # A board can refuse for reasons we do not control (rights,
+                # reconfigured since listing); it must not hide a sprint
+                # that exists on another board.
+                logger.warning("Jira: sprints of board {} unavailable: {}", board_id, exc)
+                continue
+            if found is not None:
+                self._sprint_ids[(project, name)] = found
+                return found
         return None
+
+    def _find_sprint_on_board(self, board_id: int, name: str) -> int | None:
+        start = 0
+        while True:
+            page = self._client.get_all_sprints_from_board(
+                board_id, start=start, limit=_AGILE_PAGE_SIZE,
+            )
+            values = page.get("values") or [] if isinstance(page, dict) else []
+            for sprint in values:
+                if (
+                    isinstance(sprint, dict)
+                    and sprint.get("name") == name
+                    and str(sprint.get("state") or "").lower() != "closed"
+                    and sprint.get("id") is not None
+                ):
+                    return int(sprint["id"])
+            if not values or not isinstance(page, dict) or page.get("isLast", True):
+                return None
+            start += len(values)
 
     def _board_ids(self, project: str) -> list[int]:
         ids: list[int] = []
@@ -383,7 +394,11 @@ class JiraTaskTracker(TaskTrackerPort):
                 project_key=project, start=start, limit=_AGILE_PAGE_SIZE,
             )
             values = page.get("values") or [] if isinstance(page, dict) else []
-            ids.extend(int(b["id"]) for b in values if isinstance(b, dict) and "id" in b)
+            # Only scrum boards have sprints; kanban ones answer HTTP 400.
+            ids.extend(
+                int(b["id"]) for b in values
+                if isinstance(b, dict) and "id" in b and b.get("type") == "scrum"
+            )
             if not values or not isinstance(page, dict) or page.get("isLast", True):
                 return ids
             start += len(values)
