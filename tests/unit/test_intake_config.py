@@ -46,6 +46,7 @@ def test_shipped_templates_present_and_feminine() -> None:
     assert "{key}" in templates.intake_created
     assert "{url}" in templates.intake_created
     assert "Завела" in templates.intake_created
+    assert templates.intake_created.strip() == "Завела [{key}]({url}){warnings_block}"
     assert templates.intake_updated
     assert templates.intake_failed
     assert templates.intake_busy_fallback

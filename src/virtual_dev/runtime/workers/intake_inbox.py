@@ -186,7 +186,7 @@ class TaskIntakeInbox:
             summary=summary,
             assignee=created.assignee or "не назначен",
             sprint=created.sprint_name or "без спринта",
-            warnings_block=self._render_warnings(all_warnings),
+            warnings_block=self._render_warnings(all_warnings, inline=True),
         )
         sent = await self._reply(event, root_id, text)
         logger.info(
@@ -416,7 +416,12 @@ class TaskIntakeInbox:
             )
             return None
 
-    def _render_warnings(self, codes: Sequence[str]) -> str:
+    def _render_warnings(self, codes: Sequence[str], *, inline: bool = False) -> str:
+        """Warning phrases as a tail for a reply.
+
+        ``inline`` renders a short second sentence right after the link
+        (". Phrase."), otherwise a separate blank-line block.
+        """
         phrases: list[str] = []
         for code in codes:
             key = _WARNING_TEMPLATES.get(code)
@@ -425,7 +430,10 @@ class TaskIntakeInbox:
                 phrases.append(phrase)
         if not phrases:
             return ""
-        return "\n\n" + "; ".join(phrases) + "."
+        joined = "; ".join(phrases)
+        if inline:
+            return f". {joined[:1].upper()}{joined[1:]}."
+        return "\n\n" + joined + "."
 
     async def _reply(self, event: ChatMessage, root_id: str, text: str) -> bool:
         outcome = await self._communicator.send_channel(

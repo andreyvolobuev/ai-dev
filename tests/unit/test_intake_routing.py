@@ -37,6 +37,7 @@ from virtual_dev.infrastructure.db import (
 from virtual_dev.runtime.workers.intake_inbox import IntakeOutcome
 from virtual_dev.runtime.workers.mm_thread_listener import (
     _PROCESSED_REACTION,
+    _WORKING_REACTION,
     MmThreadListener,
 )
 
@@ -51,7 +52,9 @@ class _Chat(ChatPort):
         self._reactions = reactions or {}
         self._catchup_posts = catchup_posts or {}
         self.sent: list[tuple[str, str]] = []
+        # Idempotency markers only; the transient working reaction is in `events`.
         self.added_reactions: list[tuple[str, str]] = []
+        self.events: list[tuple[str, str, str]] = []
         self.posts: dict[str, ChatMessage] = {}
         self.read_channel_calls: list[tuple[str, datetime]] = []
 
@@ -74,7 +77,12 @@ class _Chat(ChatPort):
         return None
 
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
-        self.added_reactions.append((post_id, emoji_name))
+        self.events.append(("add", post_id, emoji_name))
+        if emoji_name != _WORKING_REACTION:
+            self.added_reactions.append((post_id, emoji_name))
+
+    async def remove_reaction(self, post_id: str, emoji_name: str) -> None:
+        self.events.append(("remove", post_id, emoji_name))
 
     async def get_post(self, post_id: str) -> ChatMessage | None:
         stored = self.posts.get(post_id)
@@ -574,3 +582,148 @@ async def test_fallthrough_post_is_not_replayed_by_the_catchup_sweep(
     assert [c for c, _since in chat.read_channel_calls] == ["chan-1"]
     assert [e.id for e in intake.calls] == ["p-18"]
     assert len(chat.sent) == 1
+
+
+class _WatchingIntake(_IntakeStub):
+    """Records what the chat looked like at the moment intake ran."""
+
+    def __init__(
+        self,
+        chat: _Chat,
+        outcome: IntakeOutcome | None = None,
+        *,
+        raises: bool = False,
+    ) -> None:
+        super().__init__(outcome)
+        self._chat = chat
+        self._raises = raises
+        self.events_seen: list[tuple[str, str, str]] = []
+
+    async def handle(self, event: ChatMessage) -> IntakeOutcome:
+        self.events_seen = list(self._chat.events)
+        if self._raises:
+            raise RuntimeError("model run crashed")
+        return await super().handle(event)
+
+
+def _loading(post_id: str) -> list[tuple[str, str, str]]:
+    return [
+        ("add", post_id, _WORKING_REACTION),
+        ("remove", post_id, _WORKING_REACTION),
+    ]
+
+
+def _working_events(chat: _Chat) -> list[tuple[str, str, str]]:
+    return [e for e in chat.events if e[2] == _WORKING_REACTION]
+
+
+@pytest.mark.parametrize(
+    ("action", "marked"),
+    [("created", True), ("updated", True), ("busy", True)],
+)
+async def test_loading_is_set_after_the_claim_and_removed_on_each_exit(
+    session_factory: async_sessionmaker[AsyncSession], action: str, marked: bool,
+) -> None:
+    chat = _Chat()
+    event = _post("p-30", "@aida заведи задачу")
+    chat.posts["p-30"] = event
+    intake = _WatchingIntake(
+        chat, IntakeOutcome(action=action, issue_key="DM-1", reply_sent=True),  # type: ignore[arg-type]
+    )
+    listener = _listener(chat=chat, session_factory=session_factory, intake=intake)
+
+    await listener._dispatch(event)
+
+    # Already on the post while intake runs, gone once the handler is done.
+    assert intake.events_seen == [("add", "p-30", _WORKING_REACTION)]
+    assert _working_events(chat) == _loading("p-30")
+    assert ("p-30", _PROCESSED_REACTION) in chat.added_reactions
+    # The check mark lands before the spinner is taken off.
+    assert chat.events[-1] == ("remove", "p-30", _WORKING_REACTION)
+    assert await listener._post_already_claimed("p-30")
+
+
+async def test_loading_is_not_set_when_the_post_is_claimed_elsewhere(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _Chat()
+    event = _post("p-31", "@aida заведи задачу")
+    chat.posts["p-31"] = event
+    intake = _IntakeStub()
+    listener = _listener(chat=chat, session_factory=session_factory, intake=intake)
+    assert await listener._claim_post("p-31")
+
+    await listener._dispatch(event)
+
+    assert intake.calls == []
+    assert chat.events == []
+
+
+async def test_loading_is_removed_on_the_analyst_fallthrough_without_a_check_mark(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _Chat()
+    event = _post("p-32", "@aida да, только жёлтые карточки")
+    chat.posts["p-32"] = event
+    intake = _WatchingIntake(chat, IntakeOutcome(action="busy", reply_sent=True))
+    analyst = _AnalystStub(by_thread=None, by_channel=_TaskRow())
+    listener = _listener(
+        chat=chat, session_factory=session_factory, intake=intake, analyst=analyst,
+    )
+
+    await listener._dispatch(event)
+
+    assert _working_events(chat) == _loading("p-32")
+    assert chat.added_reactions == []
+    assert analyst.fragments == ["p-32"]
+
+
+async def test_loading_is_removed_when_intake_skips(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _Chat()
+    event = _post("p-33", "@aida заведи задачу")
+    chat.posts["p-33"] = event
+    intake = _WatchingIntake(
+        chat, IntakeOutcome(action="skipped", reason="disabled"),
+    )
+    listener = _listener(chat=chat, session_factory=session_factory, intake=intake)
+
+    await listener._dispatch(event)
+
+    assert _working_events(chat) == _loading("p-33")
+    assert chat.added_reactions == []
+
+
+async def test_loading_is_removed_when_intake_raises(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _Chat()
+    event = _post("p-34", "@aida заведи задачу")
+    chat.posts["p-34"] = event
+    intake = _WatchingIntake(chat, raises=True)
+    listener = _listener(chat=chat, session_factory=session_factory, intake=intake)
+
+    await listener._dispatch(event)
+
+    assert _working_events(chat) == _loading("p-34")
+    assert chat.added_reactions == []
+    assert not await listener._post_already_claimed("p-34")
+
+
+async def test_a_failing_removal_does_not_break_the_check_mark(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    class _BrokenRemoval(_Chat):
+        async def remove_reaction(self, post_id: str, emoji_name: str) -> None:
+            raise RuntimeError("mm down")
+
+    chat = _BrokenRemoval()
+    event = _post("p-35", "@aida заведи задачу")
+    chat.posts["p-35"] = event
+    listener = _listener(chat=chat, session_factory=session_factory, intake=_IntakeStub())
+
+    await listener._dispatch(event)
+
+    assert ("p-35", _PROCESSED_REACTION) in chat.added_reactions
+    assert await listener._post_already_claimed("p-35")

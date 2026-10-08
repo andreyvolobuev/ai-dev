@@ -95,6 +95,16 @@ class ChatPort(ABC):
         thread reply it has already handled.
         """
 
+    async def remove_reaction(  # noqa: B027 - intentionally non-abstract, see below
+        self, post_id: str, emoji_name: str,
+    ) -> None:
+        """Remove the bot's own emoji reaction from a post.
+
+        Deliberately NOT abstract: many test fakes subclass ``ChatPort`` and
+        an abstract method would make every one of them uninstantiable.
+        The default does nothing.
+        """
+
     @abstractmethod
     async def get_post(self, post_id: str) -> ChatMessage | None:
         """Fetch a single post by id, including its reactions."""

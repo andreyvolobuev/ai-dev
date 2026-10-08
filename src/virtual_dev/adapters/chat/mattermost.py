@@ -457,6 +457,21 @@ class MattermostChat(ChatPort):
 
         await asyncio.to_thread(_run)
 
+    async def remove_reaction(self, post_id: str, emoji_name: str) -> None:
+        """Take the bot's own emoji reaction off a post (failures are logged)."""
+        def _run() -> None:
+            self._ensure_login()
+            bot_id = self._bot_user_id()
+            try:
+                self._driver.reactions.delete_reaction(bot_id, post_id, emoji_name)
+            except Exception as exc:
+                logger.warning(
+                    "Mattermost: remove_reaction {} on post {} failed: {}",
+                    emoji_name, post_id, exc,
+                )
+
+        await asyncio.to_thread(_run)
+
     async def read_channel_since(
         self, channel_id: str, since: datetime,
     ) -> list[ChatMessage]:

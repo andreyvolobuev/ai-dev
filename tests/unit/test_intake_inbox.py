@@ -186,10 +186,7 @@ def _ask(text: str = "@aida заведи задачу", *, post_id: str = "p-1",
 
 def _cfg(*, enabled: bool = True) -> AppConfig:
     templates = MmTemplatesCfg(
-        intake_created=(
-            "Завела [{key}]({url}) — «{summary}». "
-            "Исполнитель: {assignee}, спринт: {sprint}.{warnings_block}"
-        ),
+        intake_created="Завела [{key}]({url}){warnings_block}",
         intake_updated="Готово: {changes}",
         intake_failed="Завести задачу в Jira не вышло: {reason}.",
         intake_busy_fallback="Сейчас занята, отвлечься не могу.",
@@ -282,9 +279,7 @@ async def test_create_files_an_unassigned_prefixed_ticket_into_the_queue_sprint(
     assert channel == "chan-1"
     assert root == "p-1"          # a post outside a thread becomes the root
     assert "DM-4821" in text
-    assert "[SUPPORT] Собрать жёлтые карточки по Грузии" in text
-    assert "Исполнитель: не назначен" in text
-    assert "DM. Распределительная пещера" in text
+    assert "Собрать жёлтые" not in text  # the summary lives in the ticket
 
 
 async def test_requester_goes_into_the_customer_field_not_the_description(
@@ -444,8 +439,7 @@ async def test_ambiguous_named_assignee_leaves_the_ticket_unassigned(
     ).handle(_ask())
 
     assert tracker.specs[0].assignee is None
-    assert "не поняла, кого назначить" in chat.sent[0][1]
-    assert "Исполнитель: не назначен" in chat.sent[0][1]
+    assert "не поняла, кого назначить" in chat.sent[0][1].lower()
 
 
 async def test_sprint_warning_from_tracker_reaches_the_reply(
@@ -465,7 +459,45 @@ async def test_sprint_warning_from_tracker_reaches_the_reply(
         session_factory=session_factory,
     ).handle(_ask())
 
-    assert "нужный спринт не нашла" in chat.sent[0][1]
+    # One line: the link, then the warning as a short second sentence.
+    assert chat.sent[0][1] == (
+        "Завела [DM-4822](https://jira.example/browse/DM-4822). Нужный спринт не нашла."
+    )
+    assert "\n" not in chat.sent[0][1]
+
+
+async def test_created_reply_is_just_the_link(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _FakeChat(users={"u1": _user()})
+    tracker = _FakeTracker()
+    await _inbox(
+        agent=_FakeAgent([_create_decision()]), tracker=tracker, chat=chat,
+        session_factory=session_factory,
+    ).handle(_ask())
+
+    assert chat.sent[0][1] == "Завела [DM-4821](https://jira.example/browse/DM-4821)"
+
+
+async def test_created_reply_survives_a_template_using_every_old_placeholder(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An operator may override notifications.yaml with the old, verbose copy."""
+    cfg = _cfg()
+    cfg.notifications.mattermost = cfg.notifications.mattermost.model_copy(update={
+        "intake_created": (
+            "Завела [{key}]({url}) — «{summary}». "
+            "Исполнитель: {assignee}, спринт: {sprint}.{warnings_block}"
+        ),
+    })
+    chat = _FakeChat(users={"u1": _user()})
+    outcome = await _inbox(
+        agent=_FakeAgent([_create_decision()]), tracker=_FakeTracker(), chat=chat,
+        session_factory=session_factory, config=cfg,
+    ).handle(_ask())
+
+    assert outcome.action == "created"
+    assert "Исполнитель: не назначен" in chat.sent[0][1]
 
 
 async def test_jira_failure_reports_and_releases_the_claim(
@@ -722,7 +754,7 @@ async def test_email_lookup_failure_still_creates_the_ticket(
 
     assert outcome.action == "created"
     assert tracker.specs[0].assignee is None
-    assert "не поняла, кого назначить" in chat.sent[0][1]
+    assert "не поняла, кого назначить" in chat.sent[0][1].lower()
 
 
 # --------------------- sprint: только настоящий bool ---------------------
