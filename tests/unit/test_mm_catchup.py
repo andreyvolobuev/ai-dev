@@ -59,18 +59,22 @@ class _CatchupChat(ChatPort):
         self._subscribe_events = subscribe_events or []
         self._subscribe_raises_remaining = subscribe_raises
         self.reactions: dict[str, list[str]] = {}
+        self.sent: list[tuple[str, str]] = []
+        self.threads: dict[str, list[ChatMessage]] = {}
         self.read_channel_calls: list[tuple[str, datetime]] = []
         self.subscribe_calls = 0
 
     async def read_thread(self, thread_root_id: str) -> Sequence[ChatMessage]:
-        return []
+        return self.threads.get(thread_root_id, [])
 
     async def send_direct(self, user_id: str, text: str) -> ChatMessage:
+        self.sent.append((user_id, text))
         return _bot_post(user_id=user_id, text=text)
 
     async def send_to_channel(
         self, channel_id: str, text: str, thread_root_id: str | None = None,
     ) -> ChatMessage:
+        self.sent.append((channel_id, text))
         return _bot_post(channel_id=channel_id, text=text, thread_root_id=thread_root_id)
 
     async def find_user_by_email(self, email: str) -> ChatUser | None:
@@ -412,13 +416,72 @@ def _lead_config() -> AppConfig:
     return cfg
 
 
-def _reset_post(post_id: str, *, hours_ago: float = 1.0) -> ChatMessage:
+def _reset_post(
+    post_id: str, *, hours_ago: float = 1.0, text: str = "/reset DM-1",
+) -> ChatMessage:
     return ChatMessage(
         id=post_id, channel_id="dm-uid-lead", author_id="uid-lead",
-        text="/reset DM-1",
+        text=text,
         timestamp=datetime.now(timezone.utc) - timedelta(hours=hours_ago),
         trusted=False,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Mattermost's Jira integration rewrites a typed key into a markdown
+        # link - this exact string came from the live MM API after a
+        # lead's /reset silently did nothing.
+        "/reset [DM-1](https://jira.2gis.ru/browse/DM-1)",
+        # A pasted browse URL, same intent.
+        "/reset https://jira.2gis.ru/browse/DM-1",
+        # Lower case and a stray leading space: both seen in real posts.
+        " /reset dm-1",
+    ],
+)
+async def test_reset_accepts_a_linked_ticket_key(
+    session_factory: async_sessionmaker[AsyncSession], text: str,
+) -> None:
+    """The lead sees a ticket key and types it; what reaches us may be a
+    markdown link or a URL. Treating that literally made /reset answer
+    "not found" while the ticket sat right there in the dashboard."""
+    task_row = await _seed_task_awaiting(session_factory)
+    chat = _CatchupChat(
+        catchup_posts={"dm-uid-lead": [_reset_post("cmd-link", text=text)]},
+    )
+    listener = _listener(
+        session_factory, chat, _make_inbox(session_factory, chat),
+        config=_lead_config(),
+    )
+
+    await listener.catch_up()
+
+    async with session_scope(session_factory) as session:
+        assert await session.get(TaskRow, task_row.id) is None
+
+
+@pytest.mark.asyncio
+async def test_reset_without_a_ticket_key_explains_the_format(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Nothing key-shaped in the argument: answer with the format instead of
+    hunting the database for a ticket called "вчерашнюю"."""
+    task_row = await _seed_task_awaiting(session_factory)
+    chat = _CatchupChat(catchup_posts={"dm-uid-lead": [
+        _reset_post("cmd-junk", text="/reset вчерашнюю задачу"),
+    ]})
+    listener = _listener(
+        session_factory, chat, _make_inbox(session_factory, chat),
+        config=_lead_config(),
+    )
+
+    await listener.catch_up()
+
+    async with session_scope(session_factory) as session:
+        assert await session.get(TaskRow, task_row.id) is not None
+    assert any("Формат:" in text for _, text in chat.sent)
 
 
 @pytest.mark.asyncio
@@ -606,3 +669,100 @@ async def test_catchup_replays_a_missed_intake_mention(
 
     assert total == 1
     assert [c for c, _since in chat.read_channel_calls] == ["chan-intake"]
+
+
+def _thread_root(text: str, *, trusted: bool) -> ChatMessage:
+    return ChatMessage(
+        id="root-fail", channel_id="dm-uid-lead",
+        author_id="bot" if trusted else "uid-someone", text=text,
+        timestamp=datetime.now(timezone.utc) - timedelta(hours=2),
+        trusted=trusted,
+    )
+
+
+def _reset_reply(post_id: str, text: str = "/reset") -> ChatMessage:
+    return ChatMessage(
+        id=post_id, channel_id="dm-uid-lead", author_id="uid-lead", text=text,
+        timestamp=datetime.now(timezone.utc) - timedelta(hours=1),
+        thread_root_id="root-fail", trusted=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_bare_reset_in_a_thread_takes_the_ticket_from_the_bot_post(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The lead answers /reset right under the bot's own failure post for
+    DM-1. There is no ambiguity there about which ticket is meant, so
+    demanding the key again is make-work."""
+    task_row = await _seed_task_awaiting(session_factory)
+    chat = _CatchupChat(catchup_posts={"dm-uid-lead": [_reset_reply("cmd-thread")]})
+    chat.threads["root-fail"] = [
+        # Verbatim shape of the bot's real failure post (ruff flags the
+        # Cyrillic; changing it would stop the fixture resembling prod).
+        _thread_root(
+            "Не смогла доделать DM-1: git push failed",  # noqa: RUF001
+            trusted=True,
+        ),
+    ]
+    listener = _listener(
+        session_factory, chat, _make_inbox(session_factory, chat),
+        config=_lead_config(),
+    )
+
+    await listener.catch_up()
+
+    async with session_scope(session_factory) as session:
+        assert await session.get(TaskRow, task_row.id) is None
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_key_wins_over_the_thread(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A key typed in the command is an instruction, not a hint — it must not
+    be overridden by whatever ticket the surrounding thread is about."""
+    task_row = await _seed_task_awaiting(session_factory)
+    chat = _CatchupChat(catchup_posts={
+        "dm-uid-lead": [_reset_reply("cmd-explicit", text="/reset DM-999")],
+    })
+    chat.threads["root-fail"] = [
+        # Verbatim shape of the bot's real failure post (ruff flags the
+        # Cyrillic; changing it would stop the fixture resembling prod).
+        _thread_root(
+            "Не смогла доделать DM-1: git push failed",  # noqa: RUF001
+            trusted=True,
+        ),
+    ]
+    listener = _listener(
+        session_factory, chat, _make_inbox(session_factory, chat),
+        config=_lead_config(),
+    )
+
+    await listener.catch_up()
+
+    async with session_scope(session_factory) as session:
+        assert await session.get(TaskRow, task_row.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_key_only_a_human_mentioned_does_not_aim_the_reset(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """/reset wipes state. Only the bot's own posts may point it at a ticket —
+    a key someone mentioned in passing must not become a target."""
+    task_row = await _seed_task_awaiting(session_factory)
+    chat = _CatchupChat(catchup_posts={"dm-uid-lead": [_reset_reply("cmd-human")]})
+    chat.threads["root-fail"] = [
+        _thread_root("а что там с DM-1?", trusted=False),  # noqa: RUF001
+    ]
+    listener = _listener(
+        session_factory, chat, _make_inbox(session_factory, chat),
+        config=_lead_config(),
+    )
+
+    await listener.catch_up()
+
+    async with session_scope(session_factory) as session:
+        assert await session.get(TaskRow, task_row.id) is not None
+    assert any("Формат:" in text for _, text in chat.sent)

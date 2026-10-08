@@ -63,6 +63,19 @@ from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
 
 _PROCESSED_REACTION = "white_check_mark"
+
+# A ticket key the way a human actually sends it. Typing "DM-3548" in
+# Mattermost yields "[DM-3548](https://jira.../browse/DM-3548)" once the Jira
+# integration rewrites it, and a pasted link arrives as the bare URL. Taking
+# the argument literally made /reset answer "not found" for a ticket sitting
+# in plain sight on the dashboard.
+_TICKET_KEY_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*-\d+)\b")
+
+
+def _extract_ticket_key(argument: str) -> str | None:
+    """First ticket-shaped key in the argument, upper-cased, or None."""
+    match = _TICKET_KEY_RE.search(argument or "")
+    return match.group(1).upper() if match else None
 # Transient "I heard you" marker: set once the post is claimed, removed on every
 # exit path. Purely cosmetic - the check mark and the DB claim are the real markers.
 _WORKING_REACTION = "loading"
@@ -1155,14 +1168,17 @@ class MmThreadListener:
             return
 
         tokens = (event.text or "").strip().split()
-        flags = {t.lower() for t in tokens[2:]}
-        if len(tokens) < 2 or tokens[1].startswith("--"):
+        flags = {t.lower() for t in tokens[1:] if t.startswith("--")}
+        argument = " ".join(t for t in tokens[1:] if not t.startswith("--"))
+        # A key typed in the command is an instruction and always wins; only
+        # when there is none do we read the thread the lead answered in.
+        ticket = _extract_ticket_key(argument) or await self._ticket_from_thread(event)
+        if ticket is None:
             await self._reply_in_dm(
                 event, "Формат: `/reset DM-1234` (опционально `--with-mr` — "
                        "закрыть открытый MR бота и удалить его ветку в GitLab)",
             )
             return
-        ticket = tokens[1].strip().upper()
         with_mr = "--with-mr" in flags
 
         # Snapshot the bot's open MRs BEFORE the wipe — the reset deletes
@@ -1212,6 +1228,49 @@ class MmThreadListener:
             f"{mr_report} "
             f"Возьму заново, когда тикет вернётся в «To Do».",
         )
+
+    async def _ticket_from_thread(self, event: ChatMessage) -> str | None:
+        """Ticket the thread is about, read from the bot's own posts in it.
+
+        The lead types /reset as a reply under the bot's own "could not
+        finish DM-3548" post: the bot opened that thread about exactly one
+        ticket, so making the human repeat the key is make-work. Only
+        trusted (bot-authored) posts are
+        read: /reset wipes state, and a key someone mentioned in passing must
+        never aim it. The thread root is preferred; otherwise the bot's posts
+        must agree on a single key.
+        """
+        root_id = event.thread_root_id
+        if not root_id or self._chat is None:
+            return None
+        try:
+            thread = list(await self._chat.read_thread(root_id))
+        except Exception:
+            logger.warning(
+                "MmThreadListener: could not read thread {} for /reset", root_id,
+            )
+            return None
+
+        for message in thread:
+            if message.id == root_id and message.trusted:
+                if key := _extract_ticket_key(message.text):
+                    return key
+                break
+
+        keys: list[str] = []
+        for message in thread:
+            if not message.trusted:
+                continue
+            if (key := _extract_ticket_key(message.text)) and key not in keys:
+                keys.append(key)
+        if len(keys) == 1:
+            return keys[0]
+        if len(keys) > 1:
+            logger.info(
+                "MmThreadListener: /reset in thread {} mentions {} tickets "
+                "({}) — asking the lead to name one", root_id, len(keys), keys,
+            )
+        return None
 
     async def _close_reset_mrs(
         self, ticket: str, open_mrs: list[tuple[str, int, str]],
