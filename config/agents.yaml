@@ -15,7 +15,12 @@
 # спама в MM каналах (Phase 3).
 
 models:
-  default: "claude-opus-4-8"
+  # ВАЖНО: шлюз проверяет версию Claude Code, который SDK несёт внутри пакета
+  # (claude_agent_sdk/_bundled/claude), а не ту, что стоит в системе.
+  # claude-fable-5-1 требует 2.1.251+ → claude-agent-sdk>=0.2.164 (везёт 2.1.292).
+  # Откат SDK ниже этой версии вернёт 400 claude_code_version_too_old.
+  default: "claude-fable-5-1"
+  # default: "claude-opus-4-8"
   # default: "claude-sonnet-4-6"
   lightweight: "claude-haiku-4-5-20251001"
 
