@@ -200,7 +200,23 @@ class JiraTaskTracker(TaskTrackerPort):
                 fields["labels"] = list(spec.labels)
             if spec.assignee:
                 fields["assignee"] = {"name": spec.assignee}
-            created = self._client.create_issue(fields=fields)
+            try:
+                created = self._client.create_issue(fields=fields)
+            except Exception:
+                # Re-raise the ORIGINAL exception: the intake runner picks
+                # the human reply from its HTTP status. What we add is the
+                # list of types the project accepts — Jira answers a wrong
+                # type with "The issue type selected is invalid" and never
+                # says what it would have taken.
+                valid = _valid_issue_type_names(self._client, spec.project)
+                logger.error(
+                    "Jira: create in {} rejected with issuetype {!r}; "
+                    "project accepts: {}",
+                    spec.project,
+                    spec.issue_type,
+                    ", ".join(repr(name) for name in valid) or "(lookup failed)",
+                )
+                raise
             if not isinstance(created, dict) or not created.get("key"):
                 _raise_for_non_dict_response(created)
             key = str(cast(dict[str, Any], created)["key"])
@@ -625,6 +641,30 @@ def _pick_tracker_username(entries: Any, email: str) -> str | None:
     if len(candidates) == 1:
         return str(candidates[0].get("name") or "") or None
     return None
+
+
+def _valid_issue_type_names(client: Jira, project: str) -> list[str]:
+    """Issue-type names the project accepts on the create screen.
+
+    Empty list when the lookup fails: this is diagnostics on the failure
+    path and must never replace the original Jira error. Names are often
+    localised — project DM calls them "Zadacha" / "Oshibka" in Cyrillic —
+    so they cannot be guessed in code, only asked of the project.
+    """
+    try:
+        raw = client.get_project(project)
+    except Exception:
+        logger.debug(
+            "Jira: project lookup for {} failed", project, exc_info=True,
+        )
+        return []
+    if not isinstance(raw, dict):
+        return []
+    names: list[str] = []
+    for item in raw.get("issueTypes") or []:
+        if isinstance(item, dict) and item.get("name"):
+            names.append(str(item["name"]))
+    return names
 
 
 def _install_retry_adapter(session: Any) -> None:

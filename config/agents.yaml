@@ -107,7 +107,9 @@ pipeline_policy:
 task_intake:
   enabled: true
   project: "DM"
-  issue_type: "Task"
+  # Имена типов в DM локализованы: Усовершенствование, Задача, Подзадача,
+  # Новая функциональность, Ошибка, Epic. Типа "Task" в проекте нет.
+  issue_type: "Задача"
   labels: ["dmp-sup"]
   add_to_active_sprint: true
 

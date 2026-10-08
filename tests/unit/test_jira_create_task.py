@@ -10,11 +10,13 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+import requests
 
 from virtual_dev.adapters.task_tracker.jira import (
     JiraTaskTracker,
     _parse_sprint,
     _pick_tracker_username,
+    _valid_issue_type_names,
 )
 from virtual_dev.domain.models.task import NewTaskSpec, TaskPatch
 
@@ -78,12 +80,23 @@ class _FakeJiraClient:
         sprint_field_id: str = "customfield_10005",
         user_entries: list[dict[str, Any]] | None = None,
         sprint_add_raises: bool = False,
+        create_raises: Exception | None = None,
+        project_issue_types: list[str] | None = None,
+        project_raises: bool = False,
     ) -> None:
         self._created_key = created_key
         self._sprint_issues = sprint_issues
         self._sprint_field_id = sprint_field_id
         self._user_entries = user_entries or []
         self._sprint_add_raises = sprint_add_raises
+        self._create_raises = create_raises
+        self._project_issue_types = (
+            project_issue_types
+            if project_issue_types is not None
+            else ["Усовершенствование", "Задача", "Ошибка"]
+        )
+        self._project_raises = project_raises
+        self.project_calls: list[str] = []
         self.created_fields: dict[str, Any] | None = None
         self.sprint_calls: list[tuple[int, list[str]]] = []
         self.updated: list[tuple[str, dict[str, Any]]] = []
@@ -91,7 +104,18 @@ class _FakeJiraClient:
 
     def create_issue(self, fields: dict[str, Any]) -> dict[str, Any]:
         self.created_fields = fields
+        if self._create_raises is not None:
+            raise self._create_raises
         return {"key": self._created_key}
+
+    def get_project(self, key: str) -> dict[str, Any]:
+        self.project_calls.append(key)
+        if self._project_raises:
+            raise RuntimeError("project endpoint down")
+        return {
+            "key": key,
+            "issueTypes": [{"name": name} for name in self._project_issue_types],
+        }
 
     def get_all_fields(self) -> list[dict[str, Any]]:
         return [
@@ -248,3 +272,35 @@ async def test_find_tracker_user_by_email_not_found() -> None:
 async def test_find_tracker_user_by_email_ignores_blank(email: str) -> None:
     client = _FakeJiraClient(user_entries=[{"name": "x", "emailAddress": "x@2gis.ru"}])
     assert await _tracker(client).find_tracker_user_by_email(email) is None
+
+
+def test_valid_issue_type_names_reads_them_from_the_project() -> None:
+    client = _FakeJiraClient(project_issue_types=["Задача", "Ошибка"])
+    assert _valid_issue_type_names(client, "DM") == ["Задача", "Ошибка"]
+
+
+def test_valid_issue_type_names_is_silent_when_the_lookup_fails() -> None:
+    """Diagnostics on the failure path must never replace the original
+    Jira error."""
+    client = _FakeJiraClient(project_raises=True)
+    assert _valid_issue_type_names(client, "DM") == []
+
+
+async def test_create_task_looks_up_valid_types_and_reraises_the_original() -> None:
+    """Jira answers "The issue type selected is invalid" without naming the
+    types it would accept — exactly how this feature failed in production,
+    where project DM names its types in Russian. The adapter must pull that
+    list into the log yet re-raise the ORIGINAL exception: the runner picks
+    the human reply from its HTTP status.
+    """
+    response = requests.Response()
+    response.status_code = 400
+    original = requests.HTTPError("The issue type selected is invalid.", response=response)
+    client = _FakeJiraClient(create_raises=original)
+
+    with pytest.raises(requests.HTTPError) as caught:
+        await _tracker(client).create_task(_spec())
+
+    assert caught.value is original
+    assert caught.value.response is response
+    assert client.project_calls == ["DM"]

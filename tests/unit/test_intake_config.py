@@ -20,7 +20,10 @@ def test_shipped_config_enables_intake_with_dmp_sup_label() -> None:
 
     assert intake.enabled is True
     assert intake.project == "DM"
-    assert intake.issue_type == "Task"
+    # Project DM names its issue types in Russian and has no type called
+    # "Task" — that is what the intake hit in production, with Jira
+    # answering "The issue type selected is invalid".
+    assert intake.issue_type == "Задача"
     assert intake.labels == ["dmp-sup"]
     assert intake.add_to_active_sprint is True
 
