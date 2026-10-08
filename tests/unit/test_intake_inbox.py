@@ -42,6 +42,7 @@ from virtual_dev.infrastructure.db import IntakeRequestRow
 from virtual_dev.runtime.workers.intake_inbox import (
     TaskIntakeInbox,
     _public_cause,
+    _with_summary_prefix,
 )
 
 # ---------------------------- fakes ----------------------------
@@ -110,6 +111,7 @@ class _FakeTracker(TaskTrackerPort):
         self._create_raises = create_raises
         self._find_by_email_raises = find_by_email_raises
         self.specs: list[NewTaskSpec] = []
+        self.email_lookups: list[str] = []
         self.patches: list[tuple[str, TaskPatch]] = []
 
     async def fetch_tasks(self, jql: str, limit: int = 50) -> Sequence[Task]:
@@ -134,13 +136,14 @@ class _FakeTracker(TaskTrackerPort):
         self.specs.append(spec)
         return self._created or CreatedTask(
             key="DM-4821", url="https://jira.example/browse/DM-4821",
-            assignee=spec.assignee, sprint_name="Sprint 42",
+            assignee=spec.assignee, sprint_name=spec.sprint_name,
         )
 
     async def update_task(self, external_id: str, patch: TaskPatch) -> None:
         self.patches.append((external_id, patch))
 
     async def find_tracker_user_by_email(self, email: str) -> str | None:
+        self.email_lookups.append(email)
         if self._find_by_email_raises is not None:
             raise self._find_by_email_raises
         return self._username_by_email.get(email)
@@ -190,10 +193,11 @@ def _cfg(*, enabled: bool = True) -> AppConfig:
         intake_updated="Готово: {changes}",
         intake_failed="Завести задачу в Jira не вышло: {reason}.",
         intake_busy_fallback="Сейчас занята, отвлечься не могу.",
-        intake_warning_no_active_sprint="активного спринта не нашла",
+        intake_warning_sprint_not_found="нужный спринт не нашла",
         intake_warning_sprint_failed="в спринт положить не получилось",
-        intake_warning_assignee_not_found="не нашла тебя в Jira по почте",
-        intake_warning_assignee_hint_unresolved="не поняла, кого назначить",
+        intake_warning_assignee_hint_unresolved=(
+            "не поняла, кого назначить, оставила без исполнителя"
+        ),
         intake_warning_assignee_hint_unresolved_update=(
             "не поняла, кого назначить — исполнителя не тронула"
         ),
@@ -202,7 +206,9 @@ def _cfg(*, enabled: bool = True) -> AppConfig:
         repositories=[],
         agents=AgentsCfg(task_intake=TaskIntakeCfg(
             enabled=enabled, project="DM", issue_type="Task",
-            labels=["dmp-sup"], add_to_active_sprint=True,
+            labels=["dmp-sup"], summary_prefix="[SUPPORT] ",
+            components=["DM-Common"], sprint_name="DM. Распределительная пещера",
+            customer_field="customfield_32545",
         )),
         mappings=MappingsCfg(),
         notifications=NotificationsCfg(mattermost=templates),
@@ -247,7 +253,7 @@ def _user(username: str = "ivanov", email: str = "ivan.ivanov@2gis.ru") -> ChatU
 # ---------------------------- tests ----------------------------
 
 
-async def test_create_puts_label_sprint_and_requester_as_assignee(
+async def test_create_files_an_unassigned_prefixed_ticket_into_the_queue_sprint(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     chat = _FakeChat(users={"u1": _user()})
@@ -262,18 +268,102 @@ async def test_create_puts_label_sprint_and_requester_as_assignee(
     assert outcome.issue_key == "DM-4821"
     spec = tracker.specs[0]
     assert spec.labels == ["dmp-sup"]
-    assert spec.add_to_active_sprint is True
-    assert spec.assignee == "ivan.ivanov"
+    assert spec.components == ["DM-Common"]
+    assert spec.sprint_name == "DM. Распределительная пещера"
+    assert spec.summary == "[SUPPORT] Собрать жёлтые карточки по Грузии"
+    # The requester is never auto-assigned, and never even looked up.
+    assert spec.assignee is None
+    assert tracker.email_lookups == []
     assert spec.project == "DM"
-    # Ссылка на тред-источник обязана быть в описании: без неё через месяц
-    # непонятно, откуда задача взялась.
+    # The source link is mandatory: without it nobody knows later where
+    # the task came from.
     assert "https://mm.example/dm/pl/p-1" in spec.description
-    # Ответ в тред несёт настоящий ключ и ссылку.
     channel, text, root = chat.sent[0]
     assert channel == "chan-1"
-    assert root == "p-1"          # пост без треда сам становится корнем
+    assert root == "p-1"          # a post outside a thread becomes the root
     assert "DM-4821" in text
-    assert "Sprint 42" in text
+    assert "[SUPPORT] Собрать жёлтые карточки по Грузии" in text
+    assert "Исполнитель: не назначен" in text
+    assert "DM. Распределительная пещера" in text
+
+
+async def test_requester_goes_into_the_customer_field_not_the_description(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chat = _FakeChat(users={"u1": _user()})
+    tracker = _FakeTracker()
+    await _inbox(
+        agent=_FakeAgent([_create_decision()]), tracker=tracker, chat=chat,
+        session_factory=session_factory,
+    ).handle(_ask())
+
+    spec = tracker.specs[0]
+    assert spec.customer == "@ivanov"
+    assert "Просьба от" not in spec.description
+    assert "@ivanov" not in spec.description
+    assert "Обсуждение: https://mm.example/dm/pl/p-1" in spec.description
+    assert spec.description.rstrip().endswith(
+        "Задачу завела Аида Нейронова по просьбе в Mattermost."
+    )
+
+
+async def test_customer_falls_back_to_the_mm_user_id_when_the_handle_is_unknown(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tracker = _FakeTracker()
+    await _inbox(
+        agent=_FakeAgent([_create_decision()]), tracker=tracker,
+        chat=_FakeChat(users={}), session_factory=session_factory,
+    ).handle(_ask())
+
+    assert tracker.specs[0].customer == "u1"
+
+
+async def test_summary_prefix_is_applied_once_when_the_model_already_added_it(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tracker = _FakeTracker()
+    await _inbox(
+        agent=_FakeAgent([_create_decision(summary="[SUPPORT] Повторное ревью MR DM-2740")]),
+        tracker=tracker, chat=_FakeChat(users={"u1": _user()}),
+        session_factory=session_factory,
+    ).handle(_ask())
+
+    assert tracker.specs[0].summary == "[SUPPORT] Повторное ревью MR DM-2740"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("Повторное ревью MR DM-2740", "[SUPPORT] Повторное ревью MR DM-2740"),
+        ("[SUPPORT] Повторное ревью", "[SUPPORT] Повторное ревью"),
+        ("[SUPPORT]Повторное ревью", "[SUPPORT] Повторное ревью"),
+        ("[SUPPORT] [SUPPORT] Повторное ревью", "[SUPPORT] Повторное ревью"),
+        ("  [support]  Повторное ревью ", "[SUPPORT] Повторное ревью"),
+        ("", ""),
+    ],
+)
+def test_with_summary_prefix_is_idempotent(raw: str, expected: str) -> None:
+    assert _with_summary_prefix(raw, "[SUPPORT] ") == expected
+
+
+def test_with_summary_prefix_empty_prefix_leaves_the_summary_alone() -> None:
+    assert _with_summary_prefix("Что-то сделать", "") == "Что-то сделать"
+
+
+async def test_empty_sprint_name_in_config_files_into_no_sprint(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    config = _cfg()
+    config.agents.task_intake.sprint_name = ""
+    tracker = _FakeTracker()
+    await _inbox(
+        agent=_FakeAgent([_create_decision()]), tracker=tracker,
+        chat=_FakeChat(users={"u1": _user()}), session_factory=session_factory,
+        config=config,
+    ).handle(_ask())
+
+    assert tracker.specs[0].sprint_name is None
 
 
 async def test_created_ticket_is_recorded_for_later_edits(
@@ -314,21 +404,6 @@ async def test_same_post_twice_creates_one_ticket(
     assert len(tracker.specs) == 1
 
 
-async def test_unknown_jira_user_still_creates_and_says_so(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    chat = _FakeChat(users={"u1": _user(email="someone.else@2gis.ru")})
-    tracker = _FakeTracker(username_by_email={})
-    outcome = await _inbox(
-        agent=_FakeAgent([_create_decision()]), tracker=tracker, chat=chat,
-        session_factory=session_factory,
-    ).handle(_ask())
-
-    assert outcome.action == "created"
-    assert tracker.specs[0].assignee is None
-    assert "не нашла тебя в Jira по почте" in chat.sent[0][1]
-
-
 async def test_named_assignee_is_resolved_via_chat_search(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -343,12 +418,15 @@ async def test_named_assignee_is_resolved_via_chat_search(
     ).handle(_ask())
 
     assert tracker.specs[0].assignee == "petr.petrov"
+    # Only the named person is looked up, never the requester.
+    assert tracker.email_lookups == ["petr.petrov@2gis.ru"]
 
 
-async def test_ambiguous_named_assignee_falls_back_to_requester(
+async def test_ambiguous_named_assignee_leaves_the_ticket_unassigned(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Двое похожих — назначать наугад нельзя, но и задачу терять нельзя."""
+    """Two similar people - never guess, never assign the requester instead,
+    but do not lose the ticket either."""
     chat = _FakeChat(
         users={"u1": _user()},
         search_hits=[
@@ -365,8 +443,9 @@ async def test_ambiguous_named_assignee_falls_back_to_requester(
         tracker=tracker, chat=chat, session_factory=session_factory,
     ).handle(_ask())
 
-    assert tracker.specs[0].assignee == "ivan.ivanov"
+    assert tracker.specs[0].assignee is None
     assert "не поняла, кого назначить" in chat.sent[0][1]
+    assert "Исполнитель: не назначен" in chat.sent[0][1]
 
 
 async def test_sprint_warning_from_tracker_reaches_the_reply(
@@ -378,7 +457,7 @@ async def test_sprint_warning_from_tracker_reaches_the_reply(
         created=CreatedTask(
             key="DM-4822", url="https://jira.example/browse/DM-4822",
             assignee="ivan.ivanov", sprint_name=None,
-            warnings=["no_active_sprint"],
+            warnings=["sprint_not_found"],
         ),
     )
     await _inbox(
@@ -386,7 +465,7 @@ async def test_sprint_warning_from_tracker_reaches_the_reply(
         session_factory=session_factory,
     ).handle(_ask())
 
-    assert "активного спринта не нашла" in chat.sent[0][1]
+    assert "нужный спринт не нашла" in chat.sent[0][1]
 
 
 async def test_jira_failure_reports_and_releases_the_claim(
@@ -588,7 +667,7 @@ async def test_update_with_rename_and_ambiguous_assignee_warns_honestly(
 
     assert outcome.action == "updated"
     _key, patch = tracker.patches[0]
-    assert patch.summary == "Жёлтые карточки"
+    assert patch.summary == "[SUPPORT] Жёлтые карточки"
     assert patch.assignee is None
     assert "исполнителя не тронула" in chat.sent[-1][1]
     assert "поставила тебя" not in chat.sent[-1][1]
@@ -629,19 +708,21 @@ async def test_redelivered_post_is_skipped_before_the_agent_runs(
 async def test_email_lookup_failure_still_creates_the_ticket(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Jira 5xx на резолве исполнителя по почте не должен блокировать
-    создание тикета — деградируем в assignee_not_found, как при пустом
-    ответе."""
-    chat = _FakeChat(users={"u1": _user()})
+    """A Jira 5xx while resolving an explicitly named person must not block
+    ticket creation - it degrades into an unassigned ticket plus a warning."""
+    chat = _FakeChat(
+        users={"u1": _user()},
+        search_hits=[ChatUser(id="u2", username="petrov", email="petr.petrov@2gis.ru")],
+    )
     tracker = _FakeTracker(find_by_email_raises=RuntimeError("Jira 500"))
     outcome = await _inbox(
-        agent=_FakeAgent([_create_decision()]), tracker=tracker, chat=chat,
-        session_factory=session_factory,
+        agent=_FakeAgent([_create_decision(assignee_hint="Пётр Петров")]),
+        tracker=tracker, chat=chat, session_factory=session_factory,
     ).handle(_ask())
 
     assert outcome.action == "created"
     assert tracker.specs[0].assignee is None
-    assert "не нашла тебя в Jira по почте" in chat.sent[0][1]
+    assert "не поняла, кого назначить" in chat.sent[0][1]
 
 
 # --------------------- sprint: только настоящий bool ---------------------
@@ -725,6 +806,7 @@ async def test_real_sprint_true_is_applied(
     assert outcome.action == "updated"
     _key, patch = tracker.patches[0]
     assert patch.sprint is True
+    assert patch.sprint_name == "DM. Распределительная пещера"
     assert "вернула в спринт" in chat.sent[-1][1]
 
 
@@ -759,7 +841,7 @@ async def test_description_patch_keeps_the_source_link_footer(
     assert patch.description is not None
     assert "по Армении" in patch.description
     assert "https://mm.example/dm/pl/p-1" in patch.description
-    assert "Просьба от: @ivanov" in patch.description
+    assert "Просьба от" not in patch.description
 
 
 # --------------------- отказ «занята»: кап на прозу модели -------------
@@ -870,3 +952,40 @@ def test_public_cause_maps_exceptions_to_short_human_text(
     exc: Exception, expected: str,
 ) -> None:
     assert _public_cause(exc) == expected
+
+
+@pytest.mark.parametrize("new_summary", ["Жёлтые карточки", "[SUPPORT] Жёлтые карточки"])
+async def test_summary_edit_is_prefixed_once(
+    session_factory: async_sessionmaker[AsyncSession], new_summary: str,
+) -> None:
+    chat, tracker, outcome = await _create_then_update(
+        session_factory, {"summary": new_summary},
+    )
+
+    assert outcome.action == "updated"
+    _key, patch = tracker.patches[0]
+    assert patch.summary == "[SUPPORT] Жёлтые карточки"
+    assert "[SUPPORT] [SUPPORT]" not in chat.sent[-1][1]
+
+
+async def test_sprint_true_without_a_configured_queue_is_ignored(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """With no queue sprint configured there is nothing to return to."""
+    config = _cfg()
+    config.agents.task_intake.sprint_name = ""
+    chat = _FakeChat(users={"u1": _user()})
+    tracker = _FakeTracker()
+    inbox = _inbox(
+        agent=_FakeAgent([
+            _create_decision(),
+            IntakeDecision(action=IntakeAction.UPDATE, changes={"sprint": True},
+                           reasoning="правка"),
+        ]),
+        tracker=tracker, chat=chat, session_factory=session_factory, config=config,
+    )
+    await inbox.handle(_ask(post_id="p-1"))
+    outcome = await inbox.handle(_ask("@aida верни", post_id="p-2", root="p-1"))
+
+    assert outcome.action == "failed"
+    assert tracker.patches == []

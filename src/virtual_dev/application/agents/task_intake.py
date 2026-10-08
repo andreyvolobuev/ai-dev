@@ -9,7 +9,7 @@ structured decision:
     action ∈ {"create", "update", "busy"}
     summary / description   — for create
     changes                 — for update (deltas)
-    assignee_hint           — empty means "the person who asked"
+    assignee_hint           — empty means "nobody is named": the ticket stays unassigned
     reply_text              — only for busy
     reasoning               — for the log / dashboard
 

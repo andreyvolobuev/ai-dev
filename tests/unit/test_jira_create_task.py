@@ -1,9 +1,4 @@
-"""Jira-адаптер: создание задачи, активный спринт, резолв исполнителя.
-
-Форматы sprint-поля сняты из реальной Jira Server: современный отдаёт
-список словарей, старый — список строк-тострингов greenhopper. Каждый
-формат встречается в проде, поэтому здесь закреплены и тот, и другой.
-"""
+"""Jira adapter: task creation, sprint resolved by name, assignee lookup."""
 
 from __future__ import annotations
 
@@ -14,38 +9,10 @@ import requests
 
 from virtual_dev.adapters.task_tracker.jira import (
     JiraTaskTracker,
-    _parse_sprint,
     _pick_tracker_username,
     _valid_issue_type_names,
 )
 from virtual_dev.domain.models.task import NewTaskSpec, TaskPatch
-
-
-def test_parse_sprint_modern_dicts_prefers_active() -> None:
-    raw = [
-        {"id": 100, "state": "closed", "name": "Sprint 41"},
-        {"id": 101, "state": "active", "name": "Sprint 42"},
-    ]
-    assert _parse_sprint(raw) == (101, "Sprint 42")
-
-
-def test_parse_sprint_legacy_greenhopper_strings() -> None:
-    raw = [
-        "com.atlassian.greenhopper.service.sprint.Sprint@1a2b["
-        "id=567,rapidViewId=89,state=ACTIVE,name=Sprint 42,startDate=...]",
-    ]
-    assert _parse_sprint(raw) == (567, "Sprint 42")
-
-
-def test_parse_sprint_no_active_falls_back_to_first_parsable() -> None:
-    raw = [{"id": 7, "state": "future", "name": "Sprint 43"}]
-    assert _parse_sprint(raw) == (7, "Sprint 43")
-
-
-def test_parse_sprint_garbage_is_none() -> None:
-    assert _parse_sprint(None) == (None, None)
-    assert _parse_sprint([]) == (None, None)
-    assert _parse_sprint(["not a sprint at all"]) == (None, None)
 
 
 def test_pick_tracker_username_exact_email_match() -> None:
@@ -76,7 +43,10 @@ class _FakeJiraClient:
         self,
         *,
         created_key: str = "DM-4821",
-        sprint_issues: list[dict[str, Any]] | None = None,
+        boards: list[dict[str, Any]] | None = None,
+        sprints_by_board: dict[int, list[dict[str, Any]]] | None = None,
+        page_size: int = 50,
+        failing_boards: set[int] | None = None,
         sprint_field_id: str = "customfield_10005",
         user_entries: list[dict[str, Any]] | None = None,
         sprint_add_raises: bool = False,
@@ -85,7 +55,10 @@ class _FakeJiraClient:
         project_raises: bool = False,
     ) -> None:
         self._created_key = created_key
-        self._sprint_issues = sprint_issues
+        self._boards = boards if boards is not None else [{"id": 803, "type": "scrum"}]
+        self._sprints_by_board = sprints_by_board or {}
+        self._page_size = page_size
+        self._failing_boards = failing_boards or set()
         self._sprint_field_id = sprint_field_id
         self._user_entries = user_entries or []
         self._sprint_add_raises = sprint_add_raises
@@ -100,7 +73,8 @@ class _FakeJiraClient:
         self.created_fields: dict[str, Any] | None = None
         self.sprint_calls: list[tuple[int, list[str]]] = []
         self.updated: list[tuple[str, dict[str, Any]]] = []
-        self.jql_queries: list[str] = []
+        self.board_calls: list[str | None] = []
+        self.sprint_list_calls: list[int] = []
 
     def create_issue(self, fields: dict[str, Any]) -> dict[str, Any]:
         self.created_fields = fields
@@ -123,9 +97,24 @@ class _FakeJiraClient:
             {"id": self._sprint_field_id, "name": "Sprint"},
         ]
 
-    def jql(self, query: str, limit: int = 50) -> dict[str, Any]:
-        self.jql_queries.append(query)
-        return {"issues": self._sprint_issues or []}
+    def _page(self, items: list[dict[str, Any]], start: int, limit: int) -> dict[str, Any]:
+        size = min(limit, self._page_size)
+        chunk = items[start:start + size]
+        return {"values": chunk, "isLast": start + size >= len(items)}
+
+    def get_all_agile_boards(
+        self, project_key: str | None = None, start: int = 0, limit: int = 50, **_: Any,
+    ) -> dict[str, Any]:
+        self.board_calls.append(project_key)
+        return self._page(self._boards, start, limit)
+
+    def get_all_sprints_from_board(
+        self, board_id: int, state: str | None = None, start: int = 0, limit: int = 50,
+    ) -> dict[str, Any]:
+        self.sprint_list_calls.append(board_id)
+        if board_id in self._failing_boards:
+            raise requests.HTTPError("The board doesn't support sprints.")
+        return self._page(self._sprints_by_board.get(board_id, []), start, limit)
 
     def add_issues_to_sprint(self, sprint_id: int, issues: list[str]) -> None:
         if self._sprint_add_raises:
@@ -148,72 +137,175 @@ def _tracker(client: _FakeJiraClient) -> JiraTaskTracker:
     return tracker
 
 
+_QUEUE = "DM. Распределительная пещера"
+
+
+def _queue_sprints() -> dict[int, list[dict[str, Any]]]:
+    return {
+        803: [
+            {"id": 3000, "name": "DM. Спринт 41", "state": "closed"},
+            {"id": 3001, "name": "DM. Спринт 42", "state": "active"},
+            {"id": 2999, "name": _QUEUE, "state": "closed"},
+            {"id": 3024, "name": _QUEUE, "state": "future"},
+        ],
+    }
+
+
 def _spec(**over: Any) -> NewTaskSpec:
     base: dict[str, Any] = {
         "project": "DM",
         "issue_type": "Task",
-        "summary": "Собрать жёлтые карточки по Грузии",
+        "summary": "[SUPPORT] Собрать жёлтые карточки по Грузии",
         "description": "Просьба из MM",
         "labels": ["dmp-sup"],
-        "assignee": "ivan.ivanov",
-        "add_to_active_sprint": True,
+        "assignee": None,
+        "components": ["DM-Common"],
+        "sprint_name": _QUEUE,
+        "customer": "@ivanov",
     }
     base.update(over)
     return NewTaskSpec(**base)
 
 
-async def test_create_task_sends_labels_assignee_and_lands_in_active_sprint() -> None:
-    client = _FakeJiraClient(
-        sprint_issues=[{"fields": {"customfield_10005": [
-            {"id": 101, "state": "active", "name": "Sprint 42"},
-        ]}}],
+def _tracker_with_customer(client: _FakeJiraClient) -> JiraTaskTracker:
+    tracker = JiraTaskTracker(
+        url="https://jira.example/", token="t", customer_field_id="customfield_32545",
     )
+    tracker._client = client  # type: ignore[assignment]
+    return tracker
+
+
+async def test_create_task_sends_components_labels_and_customer() -> None:
+    client = _FakeJiraClient(sprints_by_board=_queue_sprints())
+    await _tracker_with_customer(client).create_task(_spec())
+
+    fields = client.created_fields
+    assert fields is not None
+    assert fields["components"] == [{"name": "DM-Common"}]
+    assert fields["customfield_32545"] == "@ivanov"
+    assert fields["labels"] == ["dmp-sup"]
+    assert fields["project"] == {"key": "DM"}
+    assert fields["issuetype"] == {"name": "Task"}
+    assert "assignee" not in fields
+
+
+async def test_create_task_without_customer_field_id_does_not_set_it() -> None:
+    client = _FakeJiraClient(sprints_by_board=_queue_sprints())
+    await _tracker(client).create_task(_spec())
+
+    assert client.created_fields is not None
+    assert not [k for k in client.created_fields if k.startswith("customfield_")]
+
+
+async def test_create_task_omits_empty_customer_and_components() -> None:
+    client = _FakeJiraClient(sprints_by_board=_queue_sprints())
+    tracker = _tracker_with_customer(client)
+    await tracker.create_task(_spec(customer="", components=[]))
+
+    assert client.created_fields is not None
+    assert "customfield_32545" not in client.created_fields
+    assert "components" not in client.created_fields
+
+
+async def test_create_task_sends_assignee_when_one_is_named() -> None:
+    client = _FakeJiraClient(sprints_by_board=_queue_sprints())
+    await _tracker(client).create_task(_spec(assignee="petr.petrov"))
+
+    assert client.created_fields is not None
+    assert client.created_fields["assignee"] == {"name": "petr.petrov"}
+
+
+async def test_create_task_resolves_sprint_by_name_and_adds_the_ticket() -> None:
+    client = _FakeJiraClient(sprints_by_board=_queue_sprints())
     created = await _tracker(client).create_task(_spec())
 
     assert created.key == "DM-4821"
     assert created.url == "https://jira.example/browse/DM-4821"
-    assert created.sprint_name == "Sprint 42"
+    assert created.sprint_name == _QUEUE
     assert created.warnings == []
-    assert client.created_fields is not None
-    assert client.created_fields["labels"] == ["dmp-sup"]
-    assert client.created_fields["assignee"] == {"name": "ivan.ivanov"}
-    assert client.created_fields["project"] == {"key": "DM"}
-    assert client.created_fields["issuetype"] == {"name": "Task"}
-    assert client.sprint_calls == [(101, ["DM-4821"])]
-    assert "openSprints()" in client.jql_queries[0]
+    # The closed sprint with the same name must not win.
+    assert client.sprint_calls == [(3024, ["DM-4821"])]
+    assert client.board_calls == ["DM"]
 
 
-async def test_create_task_without_active_sprint_still_creates_and_warns() -> None:
-    client = _FakeJiraClient(sprint_issues=[])
+async def test_create_task_finds_the_sprint_on_a_later_board_and_page() -> None:
+    client = _FakeJiraClient(
+        boards=[{"id": 803, "type": "scrum"}, {"id": 1804, "type": "scrum"}],
+        sprints_by_board={
+            803: [{"id": i, "name": f"Other {i}", "state": "closed"} for i in range(5)],
+            1804: [
+                *[{"id": 100 + i, "name": f"Other {i}", "state": "future"} for i in range(4)],
+                {"id": 3024, "name": _QUEUE, "state": "future"},
+            ],
+        },
+        page_size=2,
+    )
+    created = await _tracker(client).create_task(_spec())
+
+    assert created.warnings == []
+    assert client.sprint_calls == [(3024, ["DM-4821"])]
+
+
+async def test_sprint_id_is_cached_per_process() -> None:
+    client = _FakeJiraClient(sprints_by_board=_queue_sprints())
+    tracker = _tracker(client)
+    await tracker.create_task(_spec())
+    await tracker.create_task(_spec())
+
+    assert client.sprint_calls == [(3024, ["DM-4821"]), (3024, ["DM-4821"])]
+    assert client.board_calls == ["DM"]
+    assert client.sprint_list_calls == [803]
+
+
+async def test_unresolved_sprint_is_not_cached() -> None:
+    client = _FakeJiraClient(sprints_by_board={803: []})
+    tracker = _tracker(client)
+    await tracker.create_task(_spec())
+    client._sprints_by_board = _queue_sprints()
+    created = await tracker.create_task(_spec())
+
+    assert created.warnings == []
+    assert client.sprint_calls == [(3024, ["DM-4821"])]
+
+
+async def test_create_task_with_unknown_sprint_still_creates_and_warns() -> None:
+    client = _FakeJiraClient(sprints_by_board={803: [{"id": 1, "name": "x", "state": "future"}]})
     created = await _tracker(client).create_task(_spec())
 
     assert created.key == "DM-4821"
-    assert created.warnings == ["no_active_sprint"]
+    assert created.sprint_name is None
+    assert created.warnings == ["sprint_not_found"]
+    assert client.sprint_calls == []
+
+
+async def test_create_task_with_only_a_closed_sprint_of_that_name_warns() -> None:
+    client = _FakeJiraClient(
+        sprints_by_board={803: [{"id": 2999, "name": _QUEUE, "state": "closed"}]},
+    )
+    created = await _tracker(client).create_task(_spec())
+
+    assert created.warnings == ["sprint_not_found"]
+
+
+async def test_create_task_with_empty_sprint_name_skips_sprints_entirely() -> None:
+    client = _FakeJiraClient(sprints_by_board=_queue_sprints())
+    created = await _tracker(client).create_task(_spec(sprint_name=None))
+
+    assert created.warnings == []
+    assert created.sprint_name is None
+    assert client.board_calls == []
     assert client.sprint_calls == []
 
 
 async def test_create_task_survives_sprint_api_failure() -> None:
-    """Тикет уже создан — сбой спринта не должен превращаться в
-    «не смогла завести задачу»."""
-    client = _FakeJiraClient(
-        sprint_issues=[{"fields": {"customfield_10005": [
-            {"id": 101, "state": "active", "name": "Sprint 42"},
-        ]}}],
-        sprint_add_raises=True,
-    )
+    """The ticket already exists - a sprint failure must not turn into
+    "could not file the task"."""
+    client = _FakeJiraClient(sprints_by_board=_queue_sprints(), sprint_add_raises=True)
     created = await _tracker(client).create_task(_spec())
 
     assert created.key == "DM-4821"
     assert created.sprint_name is None
     assert created.warnings == ["sprint_failed"]
-
-
-async def test_create_task_without_assignee_omits_the_field() -> None:
-    client = _FakeJiraClient(sprint_issues=[])
-    await _tracker(client).create_task(_spec(assignee=None, add_to_active_sprint=False))
-
-    assert client.created_fields is not None
-    assert "assignee" not in client.created_fields
 
 
 async def test_update_task_sets_summary_and_assignee() -> None:
@@ -235,16 +327,22 @@ async def test_update_task_removes_from_sprint() -> None:
     assert client.updated == [("DM-4821", {"customfield_10005": None})]
 
 
-async def test_update_task_adds_to_sprint_via_agile_endpoint() -> None:
-    client = _FakeJiraClient(
-        sprint_issues=[{"fields": {"customfield_10005": [
-            {"id": 101, "state": "active", "name": "Sprint 42"},
-        ]}}],
+async def test_update_task_returns_to_the_named_sprint_via_agile_endpoint() -> None:
+    client = _FakeJiraClient(sprints_by_board=_queue_sprints())
+    await _tracker(client).update_task(
+        "DM-4821", TaskPatch(sprint=True, sprint_name=_QUEUE),
     )
+
+    assert client.sprint_calls == [(3024, ["DM-4821"])]
+    assert client.updated == []
+    assert client.board_calls == ["DM"]
+
+
+async def test_update_task_sprint_true_without_a_name_does_nothing() -> None:
+    client = _FakeJiraClient(sprints_by_board=_queue_sprints())
     await _tracker(client).update_task("DM-4821", TaskPatch(sprint=True))
 
-    assert client.sprint_calls == [(101, ["DM-4821"])]
-    assert client.updated == []
+    assert client.sprint_calls == []
 
 
 async def test_update_task_empty_patch_touches_nothing() -> None:
@@ -304,3 +402,52 @@ async def test_create_task_looks_up_valid_types_and_reraises_the_original() -> N
     assert caught.value is original
     assert caught.value.response is response
     assert client.project_calls == ["DM"]
+
+
+_KANBAN_FIRST = [
+    {"id": 811, "type": "kanban"},
+    {"id": 1936, "type": "kanban"},
+    {"id": 803, "type": "scrum"},
+]
+
+
+async def test_kanban_board_listed_first_does_not_hide_the_scrum_sprint() -> None:
+    client = _FakeJiraClient(
+        boards=_KANBAN_FIRST, sprints_by_board=_queue_sprints(),
+        failing_boards={811, 1936},
+    )
+    created = await _tracker(client).create_task(_spec())
+
+    assert created.warnings == []
+    assert client.sprint_calls == [(3024, ["DM-4821"])]
+
+
+async def test_non_scrum_boards_are_not_asked_for_sprints() -> None:
+    client = _FakeJiraClient(boards=_KANBAN_FIRST, sprints_by_board=_queue_sprints())
+    await _tracker(client).create_task(_spec())
+
+    assert client.sprint_list_calls == [803]
+
+
+async def test_a_scrum_board_that_refuses_does_not_hide_the_next_one() -> None:
+    client = _FakeJiraClient(
+        boards=[{"id": 1, "type": "scrum"}, {"id": 803, "type": "scrum"}],
+        sprints_by_board=_queue_sprints(), failing_boards={1},
+    )
+    created = await _tracker(client).create_task(_spec())
+
+    assert created.warnings == []
+    assert client.sprint_list_calls == [1, 803]
+
+
+async def test_every_board_failing_means_not_found_and_the_ticket_survives() -> None:
+    client = _FakeJiraClient(
+        boards=[{"id": 1, "type": "scrum"}, {"id": 2, "type": "scrum"}],
+        failing_boards={1, 2},
+    )
+    tracker = _tracker(client)
+    assert tracker._find_sprint("DM", _QUEUE) is None
+    created = await tracker.create_task(_spec())
+
+    assert created.key == "DM-4821"
+    assert created.warnings == ["sprint_not_found"]

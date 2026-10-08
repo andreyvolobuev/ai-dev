@@ -74,6 +74,7 @@ class JiraTaskTracker(TaskTrackerPort):
         token: str,
         user: str = "",          # kept for backward-compat; not used for PAT auth
         browse_base_url: str | None = None,
+        customer_field_id: str = "",
     ) -> None:
         if not url or not token:
             raise ValueError("Jira URL and token must be provided")
@@ -94,6 +95,10 @@ class JiraTaskTracker(TaskTrackerPort):
         # поля отличается от инстанса к инстансу Jira.
         self._sprint_field_id: str | None = None
         self._sprint_field_resolved = False
+        # Id of the free-text "customer" custom field; empty = not set.
+        self._customer_field_id = customer_field_id
+        # (project, sprint name) -> sprint id, resolved once per process.
+        self._sprint_ids: dict[tuple[str, str], int] = {}
 
     async def fetch_tasks(self, jql: str, limit: int = 50) -> Sequence[Task]:
         def _fetch() -> list[dict[str, Any]]:
@@ -198,6 +203,10 @@ class JiraTaskTracker(TaskTrackerPort):
             }
             if spec.labels:
                 fields["labels"] = list(spec.labels)
+            if spec.components:
+                fields["components"] = [{"name": name} for name in spec.components]
+            if spec.customer and self._customer_field_id:
+                fields[self._customer_field_id] = spec.customer
             if spec.assignee:
                 fields["assignee"] = {"name": spec.assignee}
             try:
@@ -223,20 +232,21 @@ class JiraTaskTracker(TaskTrackerPort):
 
             warnings: list[str] = []
             sprint_name: str | None = None
-            if spec.add_to_active_sprint:
-                # Спринт — вторым шагом, через Agile-эндпоинт: формат
-                # записи sprint-поля через /issue отличается между
-                # версиями Jira, тогда как /sprint/<id>/issue стабилен.
+            if spec.sprint_name:
+                # The sprint goes in as a second step via the Agile endpoint:
+                # the sprint field format differs between Jira versions,
+                # while /sprint/<id>/issue is stable.
                 try:
-                    sprint_id, sprint_name = self._active_sprint(spec.project)
+                    sprint_id = self._find_sprint(spec.project, spec.sprint_name)
                     if sprint_id is None:
-                        warnings.append("no_active_sprint")
+                        warnings.append("sprint_not_found")
                     else:
                         self._client.add_issues_to_sprint(sprint_id, [key])
+                        sprint_name = spec.sprint_name
                 except Exception:
                     logger.exception(
-                        "Jira: could not put {} into the active sprint of {}",
-                        key, spec.project,
+                        "Jira: could not put {} into sprint {!r} of {}",
+                        key, spec.sprint_name, spec.project,
                     )
                     warnings.append("sprint_failed")
                     sprint_name = None
@@ -285,10 +295,14 @@ class JiraTaskTracker(TaskTrackerPort):
                     fields[sprint_field] = None
             if fields:
                 self._client.update_issue_field(external_id, fields)
-            if patch.sprint is True:
+            if patch.sprint is True and patch.sprint_name:
                 project = external_id.split("-")[0]
-                sprint_id, _ = self._active_sprint(project)
-                if sprint_id is not None:
+                sprint_id = self._find_sprint(project, patch.sprint_name)
+                if sprint_id is None:
+                    logger.warning(
+                        "Jira: sprint {!r} not found for {}", patch.sprint_name, external_id,
+                    )
+                else:
                     self._client.add_issues_to_sprint(sprint_id, [external_id])
 
         await asyncio.to_thread(_run)
@@ -330,27 +344,64 @@ class JiraTaskTracker(TaskTrackerPort):
             logger.warning("Jira: no custom field named {!r}", _SPRINT_FIELD_NAME)
         return self._sprint_field_id
 
-    def _active_sprint(self, project: str) -> tuple[int | None, str | None]:
-        """``(id, name)`` активного спринта проекта.
+    def _find_sprint(self, project: str, name: str) -> int | None:
+        """Id of the non-closed sprint called ``name`` on the project's boards.
 
-        Через JQL, не через id доски: доска может поменяться, или досок
-        может быть несколько, зато ``sprint in openSprints()`` спрашивает
-        именно то, что нужно — спринт, в котором команда работает сейчас.
+        Cached per process once found; a miss is not cached, so a sprint
+        created later is picked up without a restart.
         """
-        sprint_field = self._sprint_field()
-        if not sprint_field:
-            return None, None
-        result = self._client.jql(
-            f'project = "{project}" AND sprint in openSprints() ORDER BY updated DESC',
-            limit=1,
-        )
-        if not isinstance(result, dict):
-            return None, None
-        issues = result.get("issues") or []
-        if not issues:
-            return None, None
-        fields = cast(dict[str, Any], issues[0]).get("fields") or {}
-        return _parse_sprint(cast(dict[str, Any], fields).get(sprint_field))
+        cached = self._sprint_ids.get((project, name))
+        if cached is not None:
+            return cached
+        for board_id in self._board_ids(project):
+            try:
+                found = self._find_sprint_on_board(board_id, name)
+            except Exception as exc:
+                # A board can refuse for reasons we do not control (rights,
+                # reconfigured since listing); it must not hide a sprint
+                # that exists on another board.
+                logger.warning("Jira: sprints of board {} unavailable: {}", board_id, exc)
+                continue
+            if found is not None:
+                self._sprint_ids[(project, name)] = found
+                return found
+        return None
+
+    def _find_sprint_on_board(self, board_id: int, name: str) -> int | None:
+        start = 0
+        while True:
+            page = self._client.get_all_sprints_from_board(
+                board_id, start=start, limit=_AGILE_PAGE_SIZE,
+            )
+            values = page.get("values") or [] if isinstance(page, dict) else []
+            for sprint in values:
+                if (
+                    isinstance(sprint, dict)
+                    and sprint.get("name") == name
+                    and str(sprint.get("state") or "").lower() != "closed"
+                    and sprint.get("id") is not None
+                ):
+                    return int(sprint["id"])
+            if not values or not isinstance(page, dict) or page.get("isLast", True):
+                return None
+            start += len(values)
+
+    def _board_ids(self, project: str) -> list[int]:
+        ids: list[int] = []
+        start = 0
+        while True:
+            page = self._client.get_all_agile_boards(
+                project_key=project, start=start, limit=_AGILE_PAGE_SIZE,
+            )
+            values = page.get("values") or [] if isinstance(page, dict) else []
+            # Only scrum boards have sprints; kanban ones answer HTTP 400.
+            ids.extend(
+                int(b["id"]) for b in values
+                if isinstance(b, dict) and "id" in b and b.get("type") == "scrum"
+            )
+            if not values or not isinstance(page, dict) or page.get("isLast", True):
+                return ids
+            start += len(values)
 
     def _purge_session_pool(self) -> None:
         """Clear pooled HTTP connections on the underlying Session.
@@ -572,54 +623,7 @@ def _fetch_comments(client: Jira, key: str) -> list[TaskComment]:
 
 
 _SPRINT_FIELD_NAME = "Sprint"
-_LEGACY_SPRINT_ID_RE = re.compile(r"\bid=(\d+)")
-_LEGACY_SPRINT_STATE_RE = re.compile(r"\bstate=(\w+)")
-_LEGACY_SPRINT_NAME_RE = re.compile(r"\bname=([^,\]]+)")
-
-
-def _parse_sprint(raw: Any) -> tuple[int | None, str | None]:
-    """``(id, name)`` активного спринта из значения sprint-поля Jira.
-
-    Jira Server отдаёт это поле в двух разных форматах, и каждый живой:
-    список словарей (``{"id": 101, "state": "active", "name": ...}``) и
-    список строк-тострингов greenhopper
-    (``...Sprint@1a2b[id=567,state=ACTIVE,name=Sprint 42,...]``).
-    При нескольких значениях предпочитаем ``state=ACTIVE``; если
-    активного нет — первый распарсенный (тикет мог быть в закрытом
-    спринте, но нам важно не упасть).
-    """
-    entries = raw if isinstance(raw, list) else [raw]
-    fallback: tuple[int, str | None] | None = None
-    for entry in entries:
-        sprint_id: int | None = None
-        name: str | None = None
-        state = ""
-        if isinstance(entry, dict):
-            try:
-                sprint_id = int(entry["id"])
-            except (KeyError, TypeError, ValueError):
-                sprint_id = None
-            name = str(entry.get("name") or "") or None
-            state = str(entry.get("state") or "")
-        elif isinstance(entry, str):
-            id_match = _LEGACY_SPRINT_ID_RE.search(entry)
-            if id_match:
-                sprint_id = int(id_match.group(1))
-            name_match = _LEGACY_SPRINT_NAME_RE.search(entry)
-            name = name_match.group(1).strip() if name_match else None
-            state_match = _LEGACY_SPRINT_STATE_RE.search(entry)
-            state = state_match.group(1) if state_match else ""
-        if sprint_id is None:
-            continue
-        if state.upper() == "ACTIVE":
-            return sprint_id, name
-        if fallback is None:
-            fallback = (sprint_id, name)
-    if fallback is None:
-        return None, None
-    return fallback
-
-
+_AGILE_PAGE_SIZE = 50
 def _pick_tracker_username(entries: Any, email: str) -> str | None:
     """Логин Jira по результату ``user/search``.
 

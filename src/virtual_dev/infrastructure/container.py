@@ -211,6 +211,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
             url=settings.jira_url,
             token=settings.jira_token,
             user=settings.jira_user,  # kept for reference; not used for Bearer auth
+            customer_field_id=config.agents.task_intake.customer_field,
         )
     else:
         logger.warning(

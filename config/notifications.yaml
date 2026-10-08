@@ -127,10 +127,9 @@ mattermost:
     Сейчас занята задачей, отвлечься не могу.
 
   # Дописки к intake_created, когда что-то не доехало.
-  intake_warning_no_active_sprint: "активного спринта не нашла — положи в спринт сама"
+  intake_warning_sprint_not_found: "нужный спринт не нашла — положи задачу в спринт сама"
   intake_warning_sprint_failed: "в спринт положить не получилось"
-  intake_warning_assignee_not_found: "не нашла тебя в Jira по почте — поставь исполнителя руками"
-  intake_warning_assignee_hint_unresolved: "не поняла, кого назначить, поставила тебя"
+  intake_warning_assignee_hint_unresolved: "не поняла, кого назначить, оставила без исполнителя"
   intake_warning_assignee_hint_unresolved_update: "не поняла, кого назначить, исполнителя оставила как был"
 
 # --- Jira (комментарии к тикетам) ---
