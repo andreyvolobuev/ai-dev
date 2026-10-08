@@ -114,7 +114,7 @@ class TaskIntakeCfg(_StrictModel):
     """Создание задач по просьбе в Mattermost.
 
     Сюда попадает работа, которую команде приносят соседние команды:
-    лейбл ``dmp-sup`` и активный спринт нужны, чтобы она была видна в
+    лейбл ``dmp-sup`` и спринт-очередь нужны, чтобы она была видна в
     планировании, не растворяясь в «помог по-быстрому».
 
     ``enabled`` по умолчанию False: дефолт не должен молча включать
@@ -125,7 +125,13 @@ class TaskIntakeCfg(_StrictModel):
     project: str = "DM"
     issue_type: str = "Task"
     labels: list[str] = Field(default_factory=lambda: ["dmp-sup"])
-    add_to_active_sprint: bool = True
+    # Prepended to every ticket title by the runner (idempotent).
+    summary_prefix: str = ""
+    components: list[str] = Field(default_factory=list)
+    # Sprint to file into, resolved by name at runtime; "" = no sprint.
+    sprint_name: str = ""
+    # Id of the free-text "customer" custom field; "" = do not set it.
+    customer_field: str = ""
 
 
 class EscalationCfg(_StrictModel):
@@ -180,9 +186,8 @@ class MmTemplatesCfg(_StrictModel):
     # Если модель не дала текста для отказа — берём этот.
     intake_busy_fallback: str = ""
     # Фразы для {warnings_block}. Тикет при любой из них уже создан.
-    intake_warning_no_active_sprint: str = ""
+    intake_warning_sprint_not_found: str = ""
     intake_warning_sprint_failed: str = ""
-    intake_warning_assignee_not_found: str = ""
     intake_warning_assignee_hint_unresolved: str = ""
     # Для правки логика другая: неразрешённая подсказка не назначает
     # исполнителя автору просьбы (в отличие от создания) — текст должен

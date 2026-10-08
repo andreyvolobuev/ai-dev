@@ -2,7 +2,7 @@
 
 Просьбу «заведи задачу» приносит ``MmThreadListener``, решение
 принимает ``TaskIntakeAgent``; здесь оно превращается в факты:
-строка-заявка в БД, тикет в Jira, лейбл, спринт, исполнитель и ответ в
+строка-заявка в БД, тикет в Jira, лейбл, компонент, спринт, заказчик и ответ в
 тред. Такое разделение сознательное — модель читает недоверенный чат,
 поэтому запись в Jira идёт не через неё.
 
@@ -12,7 +12,7 @@
 Jira ответила ошибкой, claim снимается — иначе повтор просьбы молча
 превратился бы в «уже обработано».
 
-Частичные сбои (нет активного спринта, не нашли человека в Jira) не
+Частичные сбои (не нашли спринт, не нашли человека в Jira) не
 отменяют тикет: задача уже существует — честный текст ответа говорит,
 что доделать руками.
 """
@@ -43,13 +43,11 @@ from virtual_dev.infrastructure.db import IntakeRequestRow
 
 # Код предупреждения -> ключ шаблона в notifications.mattermost.
 _WARNING_TEMPLATES: dict[str, str] = {
-    "no_active_sprint": "intake_warning_no_active_sprint",
+    "sprint_not_found": "intake_warning_sprint_not_found",
     "sprint_failed": "intake_warning_sprint_failed",
-    "assignee_not_found": "intake_warning_assignee_not_found",
     "assignee_hint_unresolved": "intake_warning_assignee_hint_unresolved",
-    # Правка тикета не назначает исполнителя автору просьбы (в отличие от
-    # создания) — здесь текст другой: "не поняла, оставила как было"
-    # вместо "поставила тебя".
+    # On an edit the ticket already has an assignee that stays untouched,
+    # so the text differs: "left as it was" instead of "left unassigned".
     "assignee_hint_unresolved_update": "intake_warning_assignee_hint_unresolved_update",
 }
 
@@ -144,25 +142,22 @@ class TaskIntakeInbox:
             return IntakeOutcome(action="skipped", reason="duplicate_post")
 
         requester = await self._chat.get_user_by_id(event.author_id)
-        requester_label = _requester_label(requester, event.author_id)
-        assignee, warnings = await self._resolve_assignee(
-            requester_email=(requester.email if requester else None),
-            hint=decision.assignee_hint,
-        )
+        customer = _requester_label(requester, event.author_id)
+        # Unassigned by default: only an explicitly named person is set.
+        assignee, warnings = await self._resolve_assignee(hint=decision.assignee_hint)
 
         cfg = self._config.agents.task_intake
+        summary = _with_summary_prefix(decision.summary, cfg.summary_prefix)
         spec = NewTaskSpec(
             project=cfg.project,
             issue_type=cfg.issue_type,
-            summary=decision.summary,
-            description=_compose_description(
-                decision.description,
-                requester_label=requester_label,
-                permalink=permalink,
-            ),
+            summary=summary,
+            description=_compose_description(decision.description, permalink=permalink),
             labels=list(cfg.labels),
             assignee=assignee,
-            add_to_active_sprint=cfg.add_to_active_sprint,
+            components=list(cfg.components),
+            sprint_name=cfg.sprint_name or None,
+            customer=customer,
         )
         try:
             created = await self._tracker.create_task(spec)
@@ -188,7 +183,7 @@ class TaskIntakeInbox:
         text = self._templates.intake_created.format(
             key=created.key,
             url=created.url,
-            summary=decision.summary,
+            summary=summary,
             assignee=created.assignee or "не назначен",
             sprint=created.sprint_name or "без спринта",
             warnings_block=self._render_warnings(all_warnings),
@@ -222,20 +217,22 @@ class TaskIntakeInbox:
             )
             return IntakeOutcome(action="failed", reply_sent=sent, reason="no_ticket")
 
+        cfg = self._config.agents.task_intake
         changes = decision.changes
         patch = TaskPatch()
         applied: list[str] = []
         warnings: list[str] = []
 
-        summary = str(changes.get("summary") or "").strip()
+        summary = _with_summary_prefix(
+            str(changes.get("summary") or ""), cfg.summary_prefix,
+        )
         if summary:
             patch.summary = summary
             applied.append(f"переименовала в «{summary}»")
         description = str(changes.get("description") or "").strip()
         if description:
-            # Патч описания в Jira заменяет поле целиком, но футер
-            # («Просьба от», «Обсуждение») дописываем мы — значит надо
-            # собрать заново, иначе одно «допиши про Армению» уносит
+            # A description patch in Jira replaces the whole field, but the
+            # footer (discussion link, signature) is ours - so rebuild it, иначе одно «допиши про Армению» уносит
             # ссылку на тред-источник, которую гарантирует спека.
             patch.description = await self._recompose_description(
                 description, issue_key=existing.key,
@@ -261,8 +258,15 @@ class TaskIntakeInbox:
         # "false" ошиблась бы в другую сторону. Видимость в спринте — весь
         # смысл фичи, поэтому неоднозначное значение игнорируем.
         raw_sprint = changes.get("sprint")
-        if isinstance(raw_sprint, bool):
+        if raw_sprint is True and not cfg.sprint_name:
+            logger.warning(
+                "TaskIntake: sprint=true for {} but no sprint_name is configured",
+                existing.key,
+            )
+        elif isinstance(raw_sprint, bool):
             patch.sprint = raw_sprint
+            if raw_sprint:
+                patch.sprint_name = cfg.sprint_name
             applied.append(
                 "вернула в спринт" if raw_sprint else "убрала из спринта"
             )
@@ -354,59 +358,37 @@ class TaskIntakeInbox:
         return text
 
     async def _recompose_description(self, body: str, *, issue_key: str) -> str:
-        """Описание тикета заново: текст от модели + наш футер.
+        """Rebuild the ticket description: the model's text + our footer.
 
-        Заказчика и ссылку на тред восстанавливаем из сохранённой заявки —
-        модель их не знает, но патч описания в Jira перезаписывает поле
-        целиком.
+        The source link is restored from the stored intake row - the model
+        does not know it, but a description patch overwrites the whole field.
         """
         row = await self._origin_row(issue_key)
         if row is None:
             logger.warning(
-                "TaskIntake: no intake row for {} — description footer will be "
+                "TaskIntake: no intake row for {} - description footer will be "
                 "rebuilt without the source link", issue_key,
             )
-            return _compose_description(body, requester_label="", permalink="")
-        requester: ChatUser | None = None
-        try:
-            requester = await self._chat.get_user_by_id(row.requester_mm_user_id)
-        except Exception:
-            logger.warning(
-                "TaskIntake: get_user_by_id({}) failed while rebuilding the "
-                "description", row.requester_mm_user_id,
-            )
+            return _compose_description(body, permalink="")
         return _compose_description(
             body,
-            requester_label=_requester_label(requester, row.requester_mm_user_id),
-            permalink=await self._safe_permalink(
-                row.source_post_id, row.mm_channel_id,
-            ),
+            permalink=await self._safe_permalink(row.source_post_id, row.mm_channel_id),
         )
 
-    async def _resolve_assignee(
-        self, *, requester_email: str | None, hint: str,
-    ) -> tuple[str | None, list[str]]:
-        """``(логин в трекере, предупреждения)``.
+    async def _resolve_assignee(self, *, hint: str) -> tuple[str | None, list[str]]:
+        """``(tracker login, warnings)``.
 
-        Именованный человек — через поиск в чате (там есть ФИО), дальше по
-        email в трекер; если никого не нашли или нашли нескольких —
-        ставим автора просьбы: потерять исполнителя лучше, чем назначить
-        чужого.
+        Only an explicitly named person is resolved (chat search for the
+        full name, then email -> tracker login). No hint means unassigned;
+        a name that matches nobody or several people also leaves the ticket
+        unassigned - better no assignee than somebody else's.
         """
-        assert self._tracker is not None
-        warnings: list[str] = []
-        if hint:
-            username = await self._resolve_named_user(hint)
-            if username:
-                return username, warnings
-            warnings.append("assignee_hint_unresolved")
-        if not requester_email:
-            warnings.append("assignee_not_found")
-            return None, warnings
-        username = await self._safe_find_by_email(requester_email)
-        if username is None:
-            warnings.append("assignee_not_found")
-        return username, warnings
+        if not hint:
+            return None, []
+        username = await self._resolve_named_user(hint)
+        if username:
+            return username, []
+        return None, ["assignee_hint_unresolved"]
 
     async def _resolve_named_user(self, name: str) -> str | None:
         assert self._tracker is not None
@@ -555,22 +537,35 @@ class TaskIntakeInbox:
         )
 
 
-def _compose_description(
-    body: str, *, requester_label: str, permalink: str,
-) -> str:
-    """Тело тикета: текст от модели + факты от нас.
+def _compose_description(body: str, *, permalink: str) -> str:
+    """Ticket body: the model's text + facts added by us.
 
-    Ссылка на тред и имя заказчика приписываются здесь — не моделью:
-    она их не знает, и угадывать такое нельзя.
+    The thread link is appended here, not by the model: it does not know
+    it, and guessing such a thing is not allowed. The requester lives in
+    the tracker's customer field, not in the text.
     """
     parts = [body.strip() or "(без описания)", ""]
-    if requester_label:
-        parts.append(f"Просьба от: {requester_label}")
     if permalink:
         parts.append(f"Обсуждение: {permalink}")
     parts.append("")
     parts.append("Задачу завела Аида Нейронова по просьбе в Mattermost.")
     return "\n".join(parts)
+
+
+def _with_summary_prefix(summary: str, prefix: str) -> str:
+    """``summary`` with ``prefix`` in front, exactly once.
+
+    Any copy of the prefix the model (or a previous edit) already left at
+    the start is stripped first, case-insensitively and whether or not it
+    is followed by a space, so the result never reads ``[SUPPORT] [SUPPORT]``.
+    """
+    core = summary.strip()
+    marker = prefix.strip()
+    if not marker:
+        return core
+    while core.casefold().startswith(marker.casefold()):
+        core = core[len(marker):].lstrip()
+    return f"{prefix}{core}" if core else ""
 
 
 def _requester_label(user: ChatUser | None, fallback_id: str) -> str:
