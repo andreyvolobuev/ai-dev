@@ -22,7 +22,10 @@ models:
   default: "claude-fable-5-1"
   # default: "claude-opus-4-8"
   # default: "claude-sonnet-4-6"
-  lightweight: "claude-haiku-4-5-20251001"
+  # Короткие одиночные вызовы без инструментов: классификация комментариев
+  # в MR и саммари MR на одну-две фразы. Haiku 5.5 вдесятеро дешевле 4.5
+  # (0.10/0.50 против 1/5 за миллион токенов) и новее.
+  lightweight: "claude-haiku-5-5"
 
 # JQL, по которому Orchestrator забирает задачи из Jira.
 # На старте — свои задачи пользователя с определённым label.
