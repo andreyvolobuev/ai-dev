@@ -203,6 +203,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
     message_bus: MessageBusPort = SqlAlchemyMessageBus(
         session_factory,
         dialect_name=dialect_name,
+        lease_seconds=settings.bus_lease_seconds,
     )
 
     task_tracker: TaskTrackerPort | None = None
