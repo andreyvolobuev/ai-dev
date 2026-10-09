@@ -8,6 +8,7 @@ from claude_agent_sdk import tool
 
 from virtual_dev.application.services.agent_effects import AnalystEffect
 from virtual_dev.tools import ToolContext, wrap_text
+from virtual_dev.tools._helpers import strip_agent_attribution
 
 TOOL_GROUP = "analyst"
 
@@ -67,7 +68,7 @@ def build(ctx: ToolContext):
             })
         handle = (args.get("to_handle") or "").strip().lstrip("@") or None
         email = (args.get("to_email") or "").strip() or None
-        message = str(args.get("message") or "").strip()
+        message = strip_agent_attribution(str(args.get("message") or ""))
         dedupe_key = (args.get("dedupe_key") or "").strip() or None
         if not message:
             return wrap_text({"sent": False, "reason": "empty_message"})

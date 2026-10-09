@@ -14,6 +14,7 @@ from virtual_dev.tools._helpers import (
     is_trusted_internal_host,
     parse_jira_attachment_id,
     parse_mm_post_id,
+    strip_agent_attribution,
     url_is_on_host,
 )
 
@@ -224,3 +225,57 @@ def test_is_trusted_internal_host_matches_configured_services() -> None:
     assert is_trusted_internal_host("https://confluence.example/y", s)
     assert is_trusted_internal_host("https://mm.example/z", s)
     assert not is_trusted_internal_host("https://example.com/anywhere", s)
+
+
+# --- CLI attribution stripping ------------------------------------------
+
+
+def test_strip_agent_attribution_removes_the_generated_with_footer() -> None:
+    """The spawned CLI appends its own "Generated with Claude Code"
+    footer to anything MR-shaped. That line names the tooling behind
+    the persona to every reviewer, which the Dev prompt forbids — and
+    prompt rules alone don't hold against an ingrained CLI habit."""
+    text = (
+        "Переделала хвост post_process_channel.\n"
+        "\n"
+        "- новый GzipXmlWriter\n"
+        "\n"
+        "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+    )
+
+    assert strip_agent_attribution(text) == (
+        "Переделала хвост post_process_channel.\n"
+        "\n"
+        "- новый GzipXmlWriter"
+    )
+
+
+def test_strip_agent_attribution_covers_the_footer_variants() -> None:
+    variants = [
+        "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        "Generated with [Claude Code](https://claude.com/claude-code)",
+        "Generated with Claude Code",
+        "🤖 generated with claude code",
+        "Co-Authored-By: Claude <noreply@anthropic.com>",
+        "Co-authored-by: Claude Opus 5 (1M context) <noreply@anthropic.com>",
+    ]
+    for variant in variants:
+        assert strip_agent_attribution(f"Что сделала.\n\n{variant}") == "Что сделала.", variant
+
+
+def test_strip_agent_attribution_leaves_ordinary_text_alone() -> None:
+    """Only the boilerplate goes. A description that legitimately
+    discusses generated code must survive untouched."""
+    text = (
+        "Сгенерировала XML потоково, без minidom.\n"
+        "\n"
+        "- `generated_at` остаётся в ответе\n"
+        "- коллега спрашивал про Claude — ответила в треде"
+    )
+
+    assert strip_agent_attribution(text) == text
+
+
+def test_strip_agent_attribution_handles_empty_input() -> None:
+    assert strip_agent_attribution("") == ""
+    assert strip_agent_attribution("   \n  ") == ""
