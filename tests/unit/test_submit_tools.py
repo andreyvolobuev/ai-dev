@@ -135,3 +135,75 @@ async def test_submit_response_marks_terminal_after_success() -> None:
 
     await _run(tool, {"action": "ignore", "reasoning": "noise"})
     assert ctx.run_state.get("terminal") is True
+
+
+@pytest.mark.asyncio
+async def test_submit_mr_strips_the_cli_self_attribution() -> None:
+    """Everything captured here reaches a human: description and
+    mr_description become the MR body in GitLab, title becomes the
+    commit message. The CLI's "Generated with Claude Code" footer must
+    not survive into any of them — it names the tooling behind Аида,
+    which the Dev prompt forbids."""
+    ctx = _make_ctx()
+    tool = build_submit_mr(ctx)
+
+    await _run(tool, {
+        "title": "Потоковая сборка Fiji-XML по чанкам",
+        "description": (
+            "Переделала хвост post_process_channel.\n"
+            "\n"
+            "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+        ),
+        "status": "success",
+        "notes": (
+            "Зависимости локально не стоят, тесты не прогоняла.\n"
+            "\n"
+            "Co-Authored-By: Claude <noreply@anthropic.com>"
+        ),
+        "mr_description": (
+            "Новое описание MR\n"
+            "\n"
+            "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+        ),
+    })
+
+    assert ctx.submit_capture["description"] == "Переделала хвост post_process_channel."
+    assert ctx.submit_capture["notes"] == "Зависимости локально не стоят, тесты не прогоняла."
+    assert ctx.submit_capture["mr_description"] == "Новое описание MR"
+    assert ctx.submit_capture["title"] == "Потоковая сборка Fiji-XML по чанкам"
+    assert ctx.submit_capture["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_submit_mr_keeps_text_that_merely_mentions_generated_code() -> None:
+    ctx = _make_ctx()
+    tool = build_submit_mr(ctx)
+    description = "Сгенерированный XML пишется потоково, поле `generated_at` не трогала."
+
+    await _run(tool, {
+        "title": "Потоковая запись XML",
+        "description": description,
+        "status": "success",
+    })
+
+    assert ctx.submit_capture["description"] == description
+
+
+@pytest.mark.asyncio
+async def test_submit_response_strips_attribution_from_the_reply() -> None:
+    """reply_text is posted into the review thread verbatim — the same
+    exposure as the MR body, so it gets the same scrub."""
+    ctx = _make_ctx()
+    tool = build_submit_response(ctx)
+
+    await _run(tool, {
+        "action": "reply",
+        "reply_text": (
+            "Поправила, спасибо.\n"
+            "\n"
+            "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+        ),
+        "reasoning": "reviewer asked for a rename",
+    })
+
+    assert ctx.submit_capture["reply_text"] == "Поправила, спасибо."
