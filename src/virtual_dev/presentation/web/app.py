@@ -278,8 +278,12 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             await asyncio.wait_for(container.init_db(), timeout=30.0)
         except TimeoutError:
             logger.error("DB migration timed out (30 s) — starting without migrations")
-        except Exception:
+            container.health.mark_failure("db_migration", "timed out after 30s")
+        except Exception as exc:
             logger.exception("DB migration failed — starting without migrations")
+            container.health.mark_failure("db_migration", repr(exc))
+        else:
+            container.health.mark_success("db_migration")
 
         background: list[asyncio.Task[None]] = []
         # Log sink: drains AgentTrace into loguru DEBUG so a prod log

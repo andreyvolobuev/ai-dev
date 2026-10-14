@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
@@ -23,6 +24,36 @@ from sqlalchemy.orm import DeclarativeBase
 
 class Base(DeclarativeBase):
     """Declarative base for all ORM models."""
+
+
+def normalize_pg_ssl(db_url: str, *, target: str) -> str:
+    """Translate the ``sslmode``/``ssl`` query param for the given driver.
+
+    libpq (psycopg2) speaks ``sslmode=require``; asyncpg speaks
+    ``ssl=require``. One DSN has to serve both worlds — asyncpg at runtime
+    and psycopg2 for Alembic — so each side rewrites the param it does not
+    understand. ``target`` is ``"asyncpg"`` or ``"psycopg2"``.
+
+    No-op for non-PostgreSQL URLs or when the relevant param is absent.
+    """
+    if not db_url.startswith("postgresql"):
+        return db_url
+
+    parsed = urlparse(db_url)
+    if not parsed.query:
+        return db_url
+
+    params = dict(parse_qsl(parsed.query))
+    if target == "asyncpg":
+        # asyncpg rejects libpq's sslmode kwarg.
+        if "sslmode" in params and "ssl" not in params:
+            params["ssl"] = params.pop("sslmode")
+    elif target == "psycopg2":
+        # psycopg2 (libpq) rejects a bare `ssl` kwarg.
+        if "ssl" in params and "sslmode" not in params:
+            params["sslmode"] = params.pop("ssl")
+
+    return urlunparse(parsed._replace(query=urlencode(params)))
 
 
 def make_engine(db_url: str, *, echo: bool = False) -> AsyncEngine:
@@ -51,7 +82,7 @@ def make_engine(db_url: str, *, echo: bool = False) -> AsyncEngine:
             cursor.close()
     else:
         engine = create_async_engine(
-            db_url,
+            normalize_pg_ssl(db_url, target="asyncpg"),
             echo=echo,
             future=True,
             pool_size=10,

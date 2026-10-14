@@ -18,6 +18,8 @@ from pathlib import Path
 from alembic import command
 from alembic.config import Config
 
+from virtual_dev.infrastructure.db.base import normalize_pg_ssl
+
 
 def _repo_root() -> Path:
     """Resolve the repo root from this file's location.
@@ -30,12 +32,16 @@ def _repo_root() -> Path:
 
 
 def _to_sync_url(db_url: str) -> str:
-    """Strip async drivers; Alembic only speaks sync.
+    """Adapt the runtime DSN for Alembic's sync (psycopg2) driver.
 
     ``sqlite+aiosqlite:///./data/foo.db`` -> ``sqlite:///./data/foo.db``
     ``postgresql+asyncpg://user:pass@host/db`` -> ``postgresql://user:pass@host/db``
+
+    Also rewrites an asyncpg-style ``ssl`` param back to libpq's ``sslmode``
+    so a single ``.env`` DSN works for both the app and migrations.
     """
-    return db_url.replace("+aiosqlite", "", 1).replace("+asyncpg", "", 1)
+    sync_url = db_url.replace("+aiosqlite", "", 1).replace("+asyncpg", "", 1)
+    return normalize_pg_ssl(sync_url, target="psycopg2")
 
 
 def build_alembic_config(db_url: str) -> Config:

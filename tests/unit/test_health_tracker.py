@@ -70,3 +70,37 @@ def test_snapshot_independent_per_subsystem() -> None:
     snap = h.snapshot()
     assert snap["jira_fetch"]["seconds_since"] == 180
     assert snap["gitlab"]["seconds_since"] == 60
+
+
+def test_failure_surfaces_even_without_a_success() -> None:
+    h = HealthTracker()
+    h.mark_failure("db_migration", "timed out after 30s")
+
+    snap = h.snapshot()
+    assert "db_migration" in snap
+    assert snap["db_migration"]["error"] == "timed out after 30s"
+    assert "last_success_at" not in snap["db_migration"]
+
+
+def test_success_clears_previous_error() -> None:
+    base = datetime(2026, 4, 30, 10, 0, tzinfo=timezone.utc)
+    h = HealthTracker(clock=lambda: base)
+
+    h.mark_failure("db_migration", "boom")
+    h.mark_success("db_migration")
+
+    snap = h.snapshot()
+    assert snap["db_migration"]["error"] is None
+    assert snap["db_migration"]["last_success_at"] == base
+
+
+def test_error_recorded_alongside_last_success() -> None:
+    base = datetime(2026, 4, 30, 10, 0, tzinfo=timezone.utc)
+    h = HealthTracker(clock=lambda: base)
+
+    h.mark_success("gitlab")
+    h.mark_failure("gitlab", "503")
+
+    snap = h.snapshot()
+    assert snap["gitlab"]["error"] == "503"
+    assert snap["gitlab"]["last_success_at"] == base
