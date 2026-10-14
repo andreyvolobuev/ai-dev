@@ -17,6 +17,12 @@ Durability + at-least-once via lease/ack:
   ``consumed_at = now``. A crashed handler / killed process leaves
   ``claimed_until`` in place; the next poll's lazy reaper resets it
   back to NULL so the message is reclaimable.
+* ``renew`` moves ``claimed_until`` forward while a handler is still
+  working, so "lease expired" means "the consumer stopped reporting
+  in", not "the work is taking a while". Agent runs are allowed to
+  take up to ``code_agent_run_timeout_seconds`` (an hour) — many
+  times the lease — and without renewal every such run got handed
+  out a second time mid-flight.
 * Handler idempotency is the consumer's job. Application models
   already enforce it via UNIQUE constraints (``tasks``,
   ``merge_requests``, ``analyst_conversation_fragments``).
@@ -157,6 +163,30 @@ class SqlAlchemyMessageBus(MessageBusPort):
                 .values(consumed_at=self._db_ts(self._now()))
             )
             await session.commit()
+
+    async def renew(self, message: AgentMessage) -> bool:
+        """Push ``claimed_until`` out by a full lease period.
+
+        Called by the consumer's heartbeat while its handler is still
+        working. Guarded on ``consumed_at IS NULL`` so a renewal that
+        races an ack can never un-finish a message."""
+        if message._row_id is None:
+            return False
+        async with self._session_factory() as session:
+            result = await session.execute(
+                update(AgentMessageRow)
+                .where(
+                    AgentMessageRow.id == message._row_id,
+                    AgentMessageRow.consumed_at.is_(None),
+                )
+                .values(claimed_until=self._db_ts(self._now()) + self._lease)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+        # AsyncSession.execute is typed as the base Result (no rowcount
+        # in the stubs) though an UPDATE always yields a CursorResult —
+        # read it duck-typed, same as ticket_reset._delete.
+        return bool(getattr(result, "rowcount", 0) or 0)
 
     # --- internals ------------------------------------------------------
 

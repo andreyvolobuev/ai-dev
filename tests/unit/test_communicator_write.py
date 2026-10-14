@@ -187,3 +187,44 @@ async def test_send_dm_threaded_falls_back_when_anchor_partial() -> None:
     assert outcome.sent is True
     assert chat.sent_dms == [("uid-alice", "что-то")]
     assert chat.sent_channels == []
+
+
+@pytest.mark.asyncio
+async def test_reactive_send_ignores_working_hours(monkeypatch) -> None:
+    """Direct response to human mention bypasses working hours: they are
+    waiting now, silence reads as broken."""
+    chat = _RecordingChat()
+    wh = WorkingHoursCfg(
+        timezone="Europe/Moscow", start_hour=3, end_hour=4, weekdays_only=False,
+    )
+    svc = CommunicatorService(
+        chat, InjectionFilter(), working_hours=wh, respect_working_hours=True,
+    )
+
+    # Patch _is_within_working_hours to always return False
+    from virtual_dev.application.services import communicator
+    monkeypatch.setattr(communicator, "_is_within_working_hours", lambda *args: False)
+
+    blocked = await svc.send_channel("chan-1", "обычный пинг")
+    reactive = await svc.send_channel("chan-1", "ответ на просьбу", reactive=True)
+
+    assert blocked.sent is False
+    assert blocked.skip_reason == "outside_working_hours"
+    assert reactive.sent is True
+    assert chat.sent_channels == [("chan-1", "ответ на просьбу", None)]
+
+
+@pytest.mark.asyncio
+async def test_reactive_send_still_respects_rate_limit() -> None:
+    """Bypassing working hours is not indulgence for spam."""
+    chat = _RecordingChat()
+    svc = CommunicatorService(
+        chat, InjectionFilter(), rate_limit_per_hour=1, respect_working_hours=False,
+    )
+
+    first = await svc.send_channel("chan-1", "раз", reactive=True)
+    second = await svc.send_channel("chan-1", "два", reactive=True)
+
+    assert first.sent is True
+    assert second.sent is False
+    assert second.skip_reason == "rate_limited"

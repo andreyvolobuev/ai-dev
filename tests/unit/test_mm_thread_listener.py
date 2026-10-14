@@ -17,6 +17,11 @@ from virtual_dev.application.agents import (
 )
 from virtual_dev.application.services import CommunicatorService, InjectionFilter
 from virtual_dev.domain.models.chat import ChatMessage, ChatUser
+from virtual_dev.domain.models.merge_request import (
+    MergeRequest,
+    MRStatus,
+    PipelineStatus,
+)
 from virtual_dev.domain.ports.chat import ChatPort
 from virtual_dev.infrastructure.config import (
     AgentsCfg,
@@ -138,9 +143,11 @@ class _ScriptedResponder:
     def __init__(self, decisions: list[ResponderDecision]) -> None:
         self._decisions = iter(decisions)
         self.calls = 0
+        self.kwargs: list[dict] = []
 
     async def decide(self, **kwargs):  # type: ignore[no-untyped-def]
         self.calls += 1
+        self.kwargs.append(kwargs)
         return next(self._decisions)
 
 
@@ -990,3 +997,86 @@ async def test_non_restart_reply_in_escalation_thread_does_not_reset(
         assert row.pipeline_autofix_escalated is True
     assert chat.sent == []
     assert responder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_responder_is_told_the_real_mr_branches(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    # The responder once argued with humans about which branch the MR
+    # merges into, because its only source on branches was the MR
+    # description it had written itself. The row knows the truth —
+    # pass it.
+    await _insert_mr(session_factory, root_id="root-b", source_branch="ai-dev/dm-2911-back")
+    events = [_human_post(id="post-b", thread_root_id="root-b", text="куда льём?")]
+    chat = _ScriptedChat(events)
+    responder = _ScriptedResponder([ResponderDecision(
+        action=ResponderAction.REPLY, reply_text="В master.", reasoning="answer",
+    )])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await asyncio.sleep(0.1)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert responder.kwargs, "responder was never called"
+    call = responder.kwargs[0]
+    assert call["mr_source_branch"] == "ai-dev/dm-2911-back"
+    assert call["mr_target_branch"] == "master"
+
+
+@pytest.mark.asyncio
+async def test_responder_branches_come_from_live_mr_not_the_stale_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    # MergeRequestRow.target_branch is written once, when the MR is
+    # opened, and never refreshed. A human retargeting the MR in GitLab
+    # — exactly what the bot asks for — would otherwise leave the
+    # responder asserting a stale target as verified fact.
+    await _insert_mr(session_factory, root_id="root-c", source_branch="ai-dev/dm-2911-back")
+
+    class _RetargetedVcs:
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+        async def get_merge_request(self, repo_key: str, iid: int):  # type: ignore[no-untyped-def]
+            return MergeRequest(
+                id="1001", iid=iid, project_id="p",
+                title="Add /health", description="desc",
+                source_branch="ai-dev/dm-2911-back", target_branch="tags-dev",
+                author_username="virtual-dev",
+                web_url="https://gitlab/x/merge_requests/1001",
+                status=MRStatus.OPEN, pipeline_status=PipelineStatus.UNKNOWN,
+            )
+
+    events = [_human_post(id="post-c", thread_root_id="root-c", text="куда льём?")]
+    chat = _ScriptedChat(events)
+    responder = _ScriptedResponder([ResponderDecision(
+        action=ResponderAction.REPLY, reply_text="В tags-dev.", reasoning="answer",
+    )])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+        vcs=_RetargetedVcs(),   # type: ignore[arg-type]
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await asyncio.sleep(0.1)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    assert responder.kwargs[0]["mr_target_branch"] == "tags-dev"

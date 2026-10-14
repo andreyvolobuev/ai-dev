@@ -192,6 +192,9 @@ class MattermostChat(ChatPort):
         # login can race: two threads both see _logged_in=False and both
         # mutate the shared driver's auth state mid-flight.
         self._login_lock = threading.Lock()
+        # channel_id → team name, for permalinks. MM returns the name
+        # only through channel → team, and it changes almost never.
+        self._team_name_by_channel: dict[str, str] = {}
 
     def _ensure_login(self) -> None:
         with self._login_lock:
@@ -305,6 +308,46 @@ class MattermostChat(ChatPort):
 
         return await asyncio.to_thread(_fetch)
 
+    async def get_user_by_id(self, user_id: str) -> ChatUser | None:
+        def _fetch() -> ChatUser | None:
+            self._ensure_login()
+            try:
+                raw = self._driver.users.get_user(user_id)
+            except Exception:
+                logger.warning("MM: get_user({!r}) failed", user_id)
+                return None
+            return self._user_from_raw(raw)
+
+        return await asyncio.to_thread(_fetch)
+
+    async def post_permalink(
+        self, post_id: str, channel_id: str,
+    ) -> str | None:
+        def _build() -> str | None:
+            self._ensure_login()
+            team_name = self._team_name_by_channel.get(channel_id)
+            if team_name is None:
+                try:
+                    channel = self._driver.channels.get_channel(channel_id)
+                    team_id = str((channel or {}).get("team_id") or "")
+                    if not team_id:
+                        # DM channels do not belong to a team — no permalink.
+                        return None
+                    team = self._driver.teams.get_team(team_id)
+                    team_name = str((team or {}).get("name") or "")
+                except Exception:
+                    logger.warning(
+                        "MM: could not resolve team for channel {!r}",
+                        channel_id,
+                    )
+                    return None
+                if not team_name:
+                    return None
+                self._team_name_by_channel[channel_id] = team_name
+            return f"{self._base_url}/{team_name}/pl/{post_id}"
+
+        return await asyncio.to_thread(_build)
+
     async def search_users_by_name(
         self, query: str, *, limit: int = 25,
     ) -> Sequence[ChatUser]:
@@ -411,6 +454,21 @@ class MattermostChat(ChatPort):
                 if "already exists" in msg or "400" in msg:
                     return
                 raise
+
+        await asyncio.to_thread(_run)
+
+    async def remove_reaction(self, post_id: str, emoji_name: str) -> None:
+        """Take the bot's own emoji reaction off a post (failures are logged)."""
+        def _run() -> None:
+            self._ensure_login()
+            bot_id = self._bot_user_id()
+            try:
+                self._driver.reactions.delete_reaction(bot_id, post_id, emoji_name)
+            except Exception as exc:
+                logger.warning(
+                    "Mattermost: remove_reaction {} on post {} failed: {}",
+                    emoji_name, post_id, exc,
+                )
 
         await asyncio.to_thread(_run)
 

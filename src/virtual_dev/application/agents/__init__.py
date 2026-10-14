@@ -10,6 +10,12 @@ from virtual_dev.application.agents.dev import (
 from virtual_dev.application.agents.devops import DevOpsAgent, DevOpsTickStats
 from virtual_dev.application.agents.orchestrator import Orchestrator, OrchestratorRunStats
 from virtual_dev.application.agents.reviewer import ReviewerAgent, ReviewerTickStats
+from virtual_dev.application.agents.task_intake import (
+    IntakeAction,
+    IntakeDecision,
+    IntakeTicketState,
+    TaskIntakeAgent,
+)
 from virtual_dev.application.agents.thread_responder import (
     ResponderAction,
     ResponderDecision,
@@ -25,11 +31,15 @@ __all__ = [
     "DevOutcome",
     "DevResult",
     "DevSkipReason",
+    "IntakeAction",
+    "IntakeDecision",
+    "IntakeTicketState",
     "Orchestrator",
     "OrchestratorRunStats",
     "ResponderAction",
     "ResponderDecision",
     "ReviewerAgent",
     "ReviewerTickStats",
+    "TaskIntakeAgent",
     "ThreadResponderAgent",
 ]

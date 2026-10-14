@@ -125,6 +125,12 @@ _CLAUDE_MD_INSTRUCTION = (
     "* One bullet per rule: the *what*, plus a short *why* when it "
     "isn't obvious. No reviewer quotes verbatim, no ticket/MR ids.\n"
     "* Keep the file short — every future session pays to read it.\n"
+    "* When the feedback itself asks for a CLAUDE.md edit (delete / "
+    "trim / reword an entry), that edit IS the whole deliverable: "
+    "apply it as asked and do not add a replacement bullet for what "
+    "you removed. Deleting X and appending an equivalent back leaves "
+    "the working tree unchanged, and the run gets reported as if you "
+    "ignored the request.\n"
     "* If a human complains about your CLAUDE.md entries, delete what "
     "they point at and raise your bar, but never promise to stop "
     "maintaining the file — that maintenance is part of your job. "
@@ -945,16 +951,16 @@ class DevAgent:
     def _render_mr_description(
         self, task_row: TaskRow, plan: Plan, submission: dict[str, Any]
     ) -> str:
-        description = str(submission.get("description") or "").strip() or "(no description provided)"
+        description = str(submission.get("description") or "").strip() or "(описание не заполнено)"
         notes = str(submission.get("notes") or "").strip()
         plan_block = ""
         if plan.steps:
-            plan_block = "\n## Plan (from Analyst)\n" + "\n".join(
+            plan_block = "\n## План\n" + "\n".join(
                 f"- {s.summary}" for s in plan.steps
             )
         notes_block = ""
         if notes:
-            notes_block = f"\n## Notes from the Dev agent\n{notes}"
+            notes_block = f"\n## Заметки\n{notes}"
         return _safe_format(
             self._config.notifications.merge_request.description,
             key=task_row.external_id, url=task_row.url or "",

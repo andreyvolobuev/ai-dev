@@ -19,9 +19,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from virtual_dev.domain.models.task import (
+    CreatedTask,
+    NewTaskSpec,
     Task,
     TaskComment,
     TaskLink,
+    TaskPatch,
     TaskPriority,
     TaskStatus,
 )
@@ -71,6 +74,7 @@ class JiraTaskTracker(TaskTrackerPort):
         token: str,
         user: str = "",          # kept for backward-compat; not used for PAT auth
         browse_base_url: str | None = None,
+        customer_field_id: str = "",
     ) -> None:
         if not url or not token:
             raise ValueError("Jira URL and token must be provided")
@@ -87,6 +91,14 @@ class JiraTaskTracker(TaskTrackerPort):
         _install_retry_adapter(self._client._session)
         # For building web URLs to tickets.
         self._browse_base_url = (browse_base_url or url).rstrip("/")
+        # Резолвится один раз по имени поля ("Sprint") — id кастомного
+        # поля отличается от инстанса к инстансу Jira.
+        self._sprint_field_id: str | None = None
+        self._sprint_field_resolved = False
+        # Id of the free-text "customer" custom field; empty = not set.
+        self._customer_field_id = customer_field_id
+        # (project, sprint name) -> sprint id, resolved once per process.
+        self._sprint_ids: dict[tuple[str, str], int] = {}
 
     async def fetch_tasks(self, jql: str, limit: int = 50) -> Sequence[Task]:
         def _fetch() -> list[dict[str, Any]]:
@@ -180,6 +192,216 @@ class JiraTaskTracker(TaskTrackerPort):
 
         await asyncio.to_thread(_run)
         logger.info("Jira {} commented ({} chars)", external_id, len(body))
+
+    async def create_task(self, spec: NewTaskSpec) -> CreatedTask:
+        def _run() -> CreatedTask:
+            fields: dict[str, Any] = {
+                "project": {"key": spec.project},
+                "issuetype": {"name": spec.issue_type},
+                "summary": spec.summary,
+                "description": spec.description,
+            }
+            if spec.labels:
+                fields["labels"] = list(spec.labels)
+            if spec.components:
+                fields["components"] = [{"name": name} for name in spec.components]
+            if spec.customer and self._customer_field_id:
+                fields[self._customer_field_id] = spec.customer
+            if spec.assignee:
+                fields["assignee"] = {"name": spec.assignee}
+            try:
+                created = self._client.create_issue(fields=fields)
+            except Exception:
+                # Re-raise the ORIGINAL exception: the intake runner picks
+                # the human reply from its HTTP status. What we add is the
+                # list of types the project accepts — Jira answers a wrong
+                # type with "The issue type selected is invalid" and never
+                # says what it would have taken.
+                valid = _valid_issue_type_names(self._client, spec.project)
+                logger.error(
+                    "Jira: create in {} rejected with issuetype {!r}; "
+                    "project accepts: {}",
+                    spec.project,
+                    spec.issue_type,
+                    ", ".join(repr(name) for name in valid) or "(lookup failed)",
+                )
+                raise
+            if not isinstance(created, dict) or not created.get("key"):
+                _raise_for_non_dict_response(created)
+            key = str(cast(dict[str, Any], created)["key"])
+
+            warnings: list[str] = []
+            sprint_name: str | None = None
+            if spec.sprint_name:
+                # The sprint goes in as a second step via the Agile endpoint:
+                # the sprint field format differs between Jira versions,
+                # while /sprint/<id>/issue is stable.
+                try:
+                    sprint_id = self._find_sprint(spec.project, spec.sprint_name)
+                    if sprint_id is None:
+                        warnings.append("sprint_not_found")
+                    else:
+                        self._client.add_issues_to_sprint(sprint_id, [key])
+                        sprint_name = spec.sprint_name
+                except Exception:
+                    logger.exception(
+                        "Jira: could not put {} into sprint {!r} of {}",
+                        key, spec.sprint_name, spec.project,
+                    )
+                    warnings.append("sprint_failed")
+                    sprint_name = None
+
+            return CreatedTask(
+                key=key,
+                url=f"{self._browse_base_url}/browse/{key}",
+                assignee=spec.assignee,
+                sprint_name=sprint_name,
+                warnings=warnings,
+            )
+
+        task = await asyncio.to_thread(_run)
+        logger.info(
+            "Jira created {} (labels={}, assignee={}, sprint={}, warnings={})",
+            task.key, spec.labels, spec.assignee, task.sprint_name, task.warnings,
+        )
+        return task
+
+    async def update_task(self, external_id: str, patch: TaskPatch) -> None:
+        if patch.is_empty():
+            return
+
+        def _run() -> None:
+            fields: dict[str, Any] = {}
+            if patch.summary is not None:
+                fields["summary"] = patch.summary
+            if patch.description is not None:
+                fields["description"] = patch.description
+            if patch.assignee is not None:
+                # "" снимает исполнителя: Jira ждёт assignee=None.
+                fields["assignee"] = (
+                    {"name": patch.assignee} if patch.assignee else None
+                )
+            if patch.labels_add or patch.labels_remove:
+                current = self._client.issue_field_value(external_id, "labels")
+                labels = [str(x) for x in current] if isinstance(current, list) else []
+                for label in patch.labels_add:
+                    if label not in labels:
+                        labels.append(label)
+                labels = [x for x in labels if x not in set(patch.labels_remove)]
+                fields["labels"] = labels
+            if patch.sprint is False:
+                sprint_field = self._sprint_field()
+                if sprint_field:
+                    fields[sprint_field] = None
+            if fields:
+                self._client.update_issue_field(external_id, fields)
+            if patch.sprint is True and patch.sprint_name:
+                project = external_id.split("-")[0]
+                sprint_id = self._find_sprint(project, patch.sprint_name)
+                if sprint_id is None:
+                    logger.warning(
+                        "Jira: sprint {!r} not found for {}", patch.sprint_name, external_id,
+                    )
+                else:
+                    self._client.add_issues_to_sprint(sprint_id, [external_id])
+
+        await asyncio.to_thread(_run)
+        logger.info("Jira {} patched", external_id)
+
+    async def find_tracker_user_by_email(self, email: str) -> str | None:
+        if not email.strip():
+            return None
+
+        def _run() -> str | None:
+            # Jira Server требует именно ``username``; матчится по
+            # username / displayName / emailAddress.
+            entries = self._client.user_find_by_user_string(
+                username=email, limit=10,
+            )
+            return _pick_tracker_username(entries, email)
+
+        return await asyncio.to_thread(_run)
+
+    # --- internals (write path) ---
+
+    def _sprint_field(self) -> str | None:
+        """id кастомного поля «Sprint», один раз на процесс."""
+        if self._sprint_field_resolved:
+            return self._sprint_field_id
+        self._sprint_field_resolved = True
+        try:
+            for field in self._client.get_all_fields() or []:
+                if (
+                    isinstance(field, dict)
+                    and str(field.get("name") or "") == _SPRINT_FIELD_NAME
+                ):
+                    self._sprint_field_id = str(field.get("id") or "") or None
+                    break
+        except Exception:
+            logger.exception("Jira: could not resolve the Sprint field id")
+            self._sprint_field_id = None
+        if self._sprint_field_id is None:
+            logger.warning("Jira: no custom field named {!r}", _SPRINT_FIELD_NAME)
+        return self._sprint_field_id
+
+    def _find_sprint(self, project: str, name: str) -> int | None:
+        """Id of the non-closed sprint called ``name`` on the project's boards.
+
+        Cached per process once found; a miss is not cached, so a sprint
+        created later is picked up without a restart.
+        """
+        cached = self._sprint_ids.get((project, name))
+        if cached is not None:
+            return cached
+        for board_id in self._board_ids(project):
+            try:
+                found = self._find_sprint_on_board(board_id, name)
+            except Exception as exc:
+                # A board can refuse for reasons we do not control (rights,
+                # reconfigured since listing); it must not hide a sprint
+                # that exists on another board.
+                logger.warning("Jira: sprints of board {} unavailable: {}", board_id, exc)
+                continue
+            if found is not None:
+                self._sprint_ids[(project, name)] = found
+                return found
+        return None
+
+    def _find_sprint_on_board(self, board_id: int, name: str) -> int | None:
+        start = 0
+        while True:
+            page = self._client.get_all_sprints_from_board(
+                board_id, start=start, limit=_AGILE_PAGE_SIZE,
+            )
+            values = page.get("values") or [] if isinstance(page, dict) else []
+            for sprint in values:
+                if (
+                    isinstance(sprint, dict)
+                    and sprint.get("name") == name
+                    and str(sprint.get("state") or "").lower() != "closed"
+                    and sprint.get("id") is not None
+                ):
+                    return int(sprint["id"])
+            if not values or not isinstance(page, dict) or page.get("isLast", True):
+                return None
+            start += len(values)
+
+    def _board_ids(self, project: str) -> list[int]:
+        ids: list[int] = []
+        start = 0
+        while True:
+            page = self._client.get_all_agile_boards(
+                project_key=project, start=start, limit=_AGILE_PAGE_SIZE,
+            )
+            values = page.get("values") or [] if isinstance(page, dict) else []
+            # Only scrum boards have sprints; kanban ones answer HTTP 400.
+            ids.extend(
+                int(b["id"]) for b in values
+                if isinstance(b, dict) and "id" in b and b.get("type") == "scrum"
+            )
+            if not values or not isinstance(page, dict) or page.get("isLast", True):
+                return ids
+            start += len(values)
 
     def _purge_session_pool(self) -> None:
         """Clear pooled HTTP connections on the underlying Session.
@@ -398,6 +620,55 @@ def _fetch_comments(client: Jira, key: str) -> list[TaskComment]:
             external_id=str(entry.get("id") or "") or None,
         ))
     return out
+
+
+_SPRINT_FIELD_NAME = "Sprint"
+_AGILE_PAGE_SIZE = 50
+def _pick_tracker_username(entries: Any, email: str) -> str | None:
+    """Логин Jira по результату ``user/search``.
+
+    Приоритет — точное совпадение ``emailAddress``. Jira Server часто
+    скрывает email в выдаче (privacy setting): тогда единственный
+    результат по email-запросу считаем тем самым человеком; два и
+    более результата — уже неоднозначность (назначить наугад хуже, чем
+    не назначить).
+    """
+    if not isinstance(entries, list):
+        return None
+    target = email.strip().lower()
+    candidates: list[dict[str, Any]] = [e for e in entries if isinstance(e, dict)]
+    for entry in candidates:
+        if str(entry.get("emailAddress") or "").strip().lower() == target:
+            name = str(entry.get("name") or "")
+            if name:
+                return name
+    if len(candidates) == 1:
+        return str(candidates[0].get("name") or "") or None
+    return None
+
+
+def _valid_issue_type_names(client: Jira, project: str) -> list[str]:
+    """Issue-type names the project accepts on the create screen.
+
+    Empty list when the lookup fails: this is diagnostics on the failure
+    path and must never replace the original Jira error. Names are often
+    localised — project DM calls them "Zadacha" / "Oshibka" in Cyrillic —
+    so they cannot be guessed in code, only asked of the project.
+    """
+    try:
+        raw = client.get_project(project)
+    except Exception:
+        logger.debug(
+            "Jira: project lookup for {} failed", project, exc_info=True,
+        )
+        return []
+    if not isinstance(raw, dict):
+        return []
+    names: list[str] = []
+    for item in raw.get("issueTypes") or []:
+        if isinstance(item, dict) and item.get("name"):
+            names.append(str(item["name"]))
+    return names
 
 
 def _install_retry_adapter(session: Any) -> None:

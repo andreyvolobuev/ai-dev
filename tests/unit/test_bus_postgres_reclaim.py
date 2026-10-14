@@ -77,3 +77,39 @@ async def test_expired_lease_is_reclaimable_on_postgres() -> None:
         async with engine.begin() as conn:
             await conn.execute(delete(AgentMessageRow))
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_renew_extends_the_lease_on_postgres() -> None:
+    """Renewal binds a datetime too, so it shares the naive/aware trap
+    the reclaim test above guards. Same helper, same coverage."""
+    engine = await _pg_engine()
+    try:
+        sf = make_session_factory(engine)
+        bus = SqlAlchemyMessageBus(
+            session_factory=sf, dialect_name="postgresql", lease_seconds=5,
+        )
+        await bus.publish(AgentMessage(
+            id="renew-1", from_agent="orch", to_agent="analyst",
+            topic="task.discovered", payload={"external_id": "DM-1"},
+        ))
+
+        claimed = await bus._claim_next("analyst")
+        assert claimed is not None
+
+        # Lease about to lapse — the handler is still working.
+        async with sf() as session:
+            await session.execute(update(AgentMessageRow).values(
+                claimed_until=datetime.now(timezone.utc) + timedelta(seconds=1),
+            ))
+            await session.commit()
+
+        assert await bus.renew(claimed) is True
+        assert await bus._claim_next("analyst") is None
+
+        await bus.ack(claimed)
+        assert await bus.renew(claimed) is False
+    finally:
+        async with engine.begin() as conn:
+            await conn.execute(delete(AgentMessageRow))
+        await engine.dispose()

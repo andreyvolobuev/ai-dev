@@ -67,12 +67,42 @@ class ChatPort(ABC):
         Default ``None`` so fakes that never need it can ignore it."""
         return None
 
+    async def get_user_by_id(self, user_id: str) -> ChatUser | None:
+        """User by their id in the chat, or ``None``.
+
+        Needed for task intake: post author is known only by id, but
+        in the tracker they are looked up by email. Default ``None`` so
+        fakes that don't need this can ignore the method.
+        """
+        return None
+
+    async def post_permalink(
+        self, post_id: str, channel_id: str,
+    ) -> str | None:
+        """Human-readable link to a post, or ``None``.
+
+        Goes into the description of a created ticket — "where the
+        request came from". Default ``None``: a ticket is created
+        fine without a link.
+        """
+        return None
+
     @abstractmethod
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
         """Add an emoji reaction (by name, e.g. ``white_check_mark``) to a post.
 
         Used as an idempotency marker so the bot doesn't re-process a
         thread reply it has already handled.
+        """
+
+    async def remove_reaction(  # noqa: B027 - intentionally non-abstract, see below
+        self, post_id: str, emoji_name: str,
+    ) -> None:
+        """Remove the bot's own emoji reaction from a post.
+
+        Deliberately NOT abstract: many test fakes subclass ``ChatPort`` and
+        an abstract method would make every one of them uninstantiable.
+        The default does nothing.
         """
 
     @abstractmethod

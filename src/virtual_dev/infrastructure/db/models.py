@@ -425,6 +425,32 @@ class ProcessedThreadPostRow(Base):
     )
 
 
+class IntakeRequestRow(Base):
+    """Заявка «заведи задачу», пришедшая упоминанием бота в Mattermost.
+
+    Строка вставляется ДО создания тикета в Jira: ``source_post_id``
+    уникален, поэтому повторная доставка одного поста (WS-событие плюс
+    catch-up sweep) второй тикет не создаст. ``issue_key`` заполняется,
+    когда Jira ответила.
+
+    ``mm_root_id`` — корень треда просьбы (для поста без треда это сам
+    пост): по нему находятся последующие правки «переименуй»,
+    «переназначь».
+    """
+
+    __tablename__ = "intake_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_post_id: Mapped[str] = mapped_column(String(64), unique=True)
+    mm_root_id: Mapped[str] = mapped_column(String(64), index=True)
+    mm_channel_id: Mapped[str] = mapped_column(String(64))
+    requester_mm_user_id: Mapped[str] = mapped_column(String(64))
+    issue_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+
 class ProcessedReviewCommentRow(Base):
     """Cross-restart / cross-instance dedup claim for GitLab review replies.
 

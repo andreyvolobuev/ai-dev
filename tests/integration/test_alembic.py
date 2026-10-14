@@ -36,6 +36,7 @@ _EXPECTED_TABLES = {
     "ticket_resets",
     "processed_thread_posts",
     "processed_review_comments",
+    "intake_requests",
 }
 
 # Per UniqueConstraint defined in models.py.

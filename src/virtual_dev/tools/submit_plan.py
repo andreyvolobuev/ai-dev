@@ -8,6 +8,7 @@ from claude_agent_sdk import tool
 
 from virtual_dev.application.services.agent_effects import AnalystEffect
 from virtual_dev.tools import ToolContext, wrap_text
+from virtual_dev.tools._helpers import scrub_human_fields
 
 TOOL_GROUP = "analyst"
 
@@ -83,7 +84,8 @@ def build(ctx: ToolContext):
         if run_state.get("terminal"):
             return wrap_text({"recorded": False, "reason": "already_terminal"})
         submit_capture.clear()
-        submit_capture.update(args)
+        # summary and risks are rendered into the Jira comment.
+        submit_capture.update(scrub_human_fields(args, ("summary", "risks")))
         effects.append(AnalystEffect(
             kind="plan_submitted",
             payload={

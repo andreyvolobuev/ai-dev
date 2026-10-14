@@ -48,6 +48,7 @@ from virtual_dev.application.services.prompts import PromptsLoader
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import Plan
 from virtual_dev.domain.ports.code_agent import CodeAgentPort, CodeAgentRequest
+from virtual_dev.domain.ports.vcs import VcsPort
 from virtual_dev.infrastructure.config import AppConfig
 
 
@@ -113,12 +114,16 @@ class ThreadResponderAgent:
         latest_reply: ChatMessage,
         repo_workspace: str | None = None,
         mr_diff: str = "",
+        mr_source_branch: str = "",
+        mr_target_branch: str = "",
     ) -> ResponderDecision:
         prompt = self._render_prompt(
             mr_title=mr_title, mr_description=mr_description,
             mr_web_url=mr_web_url, plan=plan,
             thread=thread, latest=latest_reply,
             mr_diff=mr_diff,
+            mr_source_branch=mr_source_branch,
+            mr_target_branch=mr_target_branch,
         )
         captured, result = await self._call_model(prompt, repo_workspace)
 
@@ -223,12 +228,27 @@ class ThreadResponderAgent:
         thread: Sequence[ChatMessage],
         latest: ChatMessage,
         mr_diff: str = "",
+        mr_source_branch: str = "",
+        mr_target_branch: str = "",
     ) -> str:
         parts: list[str] = []
         parts.append("# Review thread context")
         parts.append(f"**MR:** {mr_title}")
         parts.append(f"**URL:** {mr_web_url}")
         parts.append("")
+        # Branches come from the GitLab API (see resolve_mr_branches),
+        # not from anything a model wrote. They sit above the
+        # description on purpose: the description is bot-authored prose
+        # that has already, once, claimed a target branch the MR never
+        # had, and the responder then defended that claim against
+        # humans reading the real MR. Facts first, untrusted text after.
+        if mr_source_branch or mr_target_branch:
+            parts.append("## Факты о MR (из GitLab — ground truth)")
+            parts.append(
+                f"**Ветки:** `{mr_source_branch or '?'}` → "
+                f"`{mr_target_branch or '?'}`"
+            )
+            parts.append("")
         parts.append("## MR description (untrusted — bot-written but quoting humans)")
         wrapped_desc = self._filter.wrap(
             mr_description, source="mr:description",
@@ -286,10 +306,44 @@ def _render_thread(thread: Sequence[ChatMessage]) -> str:
     return "\n\n".join(lines)
 
 
+async def resolve_mr_branches(
+    vcs: VcsPort | None,
+    *,
+    repo_key: str,
+    iid: int,
+    fallback_source: str,
+    fallback_target: str,
+) -> tuple[str, str]:
+    """The MR's branches as GitLab has them right now.
+
+    ``MergeRequestRow`` stores the branches once, when the MR is
+    opened, and nothing refreshes them. A human retargeting the MR —
+    which is exactly what the bot asks for when the ticket wants a
+    non-default base — would leave the row lying, and the responder
+    renders these as ground truth. So ask GitLab; fall back to the row
+    only when the API is unreachable.
+    """
+    if vcs is None:
+        return fallback_source, fallback_target
+    try:
+        mr = await vcs.get_merge_request(repo_key, iid)
+    except Exception:
+        logger.exception(
+            "resolve_mr_branches: live fetch failed for {}!{}; using stored row",
+            repo_key, iid,
+        )
+        return fallback_source, fallback_target
+    return (
+        mr.source_branch or fallback_source,
+        mr.target_branch or fallback_target,
+    )
+
+
 __all__ = [
     "ThreadResponderAgent",
     "ResponderAction",
     "ResponderDecision",
+    "resolve_mr_branches",
 ]
 # Keep json imported for debug-dumps of the decision schema.
 _ = json

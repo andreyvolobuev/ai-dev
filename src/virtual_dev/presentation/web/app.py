@@ -184,6 +184,9 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
         agent_key=AnalystAgent.agent_key,
         message_bus=container.message_bus,
         handlers={TOPIC_TASK_DISCOVERED: analyst_inbox.handle},
+        lease_renew_interval_seconds=(
+            container.settings.bus_lease_renew_interval_seconds
+        ),
     )
 
     # Dev-agents are constructed in the Container so that DevOps + the
@@ -201,6 +204,9 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             agent_key=dev.agent_key,
             message_bus=container.message_bus,
             handlers={TOPIC_PLAN_READY: inbox.handle},
+            lease_renew_interval_seconds=(
+                container.settings.bus_lease_renew_interval_seconds
+            ),
         )
         dev_runners.append(runner)
 
@@ -248,6 +254,7 @@ def create_app(container: Container, *, start_scheduler: bool = True) -> FastAPI
             settings=container.settings,
             vcs=container.vcs,
             analyst_inbox=analyst_inbox,
+            intake_inbox=container.task_intake_inbox,
         )
         # Catch-up tick — runs independently of the WS health, so
         # missed posts get replayed even if the listener's

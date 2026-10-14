@@ -85,6 +85,16 @@ class Settings(BaseSettings):
     # iteration). max_turns bounds turn count, not time — a wedged CLI
     # would otherwise hang its worker forever.
     code_agent_run_timeout_seconds: int = 3600
+    # Bus lease = how long a claimed message stays invisible to other
+    # consumers. It is a LIVENESS window, not a work deadline: the
+    # consuming runner heartbeats it forward every
+    # ``bus_lease_renew_interval_seconds`` while its handler runs, so a
+    # run may legitimately take far longer than the lease. Keep the
+    # renew interval well under the lease (a few missed renewals in a
+    # row should not cost the claim) — and the lease itself short
+    # enough that a killed pod's work is picked up promptly.
+    bus_lease_seconds: int = 300
+    bus_lease_renew_interval_seconds: int = 60
     # Sentence-embedding model for MR-history similarity search. Empty →
     # the fastembed adapter's default (multilingual MiniLM, 384 dim).
     # NB: changing the model invalidates stored vectors — mr_history

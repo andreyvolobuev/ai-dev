@@ -8,6 +8,10 @@ Delivery semantics: **at-least-once** with explicit ack.
   redelivers — handlers must therefore be idempotent. (Application
   models already enforce this via UNIQUE constraints on ``TaskRow``,
   ``MergeRequestRow``, ``AnalystConversationFragmentRow``.)
+* A handler that runs longer than one lease period must call
+  ``renew(message)`` while it works, otherwise the bus considers it
+  dead and hands the message to someone else *while it is still
+  running*. The lease is a liveness signal, not a deadline.
 * In-memory adapters MAY treat ``ack`` as a no-op; the port still
   requires the call so the contract is consistent across backends.
 """
@@ -59,3 +63,17 @@ class MessageBusPort(ABC):
     async def ack(self, message: AgentMessage) -> None:
         """Mark ``message`` as fully handled. After ack the bus must
         not redeliver it. No-op in non-durable backends."""
+
+    async def renew(self, message: AgentMessage) -> bool:
+        """Extend ``message``'s lease by a full lease period.
+
+        A consumer whose handler legitimately runs longer than one lease
+        calls this periodically; without it the bus treats the handler
+        as dead and redelivers, so the same work starts a second time in
+        parallel. Returns ``False`` when there was nothing to extend
+        (already acked, or gone).
+
+        Concrete by design: lease-less backends have nothing to extend,
+        and a consumer must be able to call this against any bus.
+        """
+        return True

@@ -226,3 +226,62 @@ async def test_lease_reaper_returns_expired_claims(
     a = await bus._claim_next("analyst")
     b = await bus._claim_next("analyst")
     assert {a.payload["task_id"], b.payload["task_id"]} == {"DM-X", "DM-Y"}  # type: ignore[union-attr]
+
+
+# --- lease renewal -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_renew_extends_the_lease_of_an_in_flight_message(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A handler that outlives the lease must be able to keep its claim.
+    Without renewal the bus hands the same message to another consumer
+    while the first one is still working on it."""
+    clock = _Clock()
+    bus = SqliteMessageBus(
+        session_factory,
+        poll_interval_seconds=0.01,
+        lease_seconds=300,
+        clock=clock.now,
+    )
+    await bus.publish(_msg(task_id="DM-1"))
+
+    msg = await bus._claim_next("analyst")
+    assert msg is not None
+
+    # Still working at t+250: push the lease out another 300s.
+    clock.advance(seconds=250)
+    assert await bus.renew(msg) is True
+
+    # t+310 — past the ORIGINAL lease, inside the renewed one.
+    clock.advance(seconds=60)
+    assert await bus._claim_next("analyst") is None, (
+        "renewed lease must keep the message in flight"
+    )
+
+    # Renewal stops when the handler stops: the lease now expires for real.
+    clock.advance(seconds=300)
+    assert await bus._claim_next("analyst") is not None
+
+
+@pytest.mark.asyncio
+async def test_renew_is_false_for_an_already_acked_message(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Renewing a finished message must not resurrect it."""
+    clock = _Clock()
+    bus = SqliteMessageBus(
+        session_factory,
+        poll_interval_seconds=0.01,
+        lease_seconds=300,
+        clock=clock.now,
+    )
+    await bus.publish(_msg(task_id="DM-1"))
+    msg = await bus._claim_next("analyst")
+    assert msg is not None
+    await bus.ack(msg)
+
+    assert await bus.renew(msg) is False
+    clock.advance(seconds=10_000)
+    assert await bus._claim_next("analyst") is None

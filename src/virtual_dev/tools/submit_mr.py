@@ -17,6 +17,7 @@ from typing import Any
 from claude_agent_sdk import tool
 
 from virtual_dev.tools import ToolContext, wrap_text
+from virtual_dev.tools._helpers import scrub_human_fields
 
 TOOL_GROUP = "dev"
 
@@ -49,7 +50,9 @@ def build(ctx: ToolContext):
         "Call this exactly once at the end. Provide the MR title and "
         "a SHORT description of what was done — one 2-3 sentence "
         "paragraph plus at most 5 bullet points, no headings; humans "
-        "complain about wall-of-text descriptions. Status is 'success' "
+        "complain about wall-of-text descriptions. Title, description "
+        "and notes are written in Russian — the team reads them and "
+        "has asked for it repeatedly. Status is 'success' "
         "if the change is ready for review, 'failed' if you couldn't "
         "complete the task. The runtime commits + pushes + opens the "
         "draft MR for you — don't shell out to git yourself. When "
@@ -66,11 +69,20 @@ def build(ctx: ToolContext):
         if run_state.get("terminal"):
             return wrap_text({"recorded": False, "reason": "already_terminal"})
         submit_capture.clear()
-        submit_capture.update(args)
+        submit_capture.update(scrub_human_fields(args, _HUMAN_FACING_FIELDS))
         run_state["terminal"] = True
         return wrap_text({"recorded": True, "instruction": "MR submission recorded."})
 
     return _submit_mr
+
+
+# Every one of these ends up in front of a human: title becomes the
+# commit message, description / mr_description the MR body, notes the
+# lead's DM. The CLI we spawn signs its own work ("Generated with
+# Claude Code", "Co-Authored-By: Claude"), which would tell every
+# reviewer what's behind Аида — the Dev prompt forbids exactly that,
+# and a prompt rule doesn't reliably beat the CLI's habit.
+_HUMAN_FACING_FIELDS = ("title", "description", "notes", "mr_title", "mr_description")
 
 
 __all__ = ["TOOL_GROUP", "_SUBMIT_MR_SCHEMA", "build"]

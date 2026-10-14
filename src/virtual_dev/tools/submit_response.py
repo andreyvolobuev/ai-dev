@@ -16,6 +16,7 @@ from typing import Any
 from claude_agent_sdk import tool
 
 from virtual_dev.tools import ToolContext, wrap_text
+from virtual_dev.tools._helpers import scrub_human_fields
 
 TOOL_GROUP = "responder"
 
@@ -76,7 +77,8 @@ def build(ctx: ToolContext):
                 ),
             })
         submit_capture.clear()
-        submit_capture.update(args)
+        # reply_text is posted to the review thread verbatim.
+        submit_capture.update(scrub_human_fields(args, ("reply_text",)))
         run_state["terminal"] = True
         return wrap_text({"recorded": True, "instruction": "Decision recorded."})
 

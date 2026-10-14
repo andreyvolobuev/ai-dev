@@ -126,6 +126,9 @@ class _RecordingBus:
     async def ack(self, message: AgentMessage) -> None:
         self.acked.append(message)
 
+    async def renew(self, message: AgentMessage) -> bool:
+        return True
+
 
 @pytest.mark.asyncio
 async def test_runner_acks_after_successful_handler() -> None:
@@ -217,6 +220,9 @@ async def test_runner_resubscribes_after_bus_iterator_crash() -> None:
         async def ack(self, message: AgentMessage) -> None:
             self.acked.append(message)
 
+        async def renew(self, message: AgentMessage) -> bool:
+            return True
+
     async def handler(msg: AgentMessage) -> None:
         handled.append(msg.id)
 
@@ -240,3 +246,95 @@ async def test_runner_resubscribes_after_bus_iterator_crash() -> None:
     assert handled == ["m1"]
     assert bus.subscribe_calls >= 2
     assert [m.id for m in bus.acked] == ["m1"]
+
+
+# --- lease renewal while a handler is in flight --------------------------
+
+
+@pytest.mark.asyncio
+async def test_long_handler_keeps_its_lease(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An analyst run may legitimately take longer than the bus lease
+    (code_agent_run_timeout_seconds is 3600 against a 300s lease). While
+    the handler is in flight the runner must keep extending the claim,
+    or the bus hands the same message out again and the agent re-runs
+    the same ticket in parallel — the DM-3548 loop."""
+    bus = SqliteMessageBus(
+        session_factory, poll_interval_seconds=0.01, lease_seconds=0.3,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_msg: AgentMessage) -> None:
+        started.set()
+        await release.wait()
+
+    runner = AgentRunner(
+        agent_key="analyst", message_bus=bus,
+        handlers={"task.discovered": handler},
+        lease_renew_interval_seconds=0.05,
+    )
+    task = asyncio.create_task(runner.run_forever())
+    try:
+        await bus.publish(AgentMessage(
+            id="", from_agent="orchestrator", to_agent="analyst",
+            topic="task.discovered", payload={"task_id": "DM-3548"},
+        ))
+        await asyncio.wait_for(started.wait(), timeout=2)
+
+        # Three lease-lengths into the handler's work, the claim must
+        # still be ours: nobody else may pick this message up.
+        await asyncio.sleep(0.9)
+        assert await bus._claim_next("analyst") is None
+
+        release.set()
+        for _ in range(60):
+            if runner.stats.processed:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        release.set()
+        await runner.stop()
+        await asyncio.wait_for(task, timeout=2)
+
+    assert runner.stats.processed == 1
+
+
+@pytest.mark.asyncio
+async def test_renewal_stops_once_the_handler_fails(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Renewal must not outlive the handler: a crashed handler's message
+    has to become reclaimable once its lease runs out, which is what
+    keeps at-least-once delivery working."""
+    bus = SqliteMessageBus(
+        session_factory, poll_interval_seconds=0.01, lease_seconds=0.3,
+    )
+
+    async def handler(_msg: AgentMessage) -> None:
+        raise RuntimeError("boom")
+
+    runner = AgentRunner(
+        agent_key="analyst", message_bus=bus,
+        handlers={"task.discovered": handler},
+        lease_renew_interval_seconds=0.05,
+    )
+    task = asyncio.create_task(runner.run_forever())
+    try:
+        await bus.publish(AgentMessage(
+            id="", from_agent="orchestrator", to_agent="analyst",
+            topic="task.discovered", payload={},
+        ))
+        for _ in range(60):
+            if runner.stats.failed:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        await runner.stop()
+        await asyncio.wait_for(task, timeout=2)
+
+    assert runner.stats.failed >= 1
+    # The heartbeat died with the handler, so the lease expires.
+    await asyncio.sleep(0.4)
+    assert await bus._claim_next("analyst") is not None

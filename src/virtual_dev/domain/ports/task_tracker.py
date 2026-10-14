@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
-from virtual_dev.domain.models.task import Task
+from virtual_dev.domain.models.task import CreatedTask, NewTaskSpec, Task, TaskPatch
 
 
 class TaskTrackerPort(ABC):
@@ -30,3 +30,19 @@ class TaskTrackerPort(ABC):
     @abstractmethod
     async def comment(self, external_id: str, body: str) -> None:
         """Post a comment on the task."""
+
+    # --- Write path (task intake): методы не абстрактные. Адаптерам, которым
+    # создание не нужно, остаётся дефолт; фейки в тестах не перестают
+    # инстанцироваться.
+
+    async def create_task(self, spec: NewTaskSpec) -> CreatedTask:
+        """Создать задачу в трекере и вернуть её ключ + URL."""
+        raise NotImplementedError
+
+    async def update_task(self, external_id: str, patch: TaskPatch) -> None:
+        """Применить точечную правку к существующей задаче."""
+        raise NotImplementedError
+
+    async def find_tracker_user_by_email(self, email: str) -> str | None:
+        """Логин пользователя трекера по email, или ``None``."""
+        raise NotImplementedError

@@ -33,6 +33,7 @@ Virtual Dev is structured as a **hexagonal (ports-and-adapters) application** wi
 - `agents/orchestrator.py` — polls the tracker, upserts tasks, publishes `task.discovered`.
 - `agents/analyst.py` — consumes `task.discovered`, gathers context, plans; on a READY plan publishes `plan.ready` addressed to the target Dev-agent.
 - `agents/dev.py` — consumes `plan.ready`, implements the plan in a dedicated workspace via Claude Code tools, commits + pushes a branch, opens a draft MR. Gated on `task.dor_satisfied`. Four terminal outcomes: `SKIPPED` / `NO_CHANGES` / `MR_OPENED` / `FAILED`.
+- `agents/task_intake.py` — decides what a Mattermost mention is asking for (create a Jira task, patch the one already created, or decline as busy). Read-only: it returns a decision and never writes to Jira or chat.
 - `services/injection_filter.py` — wraps untrusted content in `<untrusted_content>`.
 - `services/link_extractor.py` — buckets URLs in free-form text.
 - `services/communicator.py` — Phase-1-2 read-only surface over `ChatPort`.
@@ -70,6 +71,7 @@ Scheduler lives inside the FastAPI `lifespan` hook. Tasks run in the background 
 - `runtime/workers/agent_runner.py` — generic subscribe-and-dispatch loop for one agent key.
 - `runtime/workers/analyst_inbox.py` — `task.discovered` handler. Transitions the Jira ticket to *In Progress*, runs AnalystAgent, comments the plan, and publishes `plan.ready` when the plan is READY and has a target repo.
 - `runtime/workers/dev_inbox.py` — `plan.ready` handler per Dev-agent. On `MR_OPENED`: transitions to *Review* and comments the MR link. On `FAILED` / `NO_CHANGES`: comments the failure notes.
+- `runtime/workers/intake_inbox.py` — executes the intake decision: claims the request in `intake_requests`, calls `create_task` / `update_task` in Jira, replies in the thread. Side effects live here, not in the agent, because the model reads untrusted chat.
 
 ## Agents
 
@@ -83,6 +85,7 @@ Scheduler lives inside the FastAPI `lifespan` hook. Tasks run in the background 
 | Reviewer | 3 | Handles comments on open MRs |
 | QA | 3 | Validates tests |
 | DevOps | 3 | CI/CD, red pipelines |
+| Task Intake | 5 | On an MM mention creates / patches a Jira task (labels `dmp-sup`, active sprint, assignee is the requester) |
 
 Agents communicate **only** via `MessageBusPort`. Production uses the durable `SqliteMessageBus` (atomic claim via stamped `consumed_at`); the in-memory bus is retained for tests. Single-consumer per `to_agent` by convention; `"*"` fans out to every known subscriber.
 

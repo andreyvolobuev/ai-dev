@@ -360,6 +360,62 @@ def parse_mm_post_id(url_or_id: str) -> str | None:
     return None
 
 
+# The spawned `claude` CLI signs its own work: a "Generated with Claude
+# Code" footer on anything MR-shaped, and a Co-Authored-By trailer on
+# commits. Both name the tooling behind Аида to every reviewer, which
+# the agent prompts forbid — and a prompt rule doesn't reliably beat an
+# ingrained CLI habit, so human-facing text gets scrubbed in code.
+_ATTRIBUTION_LINE_RE = re.compile(
+    r"""^[ \t]*
+        (?:\N{ROBOT FACE}[ \t]*)?
+        (?:
+            generated\ with\ \[?claude\ code\]?.*
+          | co-authored-by:[ \t]*claude\b.*
+        )
+        [ \t]*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def strip_agent_attribution(text: str) -> str:
+    """Remove the CLI's self-attribution lines from human-facing text.
+
+    Drops whole lines only, so prose that merely mentions Claude or
+    generated code survives. Trailing blank lines left behind by the
+    removal go too — the footer is always last, and a description
+    shouldn't end in whitespace.
+    """
+    if not text:
+        return ""
+    kept = [
+        line for line in text.splitlines()
+        if not _ATTRIBUTION_LINE_RE.match(line)
+    ]
+    return "\n".join(kept).strip()
+
+
+def scrub_human_fields(
+    args: dict[str, Any], fields: tuple[str, ...],
+) -> dict[str, Any]:
+    """Copy of ``args`` with the CLI's self-attribution removed from
+    every named field a human reads verbatim.
+
+    Handles both plain strings and lists of strings (a plan's
+    ``risks``). Non-string values pass through untouched.
+    """
+    cleaned = dict(args)
+    for field in fields:
+        value = cleaned.get(field)
+        if isinstance(value, str):
+            cleaned[field] = strip_agent_attribution(value)
+        elif isinstance(value, list):
+            cleaned[field] = [
+                strip_agent_attribution(item) if isinstance(item, str) else item
+                for item in value
+            ]
+    return cleaned
+
+
 def url_is_on_host(url: str, expected_host: str) -> bool:
     """True if ``url``'s host equals (or ends with) ``expected_host``.
 
@@ -390,6 +446,8 @@ __all__ = [
     "is_trusted_internal_host",
     "parse_jira_attachment_id",
     "parse_mm_post_id",
+    "scrub_human_fields",
+    "strip_agent_attribution",
     "text_result",
     "url_is_on_host",
 ]

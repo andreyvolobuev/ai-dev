@@ -34,6 +34,25 @@ WORKDIR ${WORKDIR_PATH}
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
+# Layer 1.5: bake the embedding model into the image.
+#
+# fastembed downloads it lazily, on the first embed() call — which in
+# practice is the first search_mr_history, i.e. in the MIDDLE of an agent
+# run. The container's cache is ephemeral, so that download happened on
+# EVERY start: ~0.5GB pulled from huggingface.co over the network, plus
+# the download buffers on top of an already-running agent, plus an
+# unauthenticated HF dependency ("set a HF_TOKEN to enable higher rate
+# limits") that breaks the tool whenever HF throttles or is unreachable.
+# Baked here, the model is just there: no network, no warning, no spike.
+#
+# Must match FastembedEmbedder._DEFAULT_MODEL. Setting EMBEDDER_MODEL at
+# runtime to anything else brings the runtime download back.
+ENV FASTEMBED_CACHE_PATH=/opt/fastembed
+ARG EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+RUN .venv/bin/python -c "\
+from fastembed import TextEmbedding; \
+TextEmbedding(model_name='${EMBEDDING_MODEL}')"
+
 # Layer 2: project source + runtime assets.
 COPY src ./src
 COPY config ./config

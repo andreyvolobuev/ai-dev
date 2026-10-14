@@ -20,6 +20,9 @@ Handler = Callable[[AgentMessage], Awaitable[None]]
 
 _RESUBSCRIBE_INITIAL_BACKOFF = 5.0
 _RESUBSCRIBE_MAX_BACKOFF = 300.0
+# How often an in-flight handler reports "still alive" to the bus. Must
+# stay well under the bus lease — see ``_renew_until_done``.
+_DEFAULT_LEASE_RENEW_INTERVAL = 60.0
 
 
 @dataclass
@@ -37,10 +40,12 @@ class AgentRunner:
         agent_key: str,
         message_bus: MessageBusPort,
         handlers: dict[str, Handler],
+        lease_renew_interval_seconds: float = _DEFAULT_LEASE_RENEW_INTERVAL,
     ) -> None:
         self._agent_key = agent_key
         self._bus = message_bus
         self._handlers = handlers
+        self._renew_interval = lease_renew_interval_seconds
         self._stop_event = asyncio.Event()
         self._running = False
         self.stats = AgentRunnerStats()
@@ -128,7 +133,12 @@ class AgentRunner:
     async def _dispatch(self, message: AgentMessage) -> bool:
         """Run the registered handler. Returns True iff the handler ran
         to completion successfully — caller acks only on True so a
-        crashed handler's lease expires and the bus redelivers."""
+        crashed handler's lease expires and the bus redelivers.
+
+        The handler runs under a lease heartbeat: an agent run is allowed
+        to take up to an hour, many times the bus lease, and a lease that
+        expires mid-run gets the SAME message delivered to a second
+        consumer while this one is still working."""
         handler = self._handlers.get(message.topic)
         if handler is None:
             # No handler == nothing to retry. Treat as "handled" so the
@@ -138,6 +148,7 @@ class AgentRunner:
                 self._agent_key, message.topic,
             )
             return True
+        heartbeat = self._start_heartbeat(message)
         try:
             await handler(message)
             self.stats.processed += 1
@@ -149,10 +160,54 @@ class AgentRunner:
                 self._agent_key, message.topic,
             )
             return False
+        finally:
+            # Stop reporting in the moment the handler is done, however
+            # it ended: a crashed handler MUST let its lease lapse so
+            # at-least-once delivery still works.
+            await _cancel(heartbeat)
+
+    def _start_heartbeat(self, message: AgentMessage) -> asyncio.Task[None] | None:
+        if self._renew_interval <= 0:
+            return None
+        return asyncio.create_task(
+            self._renew_until_done(message),
+            name=f"lease-renew[{self._agent_key}]",
+        )
+
+    async def _renew_until_done(self, message: AgentMessage) -> None:
+        """Extend ``message``'s lease every ``_renew_interval`` seconds.
+
+        Lives exactly as long as the handler. A renewal that comes back
+        False means the message is no longer ours to hold (acked, or
+        wiped by /reset) — nothing left to do, so stop quietly. Bus
+        errors are logged and retried: one failed renewal doesn't cost
+        the lease, several in a row legitimately do."""
+        while True:
+            await asyncio.sleep(self._renew_interval)
+            try:
+                if not await self._bus.renew(message):
+                    logger.debug(
+                        "AgentRunner[{}] lease for {!r} no longer renewable",
+                        self._agent_key, message.topic,
+                    )
+                    return
+            except Exception:
+                logger.exception(
+                    "AgentRunner[{}] failed to renew the lease for {!r}",
+                    self._agent_key, message.topic,
+                )
 
 
 async def _anext(iterator: Any) -> AgentMessage:
     return await iterator.__anext__()
+
+
+async def _cancel(task: asyncio.Task[None] | None) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    with _suppress_cancel():
+        await task
 
 
 class _suppress_cancel:

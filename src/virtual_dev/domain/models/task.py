@@ -117,3 +117,70 @@ class Task:
     internal_status: TaskStatus = TaskStatus.DISCOVERED
     target_repo_key: str | None = None  # определяется Analyst-агентом
     dor_satisfied: bool = False         # definition of ready — готова ли задача к кодингу
+
+
+@dataclass
+class NewTaskSpec:
+    """Что именно создать в трекере. Собирается раннером интейка:
+    project / issue_type / labels приходят из конфига, summary и
+    description — из решения модели, assignee уже резолвлен в
+    username трекера.
+
+    ``components`` - tracker components to set on creation;
+    ``sprint_name`` - name of the sprint to file into (``None`` = no
+    sprint); ``customer`` - who asked, as plain text (the adapter maps
+    it onto the tracker's own field, if it has one)."""
+
+    project: str
+    issue_type: str
+    summary: str
+    description: str
+    labels: list[str] = field(default_factory=list)
+    assignee: str | None = None
+    components: list[str] = field(default_factory=list)
+    sprint_name: str | None = None
+    customer: str = ""
+
+
+@dataclass
+class TaskPatch:
+    """Точечная правка существующего тикета.
+
+    ``None`` в поле = «не трогать». ``assignee=""`` — снять исполнителя.
+    ``sprint``: True - put back into the sprint named ``sprint_name``,
+    False - remove from any sprint, None - leave alone.
+    """
+
+    summary: str | None = None
+    description: str | None = None
+    assignee: str | None = None
+    labels_add: list[str] = field(default_factory=list)
+    labels_remove: list[str] = field(default_factory=list)
+    sprint: bool | None = None
+    sprint_name: str = ""
+
+    def is_empty(self) -> bool:
+        return (
+            self.summary is None
+            and self.description is None
+            and self.assignee is None
+            and not self.labels_add
+            and not self.labels_remove
+            and self.sprint is None
+        )
+
+
+@dataclass
+class CreatedTask:
+    """Результат создания тикета.
+
+    ``warnings`` — машинные коды частичных сбоев (``sprint_not_found``,
+    ``sprint_failed``); раннер превращает их в честный текст ответа.
+    Тикет при любом из них уже существует.
+    """
+
+    key: str
+    url: str
+    assignee: str | None = None
+    sprint_name: str | None = None
+    warnings: list[str] = field(default_factory=list)
