@@ -27,12 +27,12 @@ class Settings(BaseSettings):
     )
 
     # --- Jira ---
-    jira_url: str = ""
+    jira_url: str = "https://jira.2gis.ru"
     jira_user: str = ""
     jira_token: str = ""
 
     # --- GitLab ---
-    gitlab_url: str = ""
+    gitlab_url: str = "https://gitlab.2gis.ru"
     gitlab_token: str = ""
     # Override for the bot's GitLab username. Project / group access
     # tokens (and most bot-account PATs without ``api`` scope) can't
@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     chat_provider: str = _ChatProvider.MATTERMOST
 
     # --- Mattermost ---
-    mattermost_url: str = ""
+    mattermost_url: str = "https://mm.2gis.one"
     mattermost_token: str = ""
     mattermost_bot_username: str = ""
     # Корпоративный MM часто за self-signed / чужим CA — requests по дефолту
@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     mattermost_ssl_ca_file: str = ""
 
     # --- Confluence ---
-    confluence_url: str = ""
+    confluence_url: str = "https://confluence.2gis.ru"
     confluence_user: str = ""
     confluence_token: str = ""
 
