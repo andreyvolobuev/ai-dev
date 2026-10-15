@@ -28,16 +28,32 @@ class HealthTracker:
     def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
         self._clock = clock or _utcnow
         self._last_success: dict[str, datetime] = {}
+        self._last_error: dict[str, str] = {}
 
     def mark_success(self, name: str) -> None:
         self._last_success[name] = self._clock()
+        self._last_error.pop(name, None)
+
+    def mark_failure(self, name: str, error: str) -> None:
+        """Record that ``name`` just failed. Cleared on next success.
+
+        Failures have no timestamp of their own — the operator-facing
+        signal is "this subsystem has an un-cleared error", which is
+        sufficient to know something is wrong right now.
+        """
+        self._last_error[name] = error
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         now = self._clock()
-        return {
-            name: {
+        out: dict[str, dict[str, Any]] = {}
+        for name, ts in self._last_success.items():
+            out[name] = {
                 "last_success_at": ts,
                 "seconds_since": int((now - ts).total_seconds()),
+                "error": self._last_error.get(name),
             }
-            for name, ts in self._last_success.items()
-        }
+        # Failures for subsystems that never succeeded (e.g. DB migration
+        # on a cold start) must still surface.
+        for name, error in self._last_error.items():
+            out.setdefault(name, {"error": error})
+        return out
