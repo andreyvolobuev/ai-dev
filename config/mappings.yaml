@@ -23,10 +23,9 @@ component_to_repo:
 # Лукап: сначала <repo_key>, потом <default>. Значения — **channel id**, не имя.
 # Как получить id: открой канал в MM → ⓘ → Copy channel link, либо
 # curl /api/v4/channels/name/<team-id>/<channel-name>.
-#
-# Каналы — персональные данные; держи их в config/local.yaml (gitignored),
-# а не здесь. Этот файл в git видят все.
-team_channels: {}
+# Env DEFAULT_TEAM_CHANNEL переопределяет <default>.
+team_channels:
+  default: ny7kz6taaj88pxisee9r6yj8aw  # ~data-mining-this
 
 # Шаблон сообщения-дисклеймера бота (первое сообщение в треде / в личке).
 disclaimer_template: |
