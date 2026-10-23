@@ -269,7 +269,35 @@ class CommunicatorService:
         results = await self._chat.search_users_by_name(query, limit=limit)
         return list(results)
 
+    async def username_for(self, user_id: str) -> str | None:
+        if self._chat is None:
+            return None
+        user = await self._chat.get_user_by_id(user_id)
+        return user.username if user is not None else None
+
+    async def sign_posts(self, posts: Sequence[ChatMessage]) -> str:
+        """Render posts as ``@username: text`` paragraphs — for threads
+        where several people talk and who-said-what matters."""
+        names: dict[str, str] = {}
+        lines: list[str] = []
+        for post in posts:
+            text = post.text.strip()
+            if not text:
+                continue
+            if post.author_id not in names:
+                names[post.author_id] = (
+                    await self.username_for(post.author_id) or post.author_id
+                )
+            lines.append(f"@{names[post.author_id]}: {text}")
+        return "\n\n".join(lines)
+
     # --- Reads (Phase 1) ---
+
+    async def read_thread(self, thread_root_id: str) -> list[ChatMessage]:
+        """Raw thread posts, oldest first. Callers wrap the text themselves."""
+        if self._chat is None or not thread_root_id:
+            return []
+        return list(await self._chat.read_thread(thread_root_id))
 
     async def digest_thread(self, url: str) -> ThreadDigest | None:
         """Fetch and wrap a single thread. Returns ``None`` if chat is not wired."""

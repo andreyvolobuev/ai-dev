@@ -183,12 +183,23 @@ class AnalystAgent:
             inp.task_row, inp.history,
         )
         dm_threads = self._build_dm_threads(inp.history)
+        team_channel_id = self._team_channel_for(target_repo)
         run_state: dict[str, Any] = {
             "ask_dispatched": False,
             "terminal": False,
             "allowed_dm_handles": allowed_handles,
             "allowed_dm_emails": allowed_emails,
             "dm_threads": dm_threads,
+            "team_channel_id": team_channel_id,
+            "team_thread": _team_thread(inp.history),
+            "team_seen_post_ids": team_seen_post_ids(inp.history),
+            "ticket_ref": _ticket_ref(inp.task_row),
+            "proposal_confirmed": _proposal_confirmed(
+                inp.history, team_required=team_channel_id is not None,
+            ),
+            "confirm_below_confidence": (
+                self._config.agents.clarification.confirm_plan_below_confidence
+            ),
         }
 
         # Build tools first so the catalog (auto-discovered list of
@@ -434,6 +445,11 @@ class AnalystAgent:
             "this. You'll be re-invoked when they reply."
         )
         parts.append(
+            "- `ask_team` (ASYNC) — put your proposal / question to the "
+            "team in the ticket's team-channel thread; END YOUR TURN. "
+            "You'll be re-invoked with the team's replies."
+        )
+        parts.append(
             "- `submit_plan` — you have everything you need; ship the "
             "actionable plan. **Status MUST be `ready` when calling "
             "submit_plan** — there's no longer a `clarifying` path; if "
@@ -468,7 +484,12 @@ class AnalystAgent:
         # author and may mis-attribute it to whoever it last addressed.
         meta = step.metadata or {}
         attribution = ""
-        if step.kind == ConversationStepKind.BOT_ASKED:
+        if meta.get("audience") == "team":
+            attribution = (
+                " → team thread" if step.kind == ConversationStepKind.BOT_ASKED
+                else " ← team thread"
+            )
+        elif step.kind == ConversationStepKind.BOT_ASKED:
             target = meta.get("target_username") or meta.get("target_user_id")
             if target:
                 attribution = f" → @{target}"
@@ -651,6 +672,10 @@ class AnalystAgent:
 
     # --- helpers ---
 
+    def _team_channel_for(self, repo_key: str | None) -> str | None:
+        mapping = self._config.mappings.team_channels or {}
+        return (repo_key and mapping.get(repo_key)) or mapping.get("default") or None
+
     def _guess_target_repo(self, task_row: TaskRow) -> str | None:
         repo = self._config.repo_for_components(task_row.components_json)
         if repo is not None:
@@ -779,13 +804,19 @@ def _plan_from_submission(
         confidence = 0.0
     confidence = max(0.0, min(1.0, confidence))
 
+    # Decisions ride along with the risks so they reach the Jira comment
+    # and the dev's prompt without a schema change.
+    decisions = [
+        f"Решение: {d}" for d in (submission.get("decisions") or []) if str(d).strip()
+    ]
+
     return Plan(
         task_external_id=task_row.external_id,
         tracker=task_row.tracker,
         summary=str(submission.get("summary") or ""),
         steps=steps,
         open_questions=questions,
-        risks=[str(r) for r in (submission.get("risks") or [])],
+        risks=decisions + [str(r) for r in (submission.get("risks") or [])],
         confidence=confidence,
         status=status,
         target_repo_key=submission.get("target_repo_key") or target_repo,
@@ -794,6 +825,48 @@ def _plan_from_submission(
         model=model,
         agent_key=agent_key,
     )
+
+
+def _team_thread(history: Sequence[ConversationStep]) -> dict[str, str] | None:
+    """Thread the analyst already opened in the team channel, if any —
+    follow-up ``ask_team`` calls reply there instead of opening a new one."""
+    for step in reversed(history):
+        meta = step.metadata or {}
+        if step.kind == ConversationStepKind.BOT_ASKED and meta.get("audience") == "team":
+            channel_id = meta.get("channel_id")
+            root_id = meta.get("asked_post_id")
+            if channel_id and root_id:
+                return {"channel_id": channel_id, "root_id": root_id}
+    return None
+
+
+def team_seen_post_ids(history: Sequence[ConversationStep]) -> set[str]:
+    """Team-thread posts already delivered to the analyst."""
+    seen: set[str] = set()
+    for step in history:
+        meta = step.metadata or {}
+        if step.kind == ConversationStepKind.HUMAN_REPLIED and meta.get("audience") == "team":
+            seen.update(meta.get("post_ids") or [])
+    return seen
+
+
+def _proposal_confirmed(
+    history: Sequence[ConversationStep], *, team_required: bool,
+) -> bool:
+    """Has a human answered the analyst at all? With a team channel
+    configured only the team thread counts: a reporter's reply to «кто
+    такой X?» is not a sign-off on the design."""
+    for step in history:
+        if step.kind != ConversationStepKind.HUMAN_REPLIED:
+            continue
+        if not team_required or (step.metadata or {}).get("audience") == "team":
+            return True
+    return False
+
+
+def _ticket_ref(task_row: TaskRow) -> str:
+    title = f"{task_row.external_id} {task_row.title or ''}".strip()
+    return f"[{title}]({task_row.url})" if task_row.url else title
 
 
 def _strip_tz(dt: Any) -> Any:
@@ -833,4 +906,5 @@ __all__ = [
     "AnalystRunResult",
     "AnalystRunStats",
     "_plan_from_submission",
+    "team_seen_post_ids",
 ]

@@ -238,6 +238,10 @@ class ClarificationCfg(_StrictModel):
     # forcibly escalate to lead. Prevents runaway loops.
     max_planner_calls_per_goal: int = 8
 
+    # submit_plan below this self-assessed confidence is refused until a
+    # human (the team thread, when configured) has answered the analyst.
+    confirm_plan_below_confidence: float = 0.9
+
     # SEND_PENDING retry: how many times to retry a DM that
     # Communicator refused (rate-limited / outside working hours)
     # before giving up the goal.

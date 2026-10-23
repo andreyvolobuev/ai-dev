@@ -566,3 +566,147 @@ async def test_run_results_discarded_when_ticket_reset_mid_run(
             sa_select(PlanRow).where(PlanRow.task_external_id == "DM-42")
         )).scalars().all()
     assert plans == []
+
+
+class _TeamThreadChat(_FakeChat):
+    def __init__(self, thread: list[ChatMessage], usernames: dict[str, str]) -> None:
+        super().__init__()
+        self._thread = thread
+        self._usernames = usernames
+
+    async def read_thread(self, thread_root_id: str) -> Sequence[ChatMessage]:
+        return self._thread
+
+    async def get_user_by_id(self, user_id: str) -> ChatUser | None:
+        name = self._usernames.get(user_id)
+        return ChatUser(id=user_id, username=name) if name else None
+
+
+@pytest.mark.asyncio
+async def test_team_thread_replies_reach_analyst_with_authors(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Several teammates answer in the team thread; the analyst gets one
+    HUMAN_REPLIED step marked as the team's, each reply signed by its author."""
+    await _seed_task_row(session_factory)
+    now = datetime.now(timezone.utc)
+    replies = [
+        ChatMessage(
+            id="r-1", channel_id="ch-team", author_id="uid-a", text="ок, но без миграции",
+            timestamp=now, thread_root_id="root-1",
+        ),
+        ChatMessage(
+            id="r-2", channel_id="ch-team", author_id="uid-b", text="согласен с Сашей",
+            timestamp=now, thread_root_id="root-1",
+        ),
+    ]
+    chat = _TeamThreadChat(replies, {"uid-a": "a.ivanova", "uid-b": "b.petrov"})
+    analyst = _ScriptedAnalyst([
+        AnalystRunResult(
+            effects=[AnalystEffect(
+                kind="ask_dispatched",
+                payload={
+                    "audience": "team", "asked_post_id": "root-1",
+                    "channel_id": "ch-team", "target_user_id": "",
+                    "target_username": None, "asked_text": "предлагаю X",
+                    "dedupe_key": None,
+                },
+            )],
+            cost_usd=0.0, turns=1, stopped_reason="end_turn", plan=None,
+        ),
+        AnalystRunResult(
+            effects=[AnalystEffect(
+                kind="plan_submitted",
+                payload={"summary": "ok", "status": "ready", "target_repo_key": "x"},
+            )],
+            cost_usd=0.0, turns=1, stopped_reason="end_turn", plan=_ready_plan(),
+        ),
+    ])
+    inbox = _make_inbox(session_factory, chat, analyst)
+    await inbox.handle(_msg())
+
+    task_row = await inbox.find_task_by_thread("root-1")
+    assert task_row is not None
+    for reply in replies:
+        await inbox.append_fragment(task_row.id, reply)
+    async with session_scope(session_factory) as session:
+        from sqlalchemy import select
+
+        row = (await session.execute(
+            select(TaskRow).where(TaskRow.id == task_row.id)
+        )).scalar_one()
+        row.last_fragment_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+
+    await inbox.flush_idle()
+
+    reply_step = [
+        s for s in analyst.calls[1].history if s.kind.value == "human_replied"
+    ][0]
+    assert reply_step.metadata["audience"] == "team"
+    assert reply_step.text == (
+        "@a.ivanova: ок, но без миграции\n\n@b.petrov: согласен с Сашей"
+    )
+    asked_step = [s for s in analyst.calls[1].history if s.kind.value == "bot_asked"][0]
+    assert asked_step.metadata["audience"] == "team"
+
+
+@pytest.mark.asyncio
+async def test_team_reply_written_mid_run_is_not_lost(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A reply posted while the analyst ran isn't buffered (nobody waits
+    on the thread then). The next coalesce reads the thread and delivers
+    it together with the new reply — but not what was already shown."""
+    await _seed_task_row(session_factory)
+    now = datetime.now(timezone.utc)
+
+    def post(post_id: str, author: str, text: str) -> ChatMessage:
+        return ChatMessage(
+            id=post_id, channel_id="ch-team", author_id=author, text=text,
+            timestamp=now, thread_root_id="root-1",
+        )
+
+    seen_mid_run = post("r-1", "uid-a", "ок")
+    missed = post("r-2", "uid-b", "а ещё алерт")
+    buffered = post("r-3", "uid-a", "согласна")
+    chat = _TeamThreadChat(
+        [seen_mid_run, missed, buffered], {"uid-a": "a.ivanova", "uid-b": "b.petrov"},
+    )
+    ask = AnalystEffect(kind="ask_dispatched", payload={
+        "audience": "team", "asked_post_id": "root-1", "channel_id": "ch-team",
+        "target_user_id": "", "target_username": None, "asked_text": "итог X",
+        "dedupe_key": None,
+    })
+    analyst = _ScriptedAnalyst([
+        AnalystRunResult(
+            effects=[
+                AnalystEffect(kind="team_replies_seen",
+                              payload={"post_ids": ["r-1"], "text": "@a.ivanova: ок"}),
+                ask,
+            ],
+            cost_usd=0.0, turns=1, stopped_reason="end_turn", plan=None,
+        ),
+        AnalystRunResult(effects=[ask], cost_usd=0.0, turns=1,
+                         stopped_reason="end_turn", plan=None),
+    ])
+    inbox = _make_inbox(session_factory, chat, analyst)
+    await inbox.handle(_msg())
+
+    task_row = await inbox.find_task_by_thread("root-1")
+    assert task_row is not None
+    await inbox.append_fragment(task_row.id, buffered)
+    async with session_scope(session_factory) as session:
+        from sqlalchemy import select
+
+        row = (await session.execute(
+            select(TaskRow).where(TaskRow.id == task_row.id)
+        )).scalar_one()
+        row.last_fragment_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+
+    await inbox.flush_idle()
+
+    replies = [s for s in analyst.calls[1].history if s.kind.value == "human_replied"]
+    assert [s.text for s in replies] == [
+        "@a.ivanova: ок",
+        "@b.petrov: а ещё алерт\n\n@a.ivanova: согласна",
+    ]

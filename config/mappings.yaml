@@ -18,7 +18,8 @@ component_to_repo:
   # "Bellingshausen API": bellingshausen
   # "Rainbow": rainbow
 
-# repo_key → MM channel id (куда Reviewer / DevOps шлют пинги про этот репо).
+# repo_key → MM channel id (куда Reviewer / DevOps шлют пинги про этот репо,
+# а аналитик выносит спорные решения на обсуждение командой).
 # Лукап: сначала <repo_key>, потом <default>. Значения — **channel id**, не имя.
 # Как получить id: открой канал в MM → ⓘ → Copy channel link, либо
 # curl /api/v4/channels/name/<team-id>/<channel-name>.

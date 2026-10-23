@@ -32,6 +32,7 @@ from virtual_dev.application.agents.analyst import (
     AnalystEffect,
     AnalystRunInput,
     AnalystRunResult,
+    team_seen_post_ids,
 )
 from virtual_dev.application.agents.orchestrator import (
     TOPIC_PLAN_READY,
@@ -55,6 +56,7 @@ from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 from virtual_dev.infrastructure.config import AppConfig
 from virtual_dev.infrastructure.db import TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
+from virtual_dev.tools._team_thread import unseen_replies
 
 
 def _render_plan_comment(
@@ -256,9 +258,21 @@ class AnalystInbox:
         fragments = await self._sessions.list_unflushed_fragments(task_row.id)
         if not fragments:
             return
-        merged = "\n\n".join(
-            f.text.strip() for f in fragments if f.text and f.text.strip()
-        ) or fragments[0].text
+        team_thread = not task_row.awaiting_user_id
+        team_post_ids: list[str] = []
+        if team_thread:
+            merged, team_post_ids = await self._render_team_replies(task_row, fragments)
+            if not team_post_ids:
+                # Every buffered post was already shown to the analyst
+                # mid-run (late-reply check) — nothing new to resume on.
+                await self._sessions.mark_fragments_flushed(
+                    task_row.id, [f.id for f in fragments],
+                )
+                return
+        else:
+            merged = "\n\n".join(
+                f.text.strip() for f in fragments if f.text and f.text.strip()
+            ) or fragments[0].text
         last_post_id = fragments[-1].mm_post_id
 
         # Aggregate file attachments from every fragment so the prompt
@@ -293,6 +307,8 @@ class AnalystInbox:
             kind=ConversationStepKind.HUMAN_REPLIED,
             text=merged,
             metadata={
+                "audience": "team" if team_thread else "dm",
+                "post_ids": team_post_ids,
                 "asked_post_id": task_row.awaiting_post_id,
                 "fragment_count": len(fragments),
                 "from_user_id": task_row.awaiting_user_id,
@@ -322,6 +338,30 @@ class AnalystInbox:
         refreshed = await self._sessions.get_task(task_row.id)
         if refreshed is not None:
             await self._run_step(refreshed)
+
+    async def _render_team_replies(
+        self, task_row: TaskRow, fragments: list[Any],
+    ) -> tuple[str, list[str]]:
+        """Everything in the team thread the analyst hasn't seen yet,
+        each reply signed by its author — several people talk there and
+        the analyst has to see who agrees with whom.
+
+        Reads the thread rather than just the buffered fragments: posts
+        written while the analyst was running weren't buffered (nobody
+        was waiting), and this is where they get picked up."""
+        seen = team_seen_post_ids(await self._sessions.list_steps(task_row.id))
+        try:
+            posts = await self._communicator.read_thread(task_row.awaiting_post_id or "")
+        except Exception:
+            logger.exception(
+                "AnalystInbox: team thread read failed for task {}; using buffered replies",
+                task_row.id,
+            )
+            buffered = [f for f in fragments if f.mm_post_id not in seen]
+            text = "\n\n".join(f"@?: {f.text.strip()}" for f in buffered if f.text.strip())
+            return text, [f.mm_post_id for f in buffered]
+        fresh = unseen_replies(posts, seen)
+        return await self._communicator.sign_posts(fresh), [p.id for p in fresh]
 
     async def _run_step(self, task_row: TaskRow) -> None:
         if task_row.internal_status in (
@@ -450,6 +490,14 @@ class AnalystInbox:
         self, task_row: TaskRow, run: AnalystRunResult,
     ) -> None:
         for e in run.effects:
+            if e.kind == "team_replies_seen":
+                await self._sessions.append_step(
+                    task_id=task_row.id,
+                    kind=ConversationStepKind.HUMAN_REPLIED,
+                    text=e.payload.get("text") or "",
+                    metadata={"audience": "team", "post_ids": e.payload.get("post_ids") or []},
+                )
+        for e in run.effects:
             if e.kind == "ask_dispatched":
                 await self._on_ask(task_row, e)
                 return
@@ -492,6 +540,7 @@ class AnalystInbox:
                 "target_user_id": p.get("target_user_id"),
                 "target_username": p.get("target_username"),
                 "dedupe_key": p.get("dedupe_key"),
+                "audience": p.get("audience") or "dm",
             },
         )
         await self._sessions.install_awaiting(
