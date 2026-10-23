@@ -9,6 +9,7 @@ from claude_agent_sdk import tool
 from virtual_dev.application.services.agent_effects import AnalystEffect
 from virtual_dev.tools import ToolContext, wrap_text
 from virtual_dev.tools._helpers import strip_agent_attribution
+from virtual_dev.tools._team_thread import collect_late_replies, late_replies_result
 
 TOOL_GROUP = "analyst"
 
@@ -74,6 +75,14 @@ def build(ctx: ToolContext):
             return wrap_text({"sent": False, "reason": "empty_message"})
         if not handle and not email:
             return wrap_text({"sent": False, "reason": "missing_target"})
+        # A DM nudge mustn't skip what the team has said in the meantime —
+        # the answer may already be in the thread.
+        thread = run_state.get("team_thread")
+        late = await collect_late_replies(communicator, run_state, effects)
+        if late is not None and thread:
+            return wrap_text({
+                "sent": False, **late_replies_result(late, root_id=thread["root_id"]),
+            })
 
         # Destination whitelist. Defends against prompt-injection
         # ("ask @ceo about priority") inside a ticket steering the

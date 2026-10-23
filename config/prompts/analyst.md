@@ -199,11 +199,13 @@ Several people may reply, and they may disagree. On each re-invocation:
 * If the discussion stalls (several rounds, no convergence) — `stuck`;
   the lead will step in.
 * People keep adding things while you work. Right before posting or
-  submitting, `ask_team` / `submit_plan` check the thread; if someone
-  wrote in the meantime, the call is refused with `new_team_replies` and
-  shows you those messages. Read them like any other reply: if they
-  change or question the plan — answer with `ask_team`; if not — call
-  the tool again.
+  submitting, `ask_team` / `dm_user` / `submit_plan` check the thread; if
+  someone wrote in the meantime, the call is refused with
+  `new_team_replies` and shows you those messages. Read them like any
+  other reply: if they change or question the plan — answer with
+  `ask_team`; if not — call the tool again.
+* Nudging someone by DM to look at the thread is fine — the thread keeps
+  being watched, and replies there still reach you.
 
 ### 2.5. Linked tickets MUST be inspected before DMing.
 

@@ -25,6 +25,7 @@ from virtual_dev.domain.models.analyst_conversation import (
     ConversationStep,
     ConversationStepKind,
 )
+from virtual_dev.domain.models.task import TaskStatus
 from virtual_dev.infrastructure.db import (
     AnalystConversationFragmentRow,
     AnalystConversationStepRow,
@@ -36,6 +37,9 @@ from virtual_dev.infrastructure.db.base import session_scope
 # the same task; small enough that a *real* schema bug surfaces quickly
 # instead of looping forever.
 _APPEND_STEP_MAX_RETRIES = 8
+
+# The analyst still owns the ticket: replies in its team thread are for it.
+_PLANNING_STATUSES = (TaskStatus.PLANNING.value, TaskStatus.CLARIFYING.value)
 
 
 def _row_to_step(row: AnalystConversationStepRow) -> ConversationStep:
@@ -92,6 +96,29 @@ class AnalystSessionRepository:
                     TaskRow.awaiting_post_id == asked_post_id,
                 ).limit(1)
             )).scalar_one_or_none()
+
+    async def find_by_team_thread(self, root_id: str) -> TaskRow | None:
+        """The planning task whose team-channel discussion lives under
+        ``root_id`` — even while the analyst is waiting on someone else
+        (a DM nudge) or still running. Without it a teammate's reply in
+        the thread reaches nobody once the awaited post moves away."""
+        async with self._session_factory() as session:
+            rows = (await session.execute(
+                select(AnalystConversationStepRow.task_id, AnalystConversationStepRow.metadata_json)
+                .join(TaskRow, TaskRow.id == AnalystConversationStepRow.task_id)
+                .where(
+                    AnalystConversationStepRow.kind == ConversationStepKind.BOT_ASKED.value,
+                    TaskRow.internal_status.in_(_PLANNING_STATUSES),
+                )
+                .order_by(AnalystConversationStepRow.task_id.desc())
+            )).all()
+            for task_id, meta in rows:
+                meta = meta or {}
+                if meta.get("audience") == "team" and meta.get("asked_post_id") == root_id:
+                    return (await session.execute(
+                        select(TaskRow).where(TaskRow.id == task_id)
+                    )).scalar_one_or_none()
+        return None
 
     async def find_by_awaiting_channel(
         self, mm_channel_id: str, mm_user_id: str,

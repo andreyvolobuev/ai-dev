@@ -191,7 +191,7 @@ class AnalystAgent:
             "allowed_dm_emails": allowed_emails,
             "dm_threads": dm_threads,
             "team_channel_id": team_channel_id,
-            "team_thread": _team_thread(inp.history),
+            "team_thread": team_thread(inp.history),
             "team_seen_post_ids": team_seen_post_ids(inp.history),
             "ticket_ref": _ticket_ref(inp.task_row),
             "proposal_confirmed": _proposal_confirmed(
@@ -827,7 +827,7 @@ def _plan_from_submission(
     )
 
 
-def _team_thread(history: Sequence[ConversationStep]) -> dict[str, str] | None:
+def team_thread(history: Sequence[ConversationStep]) -> dict[str, str] | None:
     """Thread the analyst already opened in the team channel, if any —
     follow-up ``ask_team`` calls reply there instead of opening a new one."""
     for step in reversed(history):
@@ -907,4 +907,5 @@ __all__ = [
     "AnalystRunStats",
     "_plan_from_submission",
     "team_seen_post_ids",
+    "team_thread",
 ]

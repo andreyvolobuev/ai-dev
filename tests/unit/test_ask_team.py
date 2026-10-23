@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from virtual_dev.application.agents.analyst import _proposal_confirmed, _team_thread
+from virtual_dev.application.agents.analyst import _proposal_confirmed, team_thread
 from virtual_dev.application.services.communicator import SendOutcome
 from virtual_dev.domain.models.analyst_conversation import (
     ConversationStep,
@@ -21,6 +21,7 @@ from virtual_dev.domain.models.analyst_conversation import (
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.tools import ToolContext
 from virtual_dev.tools.ask_team import build as build_ask_team
+from virtual_dev.tools.dm_user import build as build_dm_user
 from virtual_dev.tools.submit_plan import build as build_submit_plan
 
 
@@ -163,8 +164,8 @@ def test_team_thread_is_taken_from_latest_team_ask() -> None:
               channel_id="ch-team", asked_post_id="root-1"),
     ]
 
-    assert _team_thread(history) == {"channel_id": "ch-team", "root_id": "root-1"}
-    assert _team_thread(history[:1]) is None
+    assert team_thread(history) == {"channel_id": "ch-team", "root_id": "root-1"}
+    assert team_thread(history[:1]) is None
 
 
 class _ThreadCommunicator(_StubCommunicator):
@@ -242,3 +243,15 @@ async def test_ask_team_shows_reply_written_mid_run_before_posting() -> None:
 
     await _run(build_ask_team(ctx), {"message": "про Y: учла, итог X+Y"})
     assert comm.posts == [("ch-team", "про Y: учла, итог X+Y", "root-1")]
+
+
+@pytest.mark.asyncio
+async def test_dm_nudge_shows_thread_replies_first() -> None:
+    thread = [_post("root-1", "предлагаю X", trusted=True), _post("r-2", "ок, но тип TEXT")]
+    ctx, comm = _thread_ctx(thread, seen=set())
+
+    body = await _run(build_dm_user(ctx), {"to_handle": "d.kozhevnikov", "message": "глянешь тред?"})
+
+    assert "new_team_replies" in body
+    assert "@a.ivanova: ок, но тип TEXT" in body
+    assert comm.posts == []

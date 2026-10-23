@@ -710,3 +710,95 @@ async def test_team_reply_written_mid_run_is_not_lost(
         "@a.ivanova: ок",
         "@b.petrov: а ещё алерт\n\n@a.ivanova: согласна",
     ]
+
+
+@pytest.mark.asyncio
+async def test_team_thread_still_heard_while_analyst_awaits_a_dm(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """DM-3784: the analyst nudged the reporter by DM, the reporter
+    answered in the team thread instead. That reply must still reach the
+    analyst — not fall through to intake as an unrelated mention."""
+    await _seed_task_row(session_factory)
+    now = datetime.now(timezone.utc)
+    first = ChatMessage(
+        id="r-1", channel_id="ch-team", author_id="uid-g", text="мне ок, ждём ещё двоих",
+        timestamp=now, thread_root_id="root-1",
+    )
+    approval = ChatMessage(
+        id="r-2", channel_id="ch-team", author_id="uid-k", text="ок, но тип TEXT",
+        timestamp=now + timedelta(seconds=1), thread_root_id="root-1",
+    )
+    thread = [first]
+    chat = _TeamThreadChat(thread, {"uid-g": "g.golovin", "uid-k": "d.kozhevnikov"})
+    team_ask = AnalystEffect(kind="ask_dispatched", payload={
+        "audience": "team", "asked_post_id": "root-1", "channel_id": "ch-team",
+        "target_user_id": "", "target_username": None, "asked_text": "предлагаю X",
+        "dedupe_key": None,
+    })
+    dm_nudge = AnalystEffect(kind="ask_dispatched", payload={
+        "asked_post_id": "dm-1", "channel_id": "dm-uid-k", "target_user_id": "uid-k",
+        "target_username": "d.kozhevnikov", "asked_text": "глянешь тред?",
+        "dedupe_key": None,
+    })
+    analyst = _ScriptedAnalyst([
+        AnalystRunResult(effects=[team_ask], cost_usd=0.0, turns=1,
+                         stopped_reason="end_turn", plan=None),
+        AnalystRunResult(effects=[dm_nudge], cost_usd=0.0, turns=1,
+                         stopped_reason="end_turn", plan=None),
+        AnalystRunResult(effects=[team_ask], cost_usd=0.0, turns=1,
+                         stopped_reason="end_turn", plan=None),
+    ])
+    inbox = _make_inbox(session_factory, chat, analyst)
+    await inbox.handle(_msg())
+
+    async def reply_in_thread(post: ChatMessage) -> TaskRow:
+        task_row = await inbox.find_task_by_thread("root-1")
+        assert task_row is not None
+        await inbox.append_fragment(task_row.id, post)
+        async with session_scope(session_factory) as session:
+            from sqlalchemy import select
+
+            row = (await session.execute(
+                select(TaskRow).where(TaskRow.id == task_row.id)
+            )).scalar_one()
+            row.last_fragment_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        await inbox.flush_idle()
+        return task_row
+
+    await reply_in_thread(first)
+    thread.append(approval)
+    task_row = await reply_in_thread(approval)
+
+    assert task_row.awaiting_post_id == "dm-1"
+    assert len(analyst.calls) == 3
+    last = [s for s in analyst.calls[2].history if s.kind.value == "human_replied"][-1]
+    assert (last.text, last.metadata["audience"]) == ("@d.kozhevnikov: ок, но тип TEXT", "team")
+
+
+@pytest.mark.asyncio
+async def test_team_thread_of_finished_task_is_not_claimed(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Once the plan is in, the thread is ordinary chat again."""
+    await _seed_task_row(session_factory)
+    analyst = _ScriptedAnalyst([
+        AnalystRunResult(
+            effects=[AnalystEffect(kind="ask_dispatched", payload={
+                "audience": "team", "asked_post_id": "root-1", "channel_id": "ch-team",
+                "target_user_id": "", "target_username": None, "asked_text": "X?",
+                "dedupe_key": None,
+            })],
+            cost_usd=0.0, turns=1, stopped_reason="end_turn", plan=None,
+        ),
+    ])
+    inbox = _make_inbox(session_factory, _FakeChat(), analyst)
+    await inbox.handle(_msg())
+    async with session_scope(session_factory) as session:
+        from sqlalchemy import select
+
+        row = (await session.execute(select(TaskRow))).scalar_one()
+        row.awaiting_post_id = None
+        row.internal_status = TaskStatus.READY.value
+
+    assert await inbox.find_task_by_thread("root-1") is None

@@ -33,6 +33,7 @@ from virtual_dev.application.agents.analyst import (
     AnalystRunInput,
     AnalystRunResult,
     team_seen_post_ids,
+    team_thread,
 )
 from virtual_dev.application.agents.orchestrator import (
     TOPIC_PLAN_READY,
@@ -180,7 +181,12 @@ class AnalystInbox:
     async def find_task_by_thread(
         self, asked_post_id: str,
     ) -> TaskRow | None:
-        return await self._sessions.find_by_awaiting_post_id(asked_post_id)
+        task_row = await self._sessions.find_by_awaiting_post_id(asked_post_id)
+        if task_row is None:
+            # The team thread stays the analyst's even after it moved on
+            # to DM someone: the discussion keeps going there.
+            task_row = await self._sessions.find_by_team_thread(asked_post_id)
+        return task_row
 
     async def find_task_by_channel(
         self, mm_channel_id: str, mm_user_id: str,
@@ -258,22 +264,68 @@ class AnalystInbox:
         fragments = await self._sessions.list_unflushed_fragments(task_row.id)
         if not fragments:
             return
-        team_thread = not task_row.awaiting_user_id
-        team_post_ids: list[str] = []
-        if team_thread:
-            merged, team_post_ids = await self._render_team_replies(task_row, fragments)
-            if not team_post_ids:
-                # Every buffered post was already shown to the analyst
-                # mid-run (late-reply check) — nothing new to resume on.
-                await self._sessions.mark_fragments_flushed(
-                    task_row.id, [f.id for f in fragments],
-                )
-                return
-        else:
-            merged = "\n\n".join(
-                f.text.strip() for f in fragments if f.text and f.text.strip()
-            ) or fragments[0].text
+        steps = await self._sessions.list_steps(task_row.id)
+        thread = team_thread(steps)
+        awaiting_team = not task_row.awaiting_user_id
+        team_root = thread["root_id"] if thread else None
+        if awaiting_team:
+            team_root = team_root or task_row.awaiting_post_id
+        # While the analyst waits on a DM, the team thread may still be
+        # talking: those posts arrive here too and become their own step.
+        dm_fragments = [] if awaiting_team else [
+            f for f in fragments if team_root is None or f.asked_post_id != team_root
+        ]
+        team_text, team_post_ids = "", list[str]()
+        if team_root and len(dm_fragments) < len(fragments):
+            team_text, team_post_ids = await self._render_team_replies(
+                team_root, steps, [f for f in fragments if f not in dm_fragments],
+            )
+        if not team_post_ids and not dm_fragments:
+            # Every buffered post was already shown to the analyst
+            # mid-run (late-reply check) — nothing new to resume on.
+            await self._sessions.mark_fragments_flushed(
+                task_row.id, [f.id for f in fragments],
+            )
+            return
+        if team_post_ids:
+            await self._sessions.append_step(
+                task_id=task_row.id,
+                kind=ConversationStepKind.HUMAN_REPLIED,
+                text=team_text,
+                metadata={
+                    "audience": "team",
+                    "post_ids": team_post_ids,
+                    "asked_post_id": team_root,
+                    "fragment_count": len(fragments) - len(dm_fragments),
+                },
+            )
+        if dm_fragments:
+            await self._append_dm_reply(task_row, dm_fragments)
+        await self._sessions.mark_fragments_flushed(
+            task_row.id, [f.id for f in fragments],
+        )
         last_post_id = fragments[-1].mm_post_id
+        if last_post_id:
+            await self._communicator.add_reaction(last_post_id, "white_check_mark")
+        if not await self._sessions.clear_awaiting(task_row.id):
+            # A fragment landed after our snapshot (user typed one more
+            # message during the flush). Awaiting stays armed, so the next
+            # flush_idle tick coalesces the late fragment into a second
+            # HUMAN_REPLIED step — run the analyst then, with the full
+            # answer, instead of now with a partial one.
+            logger.info(
+                "AnalystInbox: late fragment for task {} — deferring resume",
+                task_row.id,
+            )
+            return
+        refreshed = await self._sessions.get_task(task_row.id)
+        if refreshed is not None:
+            await self._run_step(refreshed)
+
+    async def _append_dm_reply(self, task_row: TaskRow, fragments: list[Any]) -> None:
+        merged = "\n\n".join(
+            f.text.strip() for f in fragments if f.text and f.text.strip()
+        ) or fragments[0].text
 
         # Aggregate file attachments from every fragment so the prompt
         # builder can render ``read_<format>_url`` hints. Dedup by id
@@ -307,8 +359,7 @@ class AnalystInbox:
             kind=ConversationStepKind.HUMAN_REPLIED,
             text=merged,
             metadata={
-                "audience": "team" if team_thread else "dm",
-                "post_ids": team_post_ids,
+                "audience": "dm",
                 "asked_post_id": task_row.awaiting_post_id,
                 "fragment_count": len(fragments),
                 "from_user_id": task_row.awaiting_user_id,
@@ -319,28 +370,9 @@ class AnalystInbox:
                 "thread_root_id": task_row.awaiting_post_id if replied_in_thread else None,
             },
         )
-        await self._sessions.mark_fragments_flushed(
-            task_row.id, [f.id for f in fragments],
-        )
-        if last_post_id:
-            await self._communicator.add_reaction(last_post_id, "white_check_mark")
-        if not await self._sessions.clear_awaiting(task_row.id):
-            # A fragment landed after our snapshot (user typed one more
-            # message during the flush). Awaiting stays armed, so the next
-            # flush_idle tick coalesces the late fragment into a second
-            # HUMAN_REPLIED step — run the analyst then, with the full
-            # answer, instead of now with a partial one.
-            logger.info(
-                "AnalystInbox: late fragment for task {} — deferring resume",
-                task_row.id,
-            )
-            return
-        refreshed = await self._sessions.get_task(task_row.id)
-        if refreshed is not None:
-            await self._run_step(refreshed)
 
     async def _render_team_replies(
-        self, task_row: TaskRow, fragments: list[Any],
+        self, root_id: str, steps: list[Any], fragments: list[Any],
     ) -> tuple[str, list[str]]:
         """Everything in the team thread the analyst hasn't seen yet,
         each reply signed by its author — several people talk there and
@@ -349,13 +381,12 @@ class AnalystInbox:
         Reads the thread rather than just the buffered fragments: posts
         written while the analyst was running weren't buffered (nobody
         was waiting), and this is where they get picked up."""
-        seen = team_seen_post_ids(await self._sessions.list_steps(task_row.id))
+        seen = team_seen_post_ids(steps)
         try:
-            posts = await self._communicator.read_thread(task_row.awaiting_post_id or "")
+            posts = await self._communicator.read_thread(root_id)
         except Exception:
             logger.exception(
-                "AnalystInbox: team thread read failed for task {}; using buffered replies",
-                task_row.id,
+                "AnalystInbox: team thread {} unreadable; using buffered replies", root_id,
             )
             buffered = [f for f in fragments if f.mm_post_id not in seen]
             text = "\n\n".join(f"@?: {f.text.strip()}" for f in buffered if f.text.strip())
