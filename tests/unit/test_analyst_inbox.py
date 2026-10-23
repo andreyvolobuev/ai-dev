@@ -569,17 +569,22 @@ async def test_run_results_discarded_when_ticket_reset_mid_run(
 
 
 class _TeamThreadChat(_FakeChat):
-    def __init__(self, thread: list[ChatMessage], usernames: dict[str, str]) -> None:
+    def __init__(
+        self, thread: list[ChatMessage], usernames: dict[str, str],
+        full_names: dict[str, tuple[str, str]] | None = None,
+    ) -> None:
         super().__init__()
         self._thread = thread
         self._usernames = usernames
+        self._full_names = full_names or {}
 
     async def read_thread(self, thread_root_id: str) -> Sequence[ChatMessage]:
         return self._thread
 
     async def get_user_by_id(self, user_id: str) -> ChatUser | None:
         name = self._usernames.get(user_id)
-        return ChatUser(id=user_id, username=name) if name else None
+        first, last = self._full_names.get(user_id, (None, None))
+        return ChatUser(id=user_id, username=name, first_name=first, last_name=last) if name else None
 
 
 @pytest.mark.asyncio
@@ -730,7 +735,10 @@ async def test_team_thread_still_heard_while_analyst_awaits_a_dm(
         timestamp=now + timedelta(seconds=1), thread_root_id="root-1",
     )
     thread = [first]
-    chat = _TeamThreadChat(thread, {"uid-g": "g.golovin", "uid-k": "d.kozhevnikov"})
+    chat = _TeamThreadChat(
+        thread, {"uid-g": "g.golovin", "uid-k": "d.kozhevnikov"},
+        {"uid-g": ("Глеб", "Головин"), "uid-k": ("Дмитрий", "Кожевников")},
+    )
     team_ask = AnalystEffect(kind="ask_dispatched", payload={
         "audience": "team", "asked_post_id": "root-1", "channel_id": "ch-team",
         "target_user_id": "", "target_username": None, "asked_text": "предлагаю X",
@@ -773,7 +781,10 @@ async def test_team_thread_still_heard_while_analyst_awaits_a_dm(
     assert task_row.awaiting_post_id == "dm-1"
     assert len(analyst.calls) == 3
     last = [s for s in analyst.calls[2].history if s.kind.value == "human_replied"][-1]
-    assert (last.text, last.metadata["audience"]) == ("@d.kozhevnikov: ок, но тип TEXT", "team")
+    # Real names from the directory: the analyst must not guess «Гоша» from @g.golovin.
+    assert (last.text, last.metadata["audience"]) == (
+        "@d.kozhevnikov (Дмитрий Кожевников): ок, но тип TEXT", "team",
+    )
 
 
 @pytest.mark.asyncio

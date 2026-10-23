@@ -178,8 +178,8 @@ class _ThreadCommunicator(_StubCommunicator):
     async def read_thread(self, thread_root_id: str) -> list[ChatMessage]:
         return list(self.thread)
 
-    async def username_for(self, user_id: str) -> str | None:
-        return {"uid-a": "a.ivanova"}.get(user_id)
+    async def author_label(self, user_id: str) -> str:
+        return {"uid-a": "@a.ivanova (Анна Иванова)"}.get(user_id, f"@{user_id}")
 
     async def sign_posts(self, posts: Any) -> str:
         from virtual_dev.application.services.communicator import CommunicatorService
@@ -221,7 +221,7 @@ async def test_submit_plan_shows_reply_written_mid_run_then_accepts() -> None:
     first = await _run(build_submit_plan(ctx), plan)
 
     assert "new_team_replies" in first
-    assert "@a.ivanova: и добавьте ещё алерт" in first
+    assert "@a.ivanova (Анна Иванова): и добавьте ещё алерт" in first
     assert ctx.submit_capture == {}
     assert ctx.effects[0].kind == "team_replies_seen"
     assert ctx.effects[0].payload["post_ids"] == ["r-2"]
@@ -253,5 +253,5 @@ async def test_dm_nudge_shows_thread_replies_first() -> None:
     body = await _run(build_dm_user(ctx), {"to_handle": "d.kozhevnikov", "message": "глянешь тред?"})
 
     assert "new_team_replies" in body
-    assert "@a.ivanova: ок, но тип TEXT" in body
+    assert "@a.ivanova (Анна Иванова): ок, но тип TEXT" in body
     assert comm.posts == []
