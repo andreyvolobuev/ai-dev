@@ -139,13 +139,15 @@ escalation:
 #   сообщений подряд — мы дёргаем LLM один раз, не на каждом.
 # max_planner_calls_per_goal: circuit breaker — после N вызовов
 #   аналиста без READY-плана эскалируем тимлиду.
-# max_goal_age_hours: hard deadline для всей задачи.
+# max_goal_age_hours: сколько аналитик может стоять без движения (считается
+#   от последнего запуска). Если ждём ответа людей — пингуем тимлида и
+#   продолжаем слушать; иначе задача stuck.
 # confirm_plan_below_confidence: план с уверенностью ниже порога (или с
 #   непустыми decisions) не принимается, пока команда не ответила в треде
 #   командного канала (mappings.team_channels) — или репортер в личке,
 #   если канала нет.
 clarification:
   coalesce_window_seconds: 180
-  max_planner_calls_per_goal: 8
+  max_planner_calls_per_goal: 20
   max_goal_age_hours: 48
   confirm_plan_below_confidence: 0.9

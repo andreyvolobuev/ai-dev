@@ -40,6 +40,9 @@ _APPEND_STEP_MAX_RETRIES = 8
 
 # The analyst still owns the ticket: replies in its team thread are for it.
 _PLANNING_STATUSES = (TaskStatus.PLANNING.value, TaskStatus.CLARIFYING.value)
+# A ``stuck`` ticket is parked for the lead, not closed: the team may
+# still answer in its thread, and that answer brings it back.
+_THREAD_STATUSES = (*_PLANNING_STATUSES, TaskStatus.FAILED.value)
 
 
 def _row_to_step(row: AnalystConversationStepRow) -> ConversationStep:
@@ -108,16 +111,29 @@ class AnalystSessionRepository:
                 .join(TaskRow, TaskRow.id == AnalystConversationStepRow.task_id)
                 .where(
                     AnalystConversationStepRow.kind == ConversationStepKind.BOT_ASKED.value,
-                    TaskRow.internal_status.in_(_PLANNING_STATUSES),
+                    TaskRow.internal_status.in_(_THREAD_STATUSES),
                 )
                 .order_by(AnalystConversationStepRow.task_id.desc())
             )).all()
             for task_id, meta in rows:
                 meta = meta or {}
-                if meta.get("audience") == "team" and meta.get("asked_post_id") == root_id:
-                    return (await session.execute(
-                        select(TaskRow).where(TaskRow.id == task_id)
-                    )).scalar_one_or_none()
+                if meta.get("audience") != "team" or meta.get("asked_post_id") != root_id:
+                    continue
+                row = (await session.execute(
+                    select(TaskRow).where(TaskRow.id == task_id)
+                )).scalar_one_or_none()
+                if row is None or row.internal_status != TaskStatus.FAILED.value:
+                    return row
+                last_note = (await session.execute(
+                    select(AnalystConversationStepRow.metadata_json)
+                    .where(
+                        AnalystConversationStepRow.task_id == task_id,
+                        AnalystConversationStepRow.kind == ConversationStepKind.NOTE.value,
+                    )
+                    .order_by(AnalystConversationStepRow.seq.desc())
+                    .limit(1)
+                )).scalar_one_or_none()
+                return row if (last_note or {}).get("kind") == "stuck" else None
         return None
 
     async def find_by_awaiting_channel(
@@ -247,10 +263,38 @@ class AnalystSessionRepository:
                 return
             row.analyst_iteration_count = (row.analyst_iteration_count or 0) + 1
             row.last_analyst_started_at = datetime.now(timezone.utc)
-            if deadline_at is not None and row.analyst_deadline_at is None:
+            if deadline_at is not None:
                 row.analyst_deadline_at = deadline_at
             if coalesce_window_seconds is not None:
                 row.coalesce_window_seconds = coalesce_window_seconds
+
+    async def set_deadline(self, task_id: int, deadline_at: datetime) -> None:
+        async with session_scope(self._session_factory) as session:
+            row = (await session.execute(
+                select(TaskRow).where(TaskRow.id == task_id)
+            )).scalar_one_or_none()
+            if row is not None:
+                row.analyst_deadline_at = deadline_at
+
+    async def revive_stuck(self, task_id: int, *, root_id: str, channel_id: str) -> bool:
+        """Bring a ``stuck`` ticket back to waiting on its team thread,
+        with a fresh iteration budget and deadline. False if it isn't
+        stuck (already planning, or ready / done)."""
+        async with session_scope(self._session_factory) as session:
+            row = (await session.execute(
+                select(TaskRow).where(TaskRow.id == task_id)
+            )).scalar_one_or_none()
+            if row is None or row.internal_status != TaskStatus.FAILED.value:
+                return False
+            row.internal_status = TaskStatus.CLARIFYING.value
+            row.awaiting_post_id = root_id
+            row.awaiting_user_id = ""
+            row.awaiting_username = None
+            row.awaiting_channel_id = channel_id
+            row.awaiting_dedupe_key = None
+            row.analyst_iteration_count = 0
+            row.analyst_deadline_at = None
+            return True
 
     async def clear_started_at(self, task_id: int) -> None:
         async with session_scope(self._session_factory) as session:

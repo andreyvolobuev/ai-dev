@@ -236,7 +236,7 @@ class ClarificationCfg(_StrictModel):
 
     # Planner circuit breaker: how many decisions per goal before we
     # forcibly escalate to lead. Prevents runaway loops.
-    max_planner_calls_per_goal: int = 8
+    max_planner_calls_per_goal: int = 20
 
     # submit_plan below this self-assessed confidence is refused until a
     # human (the team thread, when configured) has answered the analyst.

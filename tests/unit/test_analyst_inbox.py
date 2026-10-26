@@ -813,3 +813,91 @@ async def test_team_thread_of_finished_task_is_not_claimed(
         row.internal_status = TaskStatus.READY.value
 
     assert await inbox.find_task_by_thread("root-1") is None
+
+
+def _team_ask() -> AnalystRunResult:
+    return AnalystRunResult(
+        effects=[AnalystEffect(kind="ask_dispatched", payload={
+            "audience": "team", "asked_post_id": "root-1", "channel_id": "ch-team",
+            "target_user_id": "", "target_username": None, "asked_text": "X?",
+            "dedupe_key": None,
+        })],
+        cost_usd=0.0, turns=1, stopped_reason="end_turn", plan=None,
+    )
+
+
+async def _load_row(session_factory: async_sessionmaker[AsyncSession]) -> TaskRow:
+    from sqlalchemy import select
+
+    async with session_factory() as session:
+        return (await session.execute(select(TaskRow))).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_overdue_task_waiting_on_team_pings_lead_and_keeps_listening(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """DM-3784: the team took the weekend to answer and the deadline
+    killed the ticket — nobody heard the «ок» on Monday."""
+    await _seed_task_row(session_factory)
+    chat = _FakeChat(users={"lead": "uid-lead"})
+    inbox = _make_inbox(session_factory, chat, _ScriptedAnalyst([_team_ask()]))
+    await inbox.handle(_msg())
+    async with session_scope(session_factory) as session:
+        from sqlalchemy import select
+
+        row = (await session.execute(select(TaskRow))).scalar_one()
+        row.analyst_deadline_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    await inbox.sweep_deadlines()
+
+    row = await _load_row(session_factory)
+    assert row.internal_status != TaskStatus.FAILED.value
+    assert row.awaiting_post_id == "root-1"
+    assert row.analyst_deadline_at.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc) + timedelta(hours=47)
+    assert [uid for uid, _ in chat.sent_dms] == ["uid-lead"]
+    assert await inbox.find_task_by_thread("root-1") is not None
+
+
+@pytest.mark.asyncio
+async def test_stuck_task_is_revived_by_team_reply(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_task_row(session_factory)
+    reply = ChatMessage(
+        id="r-1", channel_id="ch-team", author_id="uid-a", text="ок",
+        timestamp=datetime.now(timezone.utc), thread_root_id="root-1",
+    )
+    chat = _TeamThreadChat([reply], {"uid-a": "a.gulvanyuk"})
+    analyst = _ScriptedAnalyst([_team_ask(), _team_ask()])
+    inbox = _make_inbox(session_factory, chat, analyst)
+    await inbox.handle(_msg())
+    await inbox._terminate(await _load_row(session_factory), kind="stuck", reason="max_iterations_reached")
+
+    task_row = await inbox.find_task_by_thread("root-1")
+    assert task_row is not None
+    await inbox.append_fragment(task_row.id, reply)
+    async with session_scope(session_factory) as session:
+        from sqlalchemy import select
+
+        row = (await session.execute(select(TaskRow))).scalar_one()
+        row.last_fragment_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+    await inbox.flush_idle()
+
+    assert len(analyst.calls) == 2
+    assert analyst.calls[1].history[-1].text == "@a.gulvanyuk: ок"
+    row = await _load_row(session_factory)
+    assert row.internal_status == TaskStatus.CLARIFYING.value
+    assert row.analyst_iteration_count == 1
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_is_not_revived_by_thread(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_task_row(session_factory)
+    inbox = _make_inbox(session_factory, _FakeChat(), _ScriptedAnalyst([_team_ask()]))
+    await inbox.handle(_msg())
+    await inbox._terminate(await _load_row(session_factory), kind="blocked", reason="contradiction")
+
+    assert await inbox.find_task_by_thread("root-1") is None

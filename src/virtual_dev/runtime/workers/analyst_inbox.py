@@ -206,6 +206,15 @@ class AnalystInbox:
             }
             for f in (mm_post.files or [])
         ]
+        if mm_post.thread_root_id and await self._sessions.revive_stuck(
+            task_id, root_id=mm_post.thread_root_id, channel_id=mm_post.channel_id,
+        ):
+            await self._sessions.append_step(
+                task_id=task_id,
+                kind=ConversationStepKind.NOTE,
+                text="Task revived: the team replied in the thread",
+                metadata={"kind": "revived"},
+            )
         ok = await self._sessions.append_fragment(
             task_id=task_id,
             mm_post_id=mm_post.id,
@@ -248,6 +257,16 @@ class AnalystInbox:
         overdue = await self._sessions.find_overdue(now=now)
         swept = 0
         for task_row in overdue:
+            if task_row.awaiting_post_id:
+                # Waiting on people isn't being stuck: ping the lead and
+                # keep listening. A ping dropped outside working hours is
+                # retried an hour later.
+                sent = await self._send_lead_escalation(
+                    task_row, reason="no_reply_yet", kind="stuck",
+                )
+                hours = self._config.agents.clarification.max_goal_age_hours if sent else 1
+                await self._sessions.set_deadline(task_row.id, now + timedelta(hours=hours))
+                continue
             await self._terminate(
                 task_row,
                 kind="stuck",
@@ -415,11 +434,10 @@ class AnalystInbox:
             )
             return
 
-        deadline_at = (
-            task_row.analyst_deadline_at
-            or datetime.now(timezone.utc) + timedelta(
-                hours=self._config.agents.clarification.max_goal_age_hours,
-            )
+        # Counted from the latest run: a discussion that keeps moving
+        # never runs out of time.
+        deadline_at = datetime.now(timezone.utc) + timedelta(
+            hours=self._config.agents.clarification.max_goal_age_hours,
         )
         coalesce_window = self._config.agents.clarification.coalesce_window_seconds
         await self._sessions.increment_iteration(
@@ -792,7 +810,7 @@ class AnalystInbox:
 
     async def _send_lead_escalation(
         self, task_row: TaskRow, *, reason: str, kind: str,
-    ) -> None:
+    ) -> bool:
         lead = await self._lead_user_id()
         steps = await self._sessions.list_steps(task_row.id)
         chain = "\n".join(
@@ -842,7 +860,7 @@ class AnalystInbox:
                     "note": note,
                 },
             ))
-            return
+            return False
         outcome = await self._communicator.send_dm(lead, body)
         await emit_if(self._trace, AgentTraceEvent(
             type="escalation_sent" if outcome.sent else "escalation_dropped",
@@ -855,6 +873,7 @@ class AnalystInbox:
                 "body": body,
             },
         ))
+        return outcome.sent
 
     # ---------------------------------------------------------------- helpers
     async def _was_reset_since(self, task_row: TaskRow, since: datetime) -> bool:
