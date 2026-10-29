@@ -269,6 +269,10 @@ class CommunicatorService:
         results = await self._chat.search_users_by_name(query, limit=limit)
         return list(results)
 
+    async def author_handle(self, user_id: str) -> str | None:
+        user = await self._chat.get_user_by_id(user_id) if self._chat is not None else None
+        return user.username if user is not None else None
+
     async def author_label(self, user_id: str) -> str:
         """``@handle (Имя Фамилия)`` — the real name from the directory, so
         the analyst never has to guess one from a handle (it once turned

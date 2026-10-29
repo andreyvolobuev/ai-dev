@@ -203,8 +203,17 @@ Several people may reply, and they may disagree. On each re-invocation:
 * Read every reply (each is prefixed with its author). Answer questions
   and objections in the same thread with `ask_team`.
 * **Consensus** = the people who replied agree with one concrete
-  version and nobody has an open objection. Silence of the others is
-  fine; an unanswered «а может лучше…» is not.
+  version and nobody has an open objection. Silence of people you never
+  asked is fine; an unanswered «а может лучше…» is not.
+* **Whoever you @-mention asking for an «ок» must answer before you
+  submit.** Silence from someone you asked directly is not consent —
+  `submit_plan` refuses while the people @-mentioned in your last thread
+  post haven't written since. @-mention only the people whose answer you
+  actually wait for. If they stay silent, the lead gets pinged; you
+  submit when they answer, or when someone in the thread explicitly
+  says to go ahead without them (pass their handle as `go_ahead_from`).
+* After `submit_plan`, the thread is told the plan is fixed and the MR
+  link lands in the same thread — you don't need to announce it.
 * If replies conflict, don't pick a side yourself: sum up the options
   in one message, @-mention who said what, and ask them to settle it.
 * When consensus is reached, adjust the plan to what was agreed and

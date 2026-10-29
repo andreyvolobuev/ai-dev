@@ -47,6 +47,7 @@ from virtual_dev.application.services.agent_trace import (
     AgentTraceEvent,
     emit_if,
 )
+from virtual_dev.application.services.analyst_session_repo import AnalystSessionRepository
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.domain.models.merge_request import MRStatus, ReviewComment
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
@@ -774,7 +775,14 @@ class ReviewerAgent:
         resulting post id + channel on the MR so the MM thread listener can
         route replies back to us. Returns False if the ping was skipped.
         """
-        channel_id = self._team_channel_for(row.repo_key)
+        # The plan was argued out in the ticket's team thread: the MR goes
+        # there too, and replies under it then route to this MR.
+        thread = None
+        if row.task_external_id:
+            thread = await AnalystSessionRepository(self._session_factory).team_thread_for_ticket(
+                row.task_external_id,
+            )
+        channel_id = thread["channel_id"] if thread else self._team_channel_for(row.repo_key)
         if not channel_id:
             logger.info(
                 "Reviewer: no team channel configured for {!r}; skipping review ping",
@@ -806,7 +814,9 @@ class ReviewerAgent:
             repo_key=row.repo_key, iid=row.iid,
             title=title, web_url=row.web_url, summary=summary,
         )
-        outcome = await self._communicator.send_channel(channel_id, body)
+        outcome = await self._communicator.send_channel(
+            channel_id, body, thread_root_id=thread["root_id"] if thread else None,
+        )
         if outcome.sent and outcome.message is not None:
             # Persist thread metadata immediately so a reply that lands
             # before the next tick can still be routed back to this MR.
@@ -816,7 +826,7 @@ class ReviewerAgent:
                 )).scalar_one_or_none()
                 if fresh is not None:
                     fresh.review_thread_channel_id = outcome.message.channel_id
-                    fresh.review_thread_root_id = outcome.message.id
+                    fresh.review_thread_root_id = thread["root_id"] if thread else outcome.message.id
         return outcome.sent
 
     async def _notify_ready_to_merge(self, row: MergeRequestRow) -> None:

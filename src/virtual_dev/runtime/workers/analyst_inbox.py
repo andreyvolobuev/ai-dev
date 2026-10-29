@@ -675,6 +675,8 @@ class AnalystInbox:
                 },
             ))
 
+        await self._announce_plan_in_thread(task_row)
+
         await emit_if(self._trace, AgentTraceEvent(
             type="task_event", agent_key="analyst",
             payload={
@@ -683,6 +685,18 @@ class AnalystInbox:
                 "target_repo_key": plan.target_repo_key,
             },
         ))
+
+    async def _announce_plan_in_thread(self, task_row: TaskRow) -> None:
+        """The team argued the plan out in the thread — it must hear there
+        that the plan is fixed, not find a MR in the channel a day later."""
+        text = self._config.notifications.mattermost.plan_ready_in_thread.strip()
+        thread = team_thread(await self._sessions.list_steps(task_row.id))
+        if not text or thread is None:
+            return
+        # The team is waiting on this answer, so working hours don't apply.
+        await self._communicator.send_channel(
+            thread["channel_id"], text, thread_root_id=thread["root_id"], reactive=True,
+        )
 
     async def _terminate(
         self,

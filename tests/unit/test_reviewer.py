@@ -436,6 +436,49 @@ async def test_review_ping_fires_once_on_first_observation(
     assert chat.sent_channels == []
 
 
+@pytest.mark.asyncio
+async def test_review_ping_goes_to_the_tickets_team_thread(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """DM-3784: the team agreed the plan in a thread, then the MR showed up
+    as a fresh channel post and the thread never heard about it."""
+    from virtual_dev.application.services.analyst_session_repo import AnalystSessionRepository
+    from virtual_dev.domain.models.analyst_conversation import ConversationStepKind
+    from virtual_dev.infrastructure.db import TaskRow
+
+    async with session_scope(session_factory) as session:
+        task = TaskRow(
+            tracker="jira", external_id="DM-1", title="t", description="",
+            url="https://jira/DM-1", priority="medium", external_status="To Do",
+            internal_status="ready", reporter_id="you",
+        )
+        session.add(task)
+        await session.flush()
+        task_id = task.id
+    await AnalystSessionRepository(session_factory).append_step(
+        task_id=task_id, kind=ConversationStepKind.BOT_ASKED, text="предлагаю X",
+        metadata={"audience": "team", "channel_id": "ch-team", "asked_post_id": "root-1"},
+    )
+    mr_id = await _insert_mr(session_factory, review_ping_sent=False)
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        mr_status=MRStatus.OPEN,
+    )
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+
+    await _agent(vcs, communicator, session_factory, _cfg()).tick()
+
+    assert [channel for channel, _ in chat.sent_channels] == ["ch-team"]
+    assert chat.sent_thread_roots == ["root-1"]
+    async with session_factory() as session:
+        row = (await session.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+    assert row.review_thread_root_id == "root-1"
+
+
 def _job(name: str, status: str) -> PipelineJob:
     return PipelineJob(
         id=1, name=name, stage="test", status=status,

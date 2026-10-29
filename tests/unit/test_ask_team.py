@@ -181,6 +181,9 @@ class _ThreadCommunicator(_StubCommunicator):
     async def author_label(self, user_id: str) -> str:
         return {"uid-a": "@a.ivanova (Анна Иванова)"}.get(user_id, f"@{user_id}")
 
+    async def author_handle(self, user_id: str) -> str | None:
+        return {"uid-a": "a.ivanova", "uid-g": "g.golovin", "uid-lead": "an.volobuev"}.get(user_id)
+
     async def sign_posts(self, posts: Any) -> str:
         from virtual_dev.application.services.communicator import CommunicatorService
 
@@ -255,3 +258,55 @@ async def test_dm_nudge_shows_thread_replies_first() -> None:
     assert "new_team_replies" in body
     assert "@a.ivanova (Анна Иванова): ок, но тип TEXT" in body
     assert comm.posts == []
+
+
+def _at(post_id: str, text: str, author: str, minute: int) -> ChatMessage:
+    return ChatMessage(
+        id=post_id, channel_id="ch-team", author_id=author, text=text,
+        timestamp=datetime(2026, 10, 26, 12, minute, tzinfo=timezone.utc),
+        thread_root_id="root-1", trusted=author == "bot",
+    )
+
+
+def _asked_glebs_ok(*after: ChatMessage) -> list[ChatMessage]:
+    return [
+        _at("root-1", "предлагаю X", "bot", 0),
+        _at("b-1", "@g.golovin @a.ivanova подтвердите смену смысла paused", "bot", 1),
+        *after,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_plan_waits_for_people_it_asked() -> None:
+    """DM-3784: asked two devs to confirm, heard nothing, shipped anyway."""
+    thread = _asked_glebs_ok(_at("r-1", "ок", "uid-a", 2), _at("r-2", "она вас ждёт", "uid-lead", 3))
+    ctx, _ = _thread_ctx(thread, seen={"r-1", "r-2"})
+
+    body = await _run(build_submit_plan(ctx), {**_PLAN, "confidence": 0.95, "decisions": []})
+
+    assert "awaiting_people_you_asked" in body
+    assert "@g.golovin" in body and "@a.ivanova" not in body
+    assert ctx.submit_capture == {}
+
+
+@pytest.mark.asyncio
+async def test_plan_goes_through_once_asked_people_answered() -> None:
+    thread = _asked_glebs_ok(_at("r-1", "ок", "uid-a", 2), _at("r-2", "не спорю", "uid-g", 3))
+    ctx, _ = _thread_ctx(thread, seen={"r-1", "r-2"})
+
+    body = await _run(build_submit_plan(ctx), {**_PLAN, "confidence": 0.95, "decisions": []})
+
+    assert '"recorded": true' in body
+
+
+@pytest.mark.asyncio
+async def test_go_ahead_counts_only_from_someone_who_wrote_after_the_ask() -> None:
+    thread = _asked_glebs_ok(_at("r-1", "всё ок, делай", "uid-lead", 2))
+    ctx, _ = _thread_ctx(thread, seen={"r-1"})
+    plan = {**_PLAN, "confidence": 0.95, "decisions": []}
+
+    refused = await _run(build_submit_plan(ctx), {**plan, "go_ahead_from": "g.golovin"})
+    assert "awaiting_people_you_asked" in refused
+
+    accepted = await _run(build_submit_plan(ctx), {**plan, "go_ahead_from": "@an.volobuev"})
+    assert '"recorded": true' in accepted

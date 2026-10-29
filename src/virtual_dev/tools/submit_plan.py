@@ -9,7 +9,11 @@ from claude_agent_sdk import tool
 from virtual_dev.application.services.agent_effects import AnalystEffect
 from virtual_dev.tools import ToolContext, wrap_text
 from virtual_dev.tools._helpers import scrub_human_fields
-from virtual_dev.tools._team_thread import collect_late_replies, late_replies_result
+from virtual_dev.tools._team_thread import (
+    collect_late_replies,
+    late_replies_result,
+    unanswered_mentions,
+)
 
 TOOL_GROUP = "analyst"
 
@@ -49,6 +53,9 @@ _SUBMIT_PLAN_SCHEMA: dict[str, Any] = {
         # state outright. Non-empty → the plan needs a human sign-off.
         "decisions": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number"},
+        # Handle of whoever, in the thread after your last post, told you
+        # to proceed without the people you @-asked there.
+        "go_ahead_from": {"type": ["string", "null"]},
         "target_repo_key": {"type": ["string", "null"]},
         "status": {"type": "string", "enum": ["ready", "failed"]},
     },
@@ -100,6 +107,27 @@ def build(ctx: ToolContext):
                 root_id = run_state["team_thread"]["root_id"]
                 return wrap_text({
                     "recorded": False, **late_replies_result(late, root_id=root_id),
+                })
+            pending = await unanswered_mentions(
+                communicator, run_state, go_ahead_from=args.get("go_ahead_from"),
+            )
+            if pending:
+                return wrap_text({
+                    "recorded": False,
+                    "reason": "awaiting_people_you_asked",
+                    "pending": [f"@{handle}" for handle in pending],
+                    "instruction": (
+                        "Your last thread post asked these people to answer "
+                        "and they haven't — silence from someone you asked "
+                        "directly is not consent. Don't submit: answer what "
+                        "the others wrote with ask_team, @-mention the people "
+                        "you still wait for in one short line, and END YOUR "
+                        "TURN. Only if someone in the thread, after your "
+                        "post, explicitly told you to go ahead without them "
+                        "(«всё ок, делай»), call submit_plan again with "
+                        "go_ahead_from=<their handle>. A nudge like «она вас "
+                        "ждёт» is not a go-ahead."
+                    ),
                 })
         if _needs_confirmation(args, run_state):
             return wrap_text({

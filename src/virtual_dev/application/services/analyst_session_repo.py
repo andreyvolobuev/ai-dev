@@ -136,6 +136,25 @@ class AnalystSessionRepository:
                 return row if (last_note or {}).get("kind") == "stuck" else None
         return None
 
+    async def team_thread_for_ticket(self, external_id: str) -> dict[str, str] | None:
+        """``{channel_id, root_id}`` of the ticket's team discussion, so
+        later news (the MR) lands in the thread the team argued in."""
+        async with self._session_factory() as session:
+            rows = (await session.execute(
+                select(AnalystConversationStepRow.metadata_json)
+                .join(TaskRow, TaskRow.id == AnalystConversationStepRow.task_id)
+                .where(
+                    TaskRow.external_id == external_id,
+                    AnalystConversationStepRow.kind == ConversationStepKind.BOT_ASKED.value,
+                )
+                .order_by(AnalystConversationStepRow.task_id.desc(), AnalystConversationStepRow.seq.desc())
+            )).scalars().all()
+        for meta in rows:
+            meta = meta or {}
+            if meta.get("audience") == "team" and meta.get("channel_id") and meta.get("asked_post_id"):
+                return {"channel_id": str(meta["channel_id"]), "root_id": str(meta["asked_post_id"])}
+        return None
+
     async def find_by_awaiting_channel(
         self, mm_channel_id: str, mm_user_id: str,
     ) -> TaskRow | None:

@@ -143,6 +143,8 @@ class EscalationCfg(_StrictModel):
 # present.
 class MmTemplatesCfg(_StrictModel):
     review_ping: str = ""
+    # Into the ticket's team-discussion thread once the plan is fixed.
+    plan_ready_in_thread: str = ""
     merge_ping: str = ""
     stale_ping: str = ""
     escalation_dm: str = ""

@@ -48,6 +48,7 @@ class _FakeChat(ChatPort):
     def __init__(self, *, users: dict[str, str] | None = None) -> None:
         self._users = users or {}
         self.sent_dms: list[tuple[str, str]] = []
+        self.channel_posts: list[tuple[str, str | None, str]] = []
 
     async def read_thread(self, thread_root_id: str) -> Sequence[ChatMessage]:
         return []
@@ -63,6 +64,7 @@ class _FakeChat(ChatPort):
     async def send_to_channel(
         self, channel_id: str, text: str, thread_root_id: str | None = None,
     ) -> ChatMessage:
+        self.channel_posts.append((channel_id, thread_root_id, text))
         return ChatMessage(
             id="x", channel_id=channel_id, author_id="uid-bot",
             text=text, timestamp=datetime.now(timezone.utc), trusted=True,
@@ -628,6 +630,7 @@ async def test_team_thread_replies_reach_analyst_with_authors(
         ),
     ])
     inbox = _make_inbox(session_factory, chat, analyst)
+    inbox._config.notifications.mattermost.plan_ready_in_thread = "план готов"
     await inbox.handle(_msg())
 
     task_row = await inbox.find_task_by_thread("root-1")
@@ -653,6 +656,8 @@ async def test_team_thread_replies_reach_analyst_with_authors(
     )
     asked_step = [s for s in analyst.calls[1].history if s.kind.value == "bot_asked"][0]
     assert asked_step.metadata["audience"] == "team"
+    # The thread that agreed the plan hears that it's fixed.
+    assert chat.channel_posts == [("ch-team", "root-1", "план готов")]
 
 
 @pytest.mark.asyncio
