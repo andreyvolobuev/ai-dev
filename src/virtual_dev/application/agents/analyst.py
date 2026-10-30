@@ -45,6 +45,7 @@ from virtual_dev.application.services import (
 )
 from virtual_dev.application.services.agent_effects import AnalystEffect
 from virtual_dev.application.services.agent_trace import bind_run_id
+from virtual_dev.application.services.repo_instructions import render_repo_instructions
 from virtual_dev.domain.models.analyst_conversation import (
     ConversationStep,
     ConversationStepKind,
@@ -217,15 +218,22 @@ class AnalystAgent:
             ),
         )
 
+        system_prompt = self._prompts.render(
+            _ANALYST_PROMPT_NAME,
+            fallback=_ANALYST_FALLBACK_PROMPT,
+            untrusted_warning=SYSTEM_PROMPT_ABOUT_UNTRUSTED,
+            tools_catalog=tools_catalog,
+        )
+        # The plan must respect the repo's own agent rules (AGENTS.md /
+        # .opencode), or the dev implements a plan that breaks them.
+        repo_instructions = render_repo_instructions(cwd)
+        if repo_instructions:
+            system_prompt = f"{system_prompt}\n\n{repo_instructions}"
+
         model = self._config.agents.model_for("analyst")
         request = CodeAgentRequest(
             agent_key=self.agent_key,
-            system_prompt=self._prompts.render(
-                _ANALYST_PROMPT_NAME,
-                fallback=_ANALYST_FALLBACK_PROMPT,
-                untrusted_warning=SYSTEM_PROMPT_ABOUT_UNTRUSTED,
-                tools_catalog=tools_catalog,
-            ),
+            system_prompt=system_prompt,
             user_prompt=prompt,
             working_dir=str(cwd) if cwd else None,
             max_turns=self._max_turns,

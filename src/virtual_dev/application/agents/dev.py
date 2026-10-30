@@ -52,6 +52,7 @@ from virtual_dev.application.services.agent_trace import (
     AgentTraceEvent,
     emit_if,
 )
+from virtual_dev.application.services.repo_instructions import render_repo_instructions
 from virtual_dev.application.services.ticket_reset import was_reset_since
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus
@@ -710,7 +711,9 @@ class DevAgent:
 
         mcp_servers, allowed_tool_names, groups, captured = self._build_tool_surface()
         tools_catalog = render_tools_catalog(groups)
-        system_prompt = self._compose_system_prompt(task_row, tools_catalog)
+        system_prompt = self._compose_system_prompt(
+            task_row, tools_catalog, workspace_path=workspace_path,
+        )
         user_prompt = self._render_iteration_prompt(
             task_row=task_row, plan=plan, feedback=feedback,
             feedback_kind=feedback_kind, thread=thread,
@@ -854,7 +857,9 @@ class DevAgent:
 
         mcp_servers, allowed_tool_names, groups, captured = self._build_tool_surface()
         tools_catalog = render_tools_catalog(groups)
-        system_prompt = self._compose_system_prompt(task_row, tools_catalog)
+        system_prompt = self._compose_system_prompt(
+            task_row, tools_catalog, workspace_path=workspace_path,
+        )
         user_prompt = self._render_user_prompt(task_row=task_row, plan=plan)
         request = CodeAgentRequest(
             agent_key=self._agent_key,
@@ -871,6 +876,7 @@ class DevAgent:
 
     def _compose_system_prompt(
         self, task_row: TaskRow, tools_catalog: str = "",
+        *, workspace_path: str | None = None,
     ) -> str:
         base = self._prompts.render(
             _DEV_PROMPT_NAME,
@@ -894,6 +900,11 @@ class DevAgent:
             parts.append("")
             parts.append("## Rules for this agent")
             parts.append(rules)
+
+        repo_instructions = render_repo_instructions(workspace_path)
+        if repo_instructions:
+            parts.append("")
+            parts.append(repo_instructions)
         return "\n".join(parts)
 
     def _render_user_prompt(self, *, task_row: TaskRow, plan: Plan) -> str:
