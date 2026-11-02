@@ -387,6 +387,10 @@ async def test_inbox_escalates_when_run_produces_no_effect(
     # Lead got the escalation DM.
     lead_dms = [(uid, txt) for uid, txt in chat.sent_dms if uid == "uid-lead"]
     assert len(lead_dms) == 1
+    # One readable line, not a dump of planner steps («простыня» on DM-3784).
+    [(_, text)] = lead_dms
+    assert "DM-42" in text
+    assert "planner_decided" not in text and "\n" not in text.strip()
 
 
 @pytest.mark.asyncio

@@ -93,29 +93,14 @@ mattermost:
   #   blocked / unworkable; orchestrator has just transitioned it to
   #   "Waiting For Response" and posted an explanatory Jira comment.
   #
-  # Placeholders for both: {tracker}, {external_id}, {task_url},
-  # {original_question}, {chain_summary}, {reason}.
+  # Одна-две строки, без цепочки шагов: её назвали нечитаемой простынёй,
+  # весь след виден на дашборде. Placeholders: {tracker}, {external_id},
+  # {task_url}, {original_question}, {reason} (уже человеческими словами).
   stuck_escalation_to_lead: |
-    Застряла с уточнением по тикету [{external_id}]({task_url}).
-
-    **Причина:** {reason}
-
-    **Цель:** {original_question}
-
-    **Цепочка шагов:**
-    {chain_summary}
-
-    Помоги, пожалуйста, разобраться или подскажи, кому переадресовать.
+    Застряла по [{external_id}]({task_url}): {reason}. Подскажи, как быть, или ответь в треде задачи — продолжу.
 
   blocked_escalation_to_lead: |
-    Перевела в Pending задачу [{external_id}]({task_url})
-
-    **Причина:** {reason}
-
-    **Цепочка шагов:**
-    {chain_summary}
-
-    Помоги, пожалуйста, разобраться или подскажи, кому переадресовать.
+    Перевела [{external_id}]({task_url}) в Pending: {reason}. Дальше без твоего решения не пойду.
 
   # --- Интейк задач ---
   # Ответ на просьбу завести задачу. Факты — от раннера, не от модели.

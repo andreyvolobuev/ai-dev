@@ -111,6 +111,22 @@ class AnalystInboxStats:
     deadlines_swept: int = 0
 
 
+
+# Internal stop codes → words a lead can act on. Reasons the analyst
+# wrote itself (stuck / blocked effects) are already prose and pass as is.
+_HUMAN_REASONS: dict[str, str] = {
+    "deadline_exceeded": "долго нет ответа, а сама дальше двинуться не могу",
+    "no_reply_yet": "жду ответа в треде, его всё нет",
+    "max_iterations_reached": "много кругов уточнений, а плана так и нет",
+    "plan_submitted_but_unparseable": "у меня сбой: план не сохранился",
+}
+
+
+def _human_reason(reason: str) -> str:
+    if reason.startswith("agent_no_action:"):
+        return "у меня сбой: прогон закончился ничем"
+    return _HUMAN_REASONS.get(reason, reason)
+
 class AnalystInbox:
     """Drives the analyst across the lifetime of a ticket."""
 
@@ -871,36 +887,29 @@ class AnalystInbox:
         self, task_row: TaskRow, *, reason: str, kind: str,
     ) -> bool:
         lead = await self._lead_user_id()
-        steps = await self._sessions.list_steps(task_row.id)
-        chain = "\n".join(
-            f"- [{s.seq}] {s.kind.value}: «{(s.text or '').splitlines()[0][:160] if s.text else ''}»"
-            for s in steps
-        ) or "(no steps)"
         mm = self._config.notifications.mattermost
+        # One or two lines: which ticket, what's wrong, in words. The step
+        # chain used to go here — 45 bullets of planner internals the lead
+        # called unreadable; the full trail stays on the dashboard.
         if kind == "blocked":
             body_template = (
                 mm.blocked_escalation_to_lead
-                or
-                "Перевела в Pending задачу [{external_id}]({task_url})\n\n"
-                "**Причина:** {reason}\n\n"
-                "**Цепочка шагов:**\n{chain_summary}"
+                or "Перевела [{external_id}]({task_url}) в Pending: {reason}."
             )
         else:
             body_template = (
                 mm.stuck_escalation_to_lead
-                or
-                "Застряла с уточнением по тикету [{external_id}]({task_url}).\n\n"
-                "**Причина:** {reason}\n\n**Цель:** {original_question}\n\n"
-                "**Цепочка:**\n{chain_summary}"
+                or "Застряла по [{external_id}]({task_url}): {reason}."
             )
         body = body_template.format(
             tracker=task_row.tracker,
             external_id=task_row.external_id,
             task_url=task_row.url or "",
             original_question=(task_row.title or "")[:300],
-            chain_summary=chain,
-            reason=reason,
-        )
+            # Old copies of notifications.yaml may still reference it.
+            chain_summary="",
+            reason=_human_reason(reason),
+        ).strip()
         if lead is None:
             handle = (self._config.agents.escalation.mattermost_user or "").strip()
             if not handle or handle == "your.name":
