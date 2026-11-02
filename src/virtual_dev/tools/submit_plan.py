@@ -8,11 +8,10 @@ from claude_agent_sdk import tool
 
 from virtual_dev.application.services.agent_effects import AnalystEffect
 from virtual_dev.tools import ToolContext, wrap_text
-from virtual_dev.tools._helpers import scrub_human_fields
+from virtual_dev.tools._helpers import scrub_human_fields, strip_agent_attribution
 from virtual_dev.tools._team_thread import (
     collect_late_replies,
     late_replies_result,
-    unanswered_mentions,
 )
 
 TOOL_GROUP = "analyst"
@@ -53,9 +52,9 @@ _SUBMIT_PLAN_SCHEMA: dict[str, Any] = {
         # state outright. Non-empty → the plan needs a human sign-off.
         "decisions": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "number"},
-        # Handle of whoever, in the thread after your last post, told you
-        # to proceed without the people you @-asked there.
-        "go_ahead_from": {"type": ["string", "null"]},
+        # One short line for the team thread: «беру в работу». Written by
+        # the model so it doesn't read as the same canned bot phrase.
+        "thread_note": {"type": ["string", "null"]},
         "target_repo_key": {"type": ["string", "null"]},
         "status": {"type": "string", "enum": ["ready", "failed"]},
     },
@@ -82,7 +81,10 @@ def build(ctx: ToolContext):
         "proposed / not agreed, scope beyond the ticket, schema "
         "migrations or data changes. A plan with decisions (or low "
         "confidence) is refused until the team has replied to your "
-        "proposal.",
+        "proposal or let it stand (silence for a couple of working "
+        "hours is consent). `thread_note`: if you discussed this in the "
+        "team thread, one short line posted there that you're starting "
+        "(«Возражений нет — беру в работу»; vary the wording).",
         _SUBMIT_PLAN_SCHEMA,
     )
     async def _submit(args: dict[str, Any]) -> dict[str, Any]:
@@ -108,38 +110,20 @@ def build(ctx: ToolContext):
                 return wrap_text({
                     "recorded": False, **late_replies_result(late, root_id=root_id),
                 })
-            pending = await unanswered_mentions(
-                communicator, run_state, go_ahead_from=args.get("go_ahead_from"),
-            )
-            if pending:
-                return wrap_text({
-                    "recorded": False,
-                    "reason": "awaiting_people_you_asked",
-                    "pending": [f"@{handle}" for handle in pending],
-                    "instruction": (
-                        "Your last thread post asked these people to answer "
-                        "and they haven't — silence from someone you asked "
-                        "directly is not consent. Don't submit: answer what "
-                        "the others wrote with ask_team, @-mention the people "
-                        "you still wait for in one short line, and END YOUR "
-                        "TURN. Only if someone in the thread, after your "
-                        "post, explicitly told you to go ahead without them "
-                        "(«всё ок, делай»), call submit_plan again with "
-                        "go_ahead_from=<their handle>. A nudge like «она вас "
-                        "ждёт» is not a go-ahead."
-                    ),
-                })
         if _needs_confirmation(args, run_state):
             return wrap_text({
                 "recorded": False,
                 "reason": "needs_confirmation",
                 "instruction": (
-                    "This plan rests on decisions nobody has confirmed "
-                    "(or your confidence is low). Don't guess — put the "
-                    "proposal to the team with ask_team (state the "
-                    "decisions, ask to confirm or correct) and END YOUR "
-                    "TURN. If ask_team has no team channel, DM the "
-                    "reporter. Submit once the team has agreed."
+                    "This plan rests on decisions the team hasn't seen "
+                    "(or your confidence is low). Tell the team what you're "
+                    "about to do with ask_team — one short line the way a "
+                    "colleague would («@vasya, по DM-1 перепишу ручку /data "
+                    "на asyncio»), @-mentioning whose area it touches; no "
+                    "list of changes, no «скажите ок» — and END YOUR TURN. "
+                    "Objections come back as replies; silence for a couple "
+                    "of working hours is consent and you'll be re-invoked "
+                    "to submit. No team channel → DM the reporter instead."
                 ),
             })
         submit_capture.clear()
@@ -153,6 +137,7 @@ def build(ctx: ToolContext):
                 "summary": str(args.get("summary") or "")[:200],
                 "status": str(args.get("status") or "ready"),
                 "target_repo_key": args.get("target_repo_key"),
+                "thread_note": strip_agent_attribution(str(args.get("thread_note") or "")),
             },
         ))
         run_state["terminal"] = True

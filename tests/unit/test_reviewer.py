@@ -644,7 +644,7 @@ async def test_review_ping_uses_mr_summarizer_to_describe_the_mr(
     # Override the team channel template with one that uses {summary}.
     cfg = _cfg()
     cfg.notifications.mattermost.review_ping = (
-        "Ребята, приглашаю на [МР]({web_url}), в котором я {summary}"
+        "@channel Ребята, приглашаю на ревью [МР]({web_url}) по задаче {key}, в котором я {summary}"
     )
 
     agent = ReviewerAgent(
@@ -667,6 +667,10 @@ async def test_review_ping_uses_mr_summarizer_to_describe_the_mr(
         "добавила валидацию этапов и покрыла её тестами" in body
         for body in bodies
     ), f"summary missing from posted bodies: {bodies}"
+    # Bare «Ребята, …» goes unnoticed in the channel: tag it, name the ticket.
+    assert any(
+        body.startswith("@channel ") and "по задаче DM-1," in body for body in bodies
+    ), bodies
 
 
 @pytest.mark.asyncio

@@ -91,3 +91,17 @@ async def test_digest_thread_skips_unparseable_url() -> None:
     chat = _FakeChat({})
     svc = CommunicatorService(chat, InjectionFilter())
     assert await svc.digest_thread("https://mm.local/random/page") is None
+
+
+def test_working_time_after_skips_nights_and_weekends() -> None:
+    from datetime import datetime, timezone
+
+    from virtual_dev.application.services.communicator import working_time_after
+    from virtual_dev.infrastructure.config import WorkingHoursCfg
+
+    cfg = WorkingHoursCfg(timezone="UTC", start_hour=10, end_hour=20)
+    # Friday 19:00 + 2h → 1h on Friday, the other hour Monday 10:00-11:00.
+    friday = datetime(2026, 10, 30, 19, 0, tzinfo=timezone.utc)
+    assert working_time_after(friday, 2, cfg) == datetime(2026, 11, 2, 11, 0, tzinfo=timezone.utc)
+    tuesday = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
+    assert working_time_after(tuesday, 2, cfg) == datetime(2026, 10, 27, 14, 0, tzinfo=timezone.utc)

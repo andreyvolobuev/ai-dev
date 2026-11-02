@@ -813,6 +813,7 @@ class ReviewerAgent:
             self._config.notifications.mattermost.review_ping,
             repo_key=row.repo_key, iid=row.iid,
             title=title, web_url=row.web_url, summary=summary,
+            key=row.task_external_id or row.repo_key,
         )
         outcome = await self._communicator.send_channel(
             channel_id, body, thread_root_id=thread["root_id"] if thread else None,

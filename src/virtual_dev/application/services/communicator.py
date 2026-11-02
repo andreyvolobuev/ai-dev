@@ -22,7 +22,7 @@ import re
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
@@ -269,10 +269,6 @@ class CommunicatorService:
         results = await self._chat.search_users_by_name(query, limit=limit)
         return list(results)
 
-    async def author_handle(self, user_id: str) -> str | None:
-        user = await self._chat.get_user_by_id(user_id) if self._chat is not None else None
-        return user.username if user is not None else None
-
     async def author_label(self, user_id: str) -> str:
         """``@handle (Имя Фамилия)`` — the real name from the directory, so
         the analyst never has to guess one from a handle (it once turned
@@ -376,6 +372,24 @@ def _is_within_working_hours(now: datetime, cfg: "WorkingHoursCfg") -> bool:
     if cfg.weekdays_only and local.weekday() >= 5:   # 5=Sat, 6=Sun
         return False
     return cfg.start_hour <= local.hour < cfg.end_hour
+
+
+def working_time_after(start: datetime, hours: float, cfg: "WorkingHoursCfg") -> datetime:
+    """Moment when ``hours`` of working time have passed since ``start``.
+
+    A proposal posted at 19:30 Friday must not be taken as agreed at 21:30
+    — nobody was there to object. Walks in 5-minute steps; capped at two
+    weeks so a misconfigured window (start_hour >= end_hour) can't spin.
+    """
+    step = timedelta(minutes=5)
+    remaining = timedelta(hours=hours)
+    cur = start
+    limit = start + timedelta(days=14)
+    while remaining > timedelta(0) and cur < limit:
+        if _is_within_working_hours(cur, cfg):
+            remaining -= step
+        cur += step
+    return cur
 
 
 def _render_messages(messages: Sequence[object]) -> str:

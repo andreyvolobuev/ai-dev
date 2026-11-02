@@ -181,9 +181,6 @@ class _ThreadCommunicator(_StubCommunicator):
     async def author_label(self, user_id: str) -> str:
         return {"uid-a": "@a.ivanova (Анна Иванова)"}.get(user_id, f"@{user_id}")
 
-    async def author_handle(self, user_id: str) -> str | None:
-        return {"uid-a": "a.ivanova", "uid-g": "g.golovin", "uid-lead": "an.volobuev"}.get(user_id)
-
     async def sign_posts(self, posts: Any) -> str:
         from virtual_dev.application.services.communicator import CommunicatorService
 
@@ -268,45 +265,34 @@ def _at(post_id: str, text: str, author: str, minute: int) -> ChatMessage:
     )
 
 
-def _asked_glebs_ok(*after: ChatMessage) -> list[ChatMessage]:
-    return [
-        _at("root-1", "предлагаю X", "bot", 0),
-        _at("b-1", "@g.golovin @a.ivanova подтвердите смену смысла paused", "bot", 1),
-        *after,
-    ]
-
-
 @pytest.mark.asyncio
-async def test_plan_waits_for_people_it_asked() -> None:
-    """DM-3784: asked two devs to confirm, heard nothing, shipped anyway."""
-    thread = _asked_glebs_ok(_at("r-1", "ок", "uid-a", 2), _at("r-2", "она вас ждёт", "uid-lead", 3))
-    ctx, _ = _thread_ctx(thread, seen={"r-1", "r-2"})
+async def test_people_tagged_in_the_proposal_dont_have_to_sign_off() -> None:
+    """Silence is consent: «@vasya, перепишу ручку» doesn't wait for Vasya's «ок»."""
+    thread = [_at("root-1", "@g.golovin по DM-1 перепишу /data на asyncio", "bot", 0)]
+    ctx, _ = _thread_ctx(thread, seen=set())
 
-    body = await _run(build_submit_plan(ctx), {**_PLAN, "confidence": 0.95, "decisions": []})
-
-    assert "awaiting_people_you_asked" in body
-    assert "@g.golovin" in body and "@a.ivanova" not in body
-    assert ctx.submit_capture == {}
-
-
-@pytest.mark.asyncio
-async def test_plan_goes_through_once_asked_people_answered() -> None:
-    thread = _asked_glebs_ok(_at("r-1", "ок", "uid-a", 2), _at("r-2", "не спорю", "uid-g", 3))
-    ctx, _ = _thread_ctx(thread, seen={"r-1", "r-2"})
-
-    body = await _run(build_submit_plan(ctx), {**_PLAN, "confidence": 0.95, "decisions": []})
+    body = await _run(build_submit_plan(ctx), {**_PLAN, "confidence": 0.95, "decisions": ["asyncio"]})
 
     assert '"recorded": true' in body
 
 
 @pytest.mark.asyncio
-async def test_go_ahead_counts_only_from_someone_who_wrote_after_the_ask() -> None:
-    thread = _asked_glebs_ok(_at("r-1", "всё ок, делай", "uid-lead", 2))
-    ctx, _ = _thread_ctx(thread, seen={"r-1"})
-    plan = {**_PLAN, "confidence": 0.95, "decisions": []}
+async def test_thread_note_reaches_the_plan_effect() -> None:
+    ctx, _ = _thread_ctx([_at("root-1", "перепишу /data", "bot", 0)], seen=set())
 
-    refused = await _run(build_submit_plan(ctx), {**plan, "go_ahead_from": "g.golovin"})
-    assert "awaiting_people_you_asked" in refused
+    await _run(build_submit_plan(ctx), {
+        **_PLAN, "confidence": 0.95, "decisions": [],
+        "thread_note": "Возражений нет, взялась",
+    })
 
-    accepted = await _run(build_submit_plan(ctx), {**plan, "go_ahead_from": "@an.volobuev"})
-    assert '"recorded": true' in accepted
+    assert ctx.effects[-1].payload["thread_note"] == "Возражений нет, взялась"
+
+
+def test_silence_in_the_team_thread_counts_as_agreement() -> None:
+    silence = [
+        _step(1, ConversationStepKind.BOT_ASKED, audience="team"),
+        _step(2, ConversationStepKind.NOTE, silence_consent=True),
+    ]
+
+    assert _proposal_confirmed(silence, team_required=True)
+    assert not _proposal_confirmed(silence[:1], team_required=True)

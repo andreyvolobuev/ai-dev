@@ -244,6 +244,10 @@ class ClarificationCfg(_StrictModel):
     # human (the team thread, when configured) has answered the analyst.
     confirm_plan_below_confidence: float = 0.9
 
+    # Silence is consent: a proposal in the team thread with no reply for
+    # this many WORKING hours counts as agreed, and the analyst proceeds.
+    silence_consent_hours: float = 2
+
     # SEND_PENDING retry: how many times to retry a DM that
     # Communicator refused (rate-limited / outside working hours)
     # before giving up the goal.

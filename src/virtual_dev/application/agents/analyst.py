@@ -67,6 +67,10 @@ from virtual_dev.tools import (
     render_tools_catalog,
 )
 
+# NOTE-step metadata flag: the team thread stayed silent on the proposal
+# for ``silence_consent_hours`` — that counts as agreement.
+SILENCE_CONSENT = "silence_consent"
+
 _ANALYST_PROMPT_NAME = "analyst"
 _ANALYST_FALLBACK_PROMPT = (
     "You are the Analyst agent. Read the ticket, research, ask humans "
@@ -861,10 +865,13 @@ def team_seen_post_ids(history: Sequence[ConversationStep]) -> set[str]:
 def _proposal_confirmed(
     history: Sequence[ConversationStep], *, team_required: bool,
 ) -> bool:
-    """Has a human answered the analyst at all? With a team channel
-    configured only the team thread counts: a reporter's reply to «кто
-    такой X?» is not a sign-off on the design."""
+    """Has a human answered the analyst, or let the proposal stand by
+    staying silent? With a team channel configured only the team thread
+    counts: a reporter's reply to «кто такой X?» is not a sign-off on the
+    design."""
     for step in history:
+        if step.kind == ConversationStepKind.NOTE and (step.metadata or {}).get(SILENCE_CONSENT):
+            return True
         if step.kind != ConversationStepKind.HUMAN_REPLIED:
             continue
         if not team_required or (step.metadata or {}).get("audience") == "team":

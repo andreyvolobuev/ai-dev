@@ -23,18 +23,21 @@ def build(ctx: ToolContext):
 
     @tool(
         "ask_team",
-        "Post a question or your proposal to the team channel, in the "
-        "ticket's discussion thread, and wait for the team. Use it for "
+        "Post to the team channel, in the ticket's discussion thread: "
+        "what you're about to do, or a reply to the team. Use it for "
         "anything the TEAM has to agree on: design decisions the ticket "
         "doesn't pin down, unratified spec items, scope expansions, "
         "schema migrations, «в спорных моментах созывай ОПГ»-style "
         "directives. The first call opens a new thread (the ticket link "
         "is added automatically); later calls reply in the same thread. "
         "Several people may answer; you'll be re-invoked with every new "
-        "reply, author-attributed. `message` must read like a human "
-        "typed it: state your proposal, then ask — short paragraphs, "
-        "~600 chars max, no headings. You may @-mention people whose "
-        "opinion is needed. **THIS IS ASYNC** — after calling, END YOUR "
+        "reply, author-attributed; no reply in ~2 working hours means "
+        "the team agrees. `message` reads like a colleague typed it: "
+        "an announcement is ONE line («@vasya, по DM-1 перепишу ручку "
+        "/data на asyncio») — no list of changes, no «скажите ок»; a "
+        "reply answers only what was asked, as briefly as it allows, "
+        "and never re-posts the plan or recaps open points. @-mention "
+        "only people whose area it touches. **THIS IS ASYNC** — after calling, END YOUR "
         "TURN. Do NOT call any other tools after this in the same turn.",
         {
             "type": "object",

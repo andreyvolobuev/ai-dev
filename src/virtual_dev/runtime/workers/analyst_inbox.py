@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents import AnalystAgent
 from virtual_dev.application.agents.analyst import (
+    SILENCE_CONSENT,
     AnalystEffect,
     AnalystRunInput,
     AnalystRunResult,
@@ -47,7 +48,10 @@ from virtual_dev.application.services.agent_trace import (
 from virtual_dev.application.services.analyst_session_repo import (
     AnalystSessionRepository,
 )
-from virtual_dev.application.services.communicator import CommunicatorService
+from virtual_dev.application.services.communicator import (
+    CommunicatorService,
+    working_time_after,
+)
 from virtual_dev.domain.models.analyst_conversation import ConversationStepKind
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import Plan, PlanStatus
@@ -257,6 +261,9 @@ class AnalystInbox:
         overdue = await self._sessions.find_overdue(now=now)
         swept = 0
         for task_row in overdue:
+            if task_row.awaiting_post_id and not task_row.awaiting_user_id:
+                await self._consent_by_silence(task_row, now)
+                continue
             if task_row.awaiting_post_id:
                 # Waiting on people isn't being stuck: ping the lead and
                 # keep listening. A ping dropped outside working hours is
@@ -275,6 +282,30 @@ class AnalystInbox:
             swept += 1
             self.stats.deadlines_swept += 1
         return swept
+
+    async def _consent_by_silence(self, task_row: TaskRow, now: datetime) -> None:
+        """Nobody objected to the proposal in the team thread — that's a
+        yes, the way teammates treat «@vasya, перепишу ручку на asyncio».
+        Resume the analyst so it submits and tells the thread it's on it."""
+        if not await self._sessions.clear_awaiting(task_row.id):
+            # Someone did answer; flush_idle hands it over shortly.
+            await self._sessions.set_deadline(task_row.id, now + timedelta(minutes=15))
+            return
+        hours = self._config.agents.clarification.silence_consent_hours
+        await self._sessions.append_step(
+            task_id=task_row.id,
+            kind=ConversationStepKind.NOTE,
+            text=(
+                f"No objections in the team thread for {hours:g} working hours "
+                "since your last post — silence is consent, the proposal stands. "
+                "Submit the plan now (unless you were waiting on a fact, not "
+                "an agreement)."
+            ),
+            metadata={SILENCE_CONSENT: True, "asked_post_id": task_row.awaiting_post_id},
+        )
+        refreshed = await self._sessions.get_task(task_row.id)
+        if refreshed is not None:
+            await self._run_step(refreshed)
 
     # ---------------------------------------------------------------- core
     async def _coalesce_and_resume(self, task_row: TaskRow) -> None:
@@ -601,6 +632,14 @@ class AnalystInbox:
             dedupe_key=p.get("dedupe_key"),
         )
         await self._sessions.clear_started_at(task_row.id)
+        if p.get("audience") == "team":
+            # No reply in time means agreement, not a stalled ticket.
+            consent_at = working_time_after(
+                datetime.now(timezone.utc),
+                self._config.agents.clarification.silence_consent_hours,
+                self._config.agents.working_hours,
+            )
+            await self._sessions.set_deadline(task_row.id, consent_at)
         self.stats.asks_dispatched += 1
         await emit_if(self._trace, AgentTraceEvent(
             type="task_event", agent_key="analyst",
@@ -675,7 +714,9 @@ class AnalystInbox:
                 },
             ))
 
-        await self._announce_plan_in_thread(task_row)
+        await self._announce_plan_in_thread(
+            task_row, str(effect.payload.get("thread_note") or ""),
+        )
 
         await emit_if(self._trace, AgentTraceEvent(
             type="task_event", agent_key="analyst",
@@ -686,10 +727,12 @@ class AnalystInbox:
             },
         ))
 
-    async def _announce_plan_in_thread(self, task_row: TaskRow) -> None:
+    async def _announce_plan_in_thread(self, task_row: TaskRow, note: str = "") -> None:
         """The team argued the plan out in the thread — it must hear there
-        that the plan is fixed, not find a MR in the channel a day later."""
-        text = self._config.notifications.mattermost.plan_ready_in_thread.strip()
+        that the work has started, not find a MR in the channel a day later.
+        The analyst's own line reads like a person; the template is the
+        fallback."""
+        text = note.strip() or self._config.notifications.mattermost.plan_ready_in_thread.strip()
         thread = team_thread(await self._sessions.list_steps(task_row.id))
         if not text or thread is None:
             return

@@ -16,14 +16,16 @@
 mattermost:
   # {summary} is a 1-2 sentence first-person feminine fragment from
   # the MrSummarizer ("добавила X, исправила Y"). Falls back to {title}
-  # when no summarizer is wired.
+  # when no summarizer is wired. {key} — тикет (DM-1234).
+  # @channel обязателен: голое «Ребята, …» в треде никто не замечает.
   review_ping: |
-    Ребята, приглашаю на [МР]({web_url}), в котором я {summary}
+    @channel Ребята, приглашаю на ревью [МР]({web_url}) по задаче {key}, в котором я {summary}
 
-  # В тред обсуждения тикета, когда план согласован. Ссылку на МР бот
-  # принесёт в этот же тред (review_ping).
+  # В тред обсуждения тикета, когда бот берётся за работу. Обычно аналитик
+  # пишет свою фразу (thread_note в submit_plan) — это запасной текст.
+  # Ссылку на МР бот принесёт в этот же тред (review_ping).
   plan_ready_in_thread: |
-    Зафиксировала план в Jira, иду делать МР — ссылку принесу сюда.
+    Возражений нет — взялась за работу, МР принесу сюда.
 
   merge_ping: |
     Мой реквестик [{iid}]({web_url}) собрал апрувы. Смержите, пожалуйста 😊

@@ -839,14 +839,60 @@ async def _load_row(session_factory: async_sessionmaker[AsyncSession]) -> TaskRo
 
 
 @pytest.mark.asyncio
-async def test_overdue_task_waiting_on_team_pings_lead_and_keeps_listening(
+async def test_silence_on_team_proposal_is_consent(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """DM-3784: the team took the weekend to answer and the deadline
-    killed the ticket — nobody heard the «ок» on Monday."""
+    """«@vasya, перепишу ручку /data» — nobody objected, so the analyst
+    goes ahead and tells the thread, instead of waiting days for an «ок»."""
     await _seed_task_row(session_factory)
     chat = _FakeChat(users={"lead": "uid-lead"})
-    inbox = _make_inbox(session_factory, chat, _ScriptedAnalyst([_team_ask()]))
+    plan_run = AnalystRunResult(
+        effects=[AnalystEffect(kind="plan_submitted", payload={
+            "summary": "ok", "status": "ready", "target_repo_key": "x",
+            "thread_note": "Возражений нет — взялась",
+        })],
+        cost_usd=0.0, turns=1, stopped_reason="end_turn", plan=_ready_plan(),
+    )
+    analyst = _ScriptedAnalyst([_team_ask(), plan_run])
+    inbox = _make_inbox(session_factory, chat, analyst)
+    await inbox.handle(_msg())
+
+    row = await _load_row(session_factory)
+    # The consent clock runs in working hours, not 48h of wall time.
+    assert row.analyst_deadline_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc) + timedelta(days=4)
+    async with session_scope(session_factory) as session:
+        from sqlalchemy import select
+
+        row = (await session.execute(select(TaskRow))).scalar_one()
+        row.analyst_deadline_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    await inbox.sweep_deadlines()
+
+    assert len(analyst.calls) == 2
+    assert analyst.calls[1].history[-1].metadata.get("silence_consent") is True
+    row = await _load_row(session_factory)
+    assert row.internal_status == TaskStatus.READY.value
+    assert chat.sent_dms == []
+    assert chat.channel_posts == [("ch-team", "root-1", "Возражений нет — взялась")]
+
+
+@pytest.mark.asyncio
+async def test_overdue_dm_ask_pings_lead_and_keeps_listening(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A question to one person is a fact we need, not a proposal — silence
+    there is not consent: ping the lead and keep waiting."""
+    await _seed_task_row(session_factory)
+    chat = _FakeChat(users={"lead": "uid-lead"})
+    dm_ask = AnalystRunResult(
+        effects=[AnalystEffect(kind="ask_dispatched", payload={
+            "audience": "dm", "asked_post_id": "dm-post", "channel_id": "dm-ch",
+            "target_user_id": "uid-v", "target_username": "v.v", "asked_text": "body?",
+            "dedupe_key": None,
+        })],
+        cost_usd=0.0, turns=1, stopped_reason="end_turn", plan=None,
+    )
+    inbox = _make_inbox(session_factory, chat, _ScriptedAnalyst([dm_ask]))
     await inbox.handle(_msg())
     async with session_scope(session_factory) as session:
         from sqlalchemy import select
@@ -858,10 +904,9 @@ async def test_overdue_task_waiting_on_team_pings_lead_and_keeps_listening(
 
     row = await _load_row(session_factory)
     assert row.internal_status != TaskStatus.FAILED.value
-    assert row.awaiting_post_id == "root-1"
+    assert row.awaiting_post_id == "dm-post"
     assert row.analyst_deadline_at.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc) + timedelta(hours=47)
     assert [uid for uid, _ in chat.sent_dms] == ["uid-lead"]
-    assert await inbox.find_task_by_thread("root-1") is not None
 
 
 @pytest.mark.asyncio
