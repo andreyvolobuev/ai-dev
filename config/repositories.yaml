@@ -21,6 +21,8 @@
 #   tests_cmd          — команда прогона тестов (для QA-агента и backend/frontend-агентов).
 #   lint_cmd           — команда линтера.
 #   ci_provider        — gitlab_ci (на будущее — github_actions, etc).
+#   reviewers          — (опц.) MM-ники, кого бот тегает в пингах на ревью вместо @channel.
+#                        Кто в отпуске (🌴) или на больничном (🤒) по статусу в MM — не тегается.
 
 repositories:
   - key: bellingshausen
@@ -49,6 +51,7 @@ repositories:
     tests_cmd: "pytest"
     lint_cmd: "make lint"
     ci_provider: gitlab_ci
+    reviewers: [e.yakovlev, g.golovin, a.gulvanyuk, d.kozhevnikov, d.boyarshin]
 
   - key: pts_aggregator
     url: git@gitlab.2gis.ru:sd-data-mining/pts-aggregator.git

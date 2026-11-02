@@ -25,6 +25,9 @@ class ChatUser:
     last_name: str | None = None
     position: str | None = None
     is_bot: bool = False
+    # Emoji name of the user's custom status while it is set (🌴 →
+    # ``palm_tree`` = on vacation, 🤒 → ``face_with_thermometer`` = sick).
+    status_emoji: str | None = None
 
 
 @dataclass

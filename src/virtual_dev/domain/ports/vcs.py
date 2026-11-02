@@ -183,11 +183,24 @@ class VcsPort(ABC):
         pipelines can ignore it."""
         raise NotImplementedError
 
+    async def play_manual_triggers(self, repo_key: str, iid: int) -> list[str]:
+        """Start the manual trigger jobs of the MR's latest pipeline that
+        cover the changed code; return the names started.
+
+        Some repos (rainbow) run no checks on an MR until someone clicks
+        a child pipeline's trigger. Without this the bot waits for a CI
+        that never starts. Non-abstract so fakes without pipelines can
+        ignore it: nothing to start."""
+        return []
+
     @abstractmethod
     async def get_latest_pipeline_jobs(
         self, repo_key: str, iid: int, *, log_tail_lines: int = 0,
     ) -> Sequence[PipelineJob]:
-        """Return jobs of the MR's latest pipeline.
+        """Return jobs of the MR's latest pipeline, child pipelines included.
+
+        A child pipeline's jobs are named ``<trigger>/<job>``; a trigger
+        whose child hasn't run is returned itself (``is_trigger``).
 
         ``log_tail_lines`` for failing jobs:
 

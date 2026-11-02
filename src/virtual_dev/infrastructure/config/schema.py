@@ -38,6 +38,8 @@ class RepositoryCfg(_StrictModel):
     tests_cmd: str | None = None
     lint_cmd: str | None = None
     ci_provider: str = "gitlab_ci"
+    # MM usernames the review pings tag instead of @channel. Empty → @channel.
+    reviewers: list[str] = Field(default_factory=list)
 
 
 class RepositoriesCfg(_StrictModel):
@@ -88,6 +90,11 @@ class ReviewPolicyCfg(_StrictModel):
     required_approvals: int = 1
     ping_reviewers_after_hours: int = 4
     escalate_after_hours: int = 24
+    # A reviewer whose MM custom status shows one of these emoji is away
+    # and isn't tagged: 🌴 vacation, 🤒 sick leave.
+    away_status_emojis: list[str] = Field(
+        default_factory=lambda: ["palm_tree", "face_with_thermometer"],
+    )
 
 
 class PipelinePolicyCfg(_StrictModel):

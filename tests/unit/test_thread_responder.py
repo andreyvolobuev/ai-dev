@@ -211,6 +211,41 @@ async def test_prompt_carries_real_branches_as_verified_facts() -> None:
     assert "master" in facts
 
 
+@pytest.mark.asyncio
+async def test_prompt_carries_ci_state_and_failed_logs() -> None:
+    """Asked «CI упал, глянь», the bot replied «скинь ссылку на красную
+    джобу» — it had no CI in its prompt. Red jobs and their log tails
+    are facts now."""
+    from virtual_dev.application.services.ci_state import CiReading
+    from virtual_dev.domain.models.merge_request import PipelineJob
+
+    fake = _FakeCodeAgent()
+    responder = ThreadResponderAgent(
+        code_agent=fake, config=_cfg(),
+        prompts_loader=PromptsLoader("/no-prompts-dir"),
+        injection_filter=InjectionFilter(),
+    )
+    mypy = PipelineJob(
+        id=1, name="01:rapid/mypy", stage="check", status="failed",
+        web_url="https://gitlab/x/-/jobs/1",
+        log_excerpt="api.py:12: error: Incompatible return value type",
+    )
+
+    await responder.decide(
+        mr_title="t", mr_description="", mr_web_url="u",
+        plan=None, thread=[],
+        latest_reply=_msg(id="p", author="a", text="там CI упал"),
+        ci=CiReading(state="failed", jobs=[mypy]),
+    )
+
+    assert fake.last_request is not None
+    prompt = fake.last_request.user_prompt
+    facts = prompt.split("## MR description", 1)[0]
+    assert "красный" in facts
+    assert "01:rapid/mypy" in facts
+    assert "Incompatible return value type" in prompt
+
+
 def test_responder_prompt_ranks_gitlab_facts_above_prose() -> None:
     prompt = (
         Path(__file__).parents[2] / "config" / "prompts" / "thread_responder.md"

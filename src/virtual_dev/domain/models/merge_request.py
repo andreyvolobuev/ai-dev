@@ -74,6 +74,10 @@ class PipelineJob:
     web_url: str
     log_excerpt: str = ""     # trailing N lines of the job log, populated on demand
     allow_failure: bool = False   # GitLab tolerates this job failing (pipeline stays green)
+    # A trigger job (GitLab bridge) that starts a child pipeline. Listed
+    # only while its child hasn't run; once it has, the child's jobs
+    # stand in for it.
+    is_trigger: bool = False
 
 
 @dataclass

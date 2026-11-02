@@ -256,6 +256,12 @@ class CommunicatorService:
                 return user.id
         return None
 
+    async def find_user(self, username: str) -> ChatUser | None:
+        """The MM user behind a username, ``None`` if unknown or no chat."""
+        if self._chat is None:
+            return None
+        return await self._chat.find_user_by_username(username)
+
     async def search_users_by_name(
         self, query: str, *, limit: int = 25,
     ) -> list[ChatUser]:

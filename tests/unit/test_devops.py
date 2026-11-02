@@ -203,6 +203,10 @@ def test_collapse_status() -> None:
     assert _collapse_status([_job("a", "success")]) == "success"
     assert _collapse_status([_job("a", "success"), _job("b", "failed")]) == "failed"
     assert _collapse_status([_job("a", "running"), _job("b", "pending")]) == "running"
+    # Nothing ran: every job waits for a click — not green.
+    assert _collapse_status([_job("a", "manual"), _job("b", "created")]) == "manual"
+    # Idle deploy gates next to jobs that ran don't block green.
+    assert _collapse_status([_job("a", "success"), _job("deploy", "manual")]) == "success"
 
 
 def test_collapse_status_ignores_failed_allow_failure_jobs() -> None:

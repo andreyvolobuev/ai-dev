@@ -36,7 +36,6 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from virtual_dev.application.agents.devops import _collapse_status
 from virtual_dev.application.agents.orchestrator import (
     TOPIC_MR_APPROVED,
     TOPIC_MR_COMMENT,
@@ -48,6 +47,7 @@ from virtual_dev.application.services.agent_trace import (
     emit_if,
 )
 from virtual_dev.application.services.analyst_session_repo import AnalystSessionRepository
+from virtual_dev.application.services.ci_state import read_ci
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.domain.models.merge_request import MRStatus, ReviewComment
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
@@ -814,6 +814,7 @@ class ReviewerAgent:
             repo_key=row.repo_key, iid=row.iid,
             title=title, web_url=row.web_url, summary=summary,
             key=row.task_external_id or row.repo_key,
+            mentions=await self._reviewer_mentions(row.repo_key),
         )
         outcome = await self._communicator.send_channel(
             channel_id, body, thread_root_id=thread["root_id"] if thread else None,
@@ -921,6 +922,7 @@ class ReviewerAgent:
                     repo_key=row.repo_key, iid=row.iid,
                     title=row.title, web_url=row.web_url,
                     idle_hours=int(idle.total_seconds() / 3600),
+                    mentions=await self._reviewer_mentions(row.repo_key),
                 )
                 outcome = await self._communicator.send_channel(
                     channel_id, text, thread_root_id=row.review_thread_root_id,
@@ -934,6 +936,32 @@ class ReviewerAgent:
                 return "ping"
 
         return None
+
+    async def _reviewer_mentions(self, repo_key: str) -> str:
+        """``@a @b`` for the repo's reviewers who aren't away; ``@channel``
+        when the repo names none or all of them are away.
+
+        A bare «Ребята, …» in a thread got no reaction for a day (!1031)
+        until a human tagged the five Rainbow reviewers by hand. Someone on
+        vacation or sick leave is skipped — tagging them is noise. A
+        reviewer whose status can't be read is tagged: a missed review
+        costs more than one extra mention.
+        """
+        repo = next((r for r in self._config.repositories if r.key == repo_key), None)
+        if repo is None or not repo.reviewers:
+            return "@channel"
+        away = set(self._config.agents.review_policy.away_status_emojis)
+        present: list[str] = []
+        for username in repo.reviewers:
+            try:
+                user = await self._communicator.find_user(username)
+            except Exception:
+                logger.warning("Reviewer: status lookup failed for @{}", username)
+                user = None
+            if user is not None and user.status_emoji in away:
+                continue
+            present.append(f"@{username}")
+        return " ".join(present) or "@channel"
 
     def _render_template(self, template: str, **kwargs: object) -> str:
         """Format a notifications template, swallowing missing keys.
@@ -1070,21 +1098,11 @@ class ReviewerAgent:
         Pulls the actual job list from the latest pipeline and collapses
         their statuses (same logic DevOps uses), so the result reflects
         ground truth instead of the brief desync window in mr.pipeline
-        right after a push.
+        right after a push. A pipeline whose checks all wait behind manual
+        triggers gets them started here and reads as ``running``.
         """
         assert self._vcs is not None
-        try:
-            jobs = list(
-                await self._vcs.get_latest_pipeline_jobs(repo_key, iid, log_tail_lines=0)
-            )
-        except Exception:
-            logger.exception(
-                "Reviewer: get_latest_pipeline_jobs failed for {}!{}", repo_key, iid,
-            )
-            return "unknown"
-        if not jobs:
-            return "no-ci"
-        return _collapse_status(jobs)
+        return (await read_ci(self._vcs, repo_key, iid)).state
 
     def _team_channel_for(self, repo_key: str) -> str | None:
         mapping = self._config.mappings.team_channels or {}

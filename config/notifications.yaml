@@ -17,9 +17,11 @@ mattermost:
   # {summary} is a 1-2 sentence first-person feminine fragment from
   # the MrSummarizer ("добавила X, исправила Y"). Falls back to {title}
   # when no summarizer is wired. {key} — тикет (DM-1234).
-  # @channel обязателен: голое «Ребята, …» в треде никто не замечает.
+  # {mentions} обязателен: голое «Ребята, …» в треде никто не замечает.
+  # Это `@ник` ревьюеров репо (repositories.yaml → reviewers) без тех,
+  # кто в отпуске/на больничном, или `@channel`, если список пуст.
   review_ping: |
-    @channel Ребята, приглашаю на ревью [МР]({web_url}) по задаче {key}, в котором я {summary}
+    {mentions} Ребята, приглашаю на ревью [МР]({web_url}) по задаче {key}, в котором я {summary}
 
   # В тред обсуждения тикета, когда бот берётся за работу. Обычно аналитик
   # пишет свою фразу (thread_note в submit_plan) — это запасной текст.
@@ -30,8 +32,9 @@ mattermost:
   merge_ping: |
     Мой реквестик [{iid}]({web_url}) собрал апрувы. Смержите, пожалуйста 😊
 
+  # {mentions} — как в review_ping.
   stale_ping: |
-    Ребят, мой [реквестик]({web_url}) ждёт ревью уже {idle_hours}ч 😔 Гляньте, пожалуйста 🙏
+    {mentions} Ребят, мой [реквестик]({web_url}) ждёт ревью уже {idle_hours}ч 😔 Гляньте, пожалуйста 🙏
 
   escalation_dm: |
     Мой [МР]({web_url}) без активности уже {idle_hours}ч — напомни кому-нибудь или переназначь.

@@ -40,6 +40,7 @@ from virtual_dev.application.services.agent_trace import (
     AgentTraceEvent,
     emit_if,
 )
+from virtual_dev.application.services.ci_state import CiReading
 from virtual_dev.application.services.injection_filter import (
     SYSTEM_PROMPT_ABOUT_UNTRUSTED,
     InjectionFilter,
@@ -116,6 +117,7 @@ class ThreadResponderAgent:
         mr_diff: str = "",
         mr_source_branch: str = "",
         mr_target_branch: str = "",
+        ci: CiReading | None = None,
     ) -> ResponderDecision:
         prompt = self._render_prompt(
             mr_title=mr_title, mr_description=mr_description,
@@ -124,6 +126,7 @@ class ThreadResponderAgent:
             mr_diff=mr_diff,
             mr_source_branch=mr_source_branch,
             mr_target_branch=mr_target_branch,
+            ci=ci,
         )
         captured, result = await self._call_model(prompt, repo_workspace)
 
@@ -230,6 +233,7 @@ class ThreadResponderAgent:
         mr_diff: str = "",
         mr_source_branch: str = "",
         mr_target_branch: str = "",
+        ci: CiReading | None = None,
     ) -> str:
         parts: list[str] = []
         parts.append("# Review thread context")
@@ -242,12 +246,23 @@ class ThreadResponderAgent:
         # that has already, once, claimed a target branch the MR never
         # had, and the responder then defended that claim against
         # humans reading the real MR. Facts first, untrusted text after.
-        if mr_source_branch or mr_target_branch:
+        if mr_source_branch or mr_target_branch or ci is not None:
             parts.append("## Факты о MR (из GitLab — ground truth)")
-            parts.append(
-                f"**Ветки:** `{mr_source_branch or '?'}` → "
-                f"`{mr_target_branch or '?'}`"
-            )
+            if mr_source_branch or mr_target_branch:
+                parts.append(
+                    f"**Ветки:** `{mr_source_branch or '?'}` → "
+                    f"`{mr_target_branch or '?'}`"
+                )
+            if ci is not None:
+                parts.append(f"**CI на последнем коммите:** {_render_ci_fact(ci)}")
+            parts.append("")
+        if ci is not None and ci.failed_jobs:
+            # Job logs echo code, test names and commit text anyone with
+            # push access shapes — untrusted, same as the diff.
+            parts.append("## Логи упавших CI-джобов (хвосты)")
+            parts.append(self._filter.wrap(
+                _render_failed_logs(ci), source="gitlab:ci:logs",
+            ).wrapped_text)
             parts.append("")
         parts.append("## MR description (untrusted — bot-written but quoting humans)")
         wrapped_desc = self._filter.wrap(
@@ -295,6 +310,28 @@ class ThreadResponderAgent:
             "deciding. When ready, call `submit_response` exactly once."
         )
         return "\n".join(parts)
+
+
+def _render_ci_fact(ci: CiReading) -> str:
+    if ci.state == "failed":
+        names = ", ".join(f"[{j.name}]({j.web_url})" for j in ci.failed_jobs)
+        return f"красный, упали: {names}"
+    if ci.started:
+        return (
+            "проверки на нём ещё не запускались; ты только что сама "
+            f"запустила {', '.join(ci.started)} — идут"
+        )
+    return {
+        "success": "зелёный",
+        "running": "идёт",
+        "no-ci": "проверок нет",
+    }.get(ci.state, "неизвестно (GitLab не ответил)")
+
+
+def _render_failed_logs(ci: CiReading) -> str:
+    return "\n\n".join(
+        f"### {j.name}\n{j.log_excerpt or '(лога нет)'}" for j in ci.failed_jobs
+    )
 
 
 def _render_thread(thread: Sequence[ChatMessage]) -> str:

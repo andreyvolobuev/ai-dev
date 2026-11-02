@@ -43,6 +43,11 @@ from virtual_dev.application.agents import (
 from virtual_dev.application.agents.thread_responder import resolve_mr_branches
 from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
 from virtual_dev.runtime.workers.intake_inbox import TaskIntakeInbox
+from virtual_dev.application.services.ci_state import (
+    CiReading,
+    read_ci,
+    render_failed_jobs,
+)
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.application.services.ticket_reset import reset_ticket_state
 from virtual_dev.domain.models.chat import ChatMessage
@@ -63,6 +68,8 @@ from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
 
 _PROCESSED_REACTION = "white_check_mark"
+# Enough of a failed job's log for the responder to name the error.
+_CI_LOG_TAIL_LINES = 40
 
 # A ticket key the way a human actually sends it. Typing "DM-3548" in
 # Mattermost yields "[DM-3548](https://jira.../browse/DM-3548)" once the Jira
@@ -623,6 +630,15 @@ class MmThreadListener:
             self._vcs, repo_key=row.repo_key, iid=row.iid,
             fallback_source=row.source_branch, fallback_target=row.target_branch,
         )
+        # CI state goes in as a fact: asked «CI упал, глянь», the bot once
+        # answered «скинь ссылку на красную джобу» because it couldn't see
+        # child pipelines. It reads them itself now and starts manual
+        # checks nobody ran.
+        ci: CiReading | None = None
+        if self._vcs is not None:
+            ci = await read_ci(
+                self._vcs, row.repo_key, row.iid, log_tail_lines=_CI_LOG_TAIL_LINES,
+            )
 
         decision = await self._responder.decide(
             mr_title=row.title,
@@ -635,6 +651,7 @@ class MmThreadListener:
             mr_diff=mr_diff,
             mr_source_branch=source_branch,
             mr_target_branch=target_branch,
+            ci=ci,
         )
         logger.info(
             "MmThreadListener: decision={} reasoning={!r}",
@@ -711,8 +728,15 @@ class MmThreadListener:
             # itself). The responder splits "history" vs "latest" because
             # it's deciding whether to act on the latest message; the dev
             # just needs the conversation as the humans wrote it.
+            feedback = decision.iteration_feedback
+            if ci is not None and ci.failed_jobs:
+                # The responder sees log tails; the fix needs whole logs.
+                full = await read_ci(
+                    self._vcs, row.repo_key, row.iid, log_tail_lines=-1,
+                ) if self._vcs is not None else ci
+                feedback = f"{feedback}\n\n{render_failed_jobs(row, full.jobs)}"
             await self._run_iteration(
-                row, decision.iteration_feedback, channel_id, root_id,
+                row, feedback, channel_id, root_id,
                 thread=[*transcript, event],
             )
             self.stats.iterations_dispatched += 1

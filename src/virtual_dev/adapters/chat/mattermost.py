@@ -727,4 +727,34 @@ class MattermostChat(ChatPort):
             last_name=str(raw.get("last_name") or "") or None,
             position=str(raw.get("position") or "") or None,
             is_bot=bool(raw.get("is_bot")),
+            status_emoji=_active_status_emoji(raw.get("props")),
         )
+
+
+def _active_status_emoji(props: Any) -> str | None:
+    """Emoji of a user's custom status, unless it has expired.
+
+    Mattermost keeps ``props.customStatus`` as a JSON string, and leaves
+    an expired status in place until the user's client clears it — so
+    ``expires_at`` must be checked here. «Don't clear» statuses carry a
+    zero date (year 1).
+    """
+    if not isinstance(props, dict):
+        return None
+    try:
+        status = json.loads(props.get("customStatus") or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(status, dict):
+        return None
+    emoji = str(status.get("emoji") or "").strip()
+    if not emoji:
+        return None
+    expires = str(status.get("expires_at") or "")
+    try:
+        expires_at = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+    except ValueError:
+        return emoji
+    if expires_at.year > 1 and expires_at <= datetime.now(timezone.utc):
+        return None
+    return emoji

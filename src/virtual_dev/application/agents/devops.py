@@ -36,6 +36,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents.dev import DevAgent
+from virtual_dev.application.services.ci_state import (
+    _collapse_status,
+    render_failed_jobs,
+)
 from virtual_dev.application.services.communicator import CommunicatorService
 from virtual_dev.domain.models.merge_request import PipelineJob
 from virtual_dev.domain.ports.message_bus import MessageBusPort
@@ -127,7 +131,9 @@ class DevOpsAgent:
             return
 
         if pipeline_status != "failed":
-            # pending / running / unknown — just remember the status, don't act.
+            # pending / running / manual / unknown — just remember the
+            # status, don't act. Manual triggers are started by the
+            # Reviewer, which owns the "is it green yet" question.
             await self._persist_pipeline_status(row.id, pipeline_status)
             return
 
@@ -460,42 +466,6 @@ class DevOpsAgent:
                 row.iteration_pending_ci_sha = commit_sha
 
 
-_PASSING_JOB_STATUSES = frozenset({
-    # Job ran and produced its expected outcome.
-    "success", "skipped",
-    # `manual` and `created` are not "running" — they're idle, waiting for
-    # someone to click (typical for deploy / approval gates, downstream of
-    # merge). For the "ready for review" gate they don't block: review is
-    # about code quality, not about whether a deploy gate has been
-    # triggered. DevOps treats them as green.
-    "manual", "created",
-})
-
-_RUNNING_JOB_STATUSES = frozenset({"running", "pending", "preparing", "scheduled"})
-
-
-def _collapse_status(jobs: list[PipelineJob]) -> str:
-    """Derive a single pipeline state from job statuses.
-
-    Failed ``allow_failure`` jobs (cleanup / destroy-env gates) don't make
-    GitLab mark the pipeline red, so they must not make DevOps see red
-    either — there is nothing in the code for an auto-fix to fix.
-    """
-    if not jobs:
-        return "unknown"
-    statuses = {
-        "success" if j.status == "failed" and j.allow_failure else j.status
-        for j in jobs
-    }
-    if "failed" in statuses:
-        return "failed"
-    if statuses <= _PASSING_JOB_STATUSES:
-        return "success"
-    if statuses & _RUNNING_JOB_STATUSES:
-        return "running"
-    return "unknown"
-
-
 # Substrings (lowercase) that mark a job log as "CI infrastructure died",
 # not "the code under test is broken". Sourced from real incidents:
 # docker-registry S3 backend answering 5xx/NoSuchKey on layer push,
@@ -556,34 +526,7 @@ def _looks_like_infra_failure(jobs: list[PipelineJob]) -> bool:
 def _render_autofix_feedback(
     row: MergeRequestRow, jobs: list[PipelineJob],
 ) -> str:
-    """Build the feedback string Dev sees in iteration mode.
-
-    Includes every failing job's name, stage, URL and FULL log (Dev needs
-    the start of the log to find import errors / syntax problems, not
-    just the trailing AssertionError).
-    """
-    lines: list[str] = []
-    lines.append(
-        f"The CI pipeline on MR {row.repo_key}!{row.iid} (branch "
-        f"`{row.source_branch}`) is FAILING. Read the failing jobs' logs "
-        "below, find the root cause, fix it in the code, and call "
-        "`submit_mr` so the runtime pushes a new commit.",
-    )
-    lines.append("")
-    failing = [j for j in jobs if j.status == "failed"]
-    if not failing:
-        lines.append("(No failing jobs in the latest pipeline payload — "
-                     "this should not happen; investigate manually.)")
-        return "\n".join(lines)
-    for job in failing:
-        lines.append(f"## Job `{job.name}` (stage `{job.stage}`)")
-        lines.append(f"URL: {job.web_url}")
-        lines.append("")
-        lines.append("```")
-        lines.append(job.log_excerpt or "(no log available)")
-        lines.append("```")
-        lines.append("")
-    return "\n".join(lines)
+    return render_failed_jobs(row, jobs)
 
 
 __all__ = ["DevOpsAgent", "DevOpsTickStats"]

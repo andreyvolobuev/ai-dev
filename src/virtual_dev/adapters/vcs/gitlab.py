@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -901,38 +902,125 @@ class GitLabVcs(VcsPort):
                 return []
             if not pipelines:
                 return []
-            pipeline_raw = pipelines[0]
             try:
-                pipeline = project.pipelines.get(pipeline_raw.id)
-                raw_jobs = pipeline.jobs.list(all=True)
+                return self._pipeline_jobs(
+                    project, int(pipelines[0].id), log_tail_lines=log_tail_lines,
+                )
             except Exception:
                 logger.exception(
                     "get_latest_pipeline_jobs: fetch jobs failed {}!{}", repo_key, iid,
                 )
                 return []
-            out: list[PipelineJob] = []
-            for job in raw_jobs:
-                attrs = getattr(job, "attributes", None) or {}
-                job_id = int(attrs.get("id") or getattr(job, "id", 0))
-                name = str(attrs.get("name") or "")
-                stage = str(attrs.get("stage") or "")
-                status = str(attrs.get("status") or "")
-                web_url = str(attrs.get("web_url") or "")
-                tail = ""
-                # log_tail_lines semantics:
-                #   > 0  — fetch + keep last N lines
-                #   < 0  — fetch full log (no truncation; DevOps auto-fix path)
-                #   == 0 — skip log fetch entirely (Reviewer's status probe)
-                if log_tail_lines != 0 and status == "failed":
-                    tail = _fetch_job_log_tail(project, job_id, log_tail_lines)
-                out.append(PipelineJob(
-                    id=job_id, name=name, stage=stage, status=status,
-                    web_url=web_url, log_excerpt=tail,
-                    allow_failure=bool(attrs.get("allow_failure", False)),
-                ))
-            return out
 
         return await asyncio.to_thread(_run)
+
+    def _pipeline_jobs(
+        self, project: Any, pipeline_id: int, *,
+        log_tail_lines: int, prefix: str = "", depth: int = 0,
+    ) -> list[PipelineJob]:
+        """Jobs of one pipeline plus, recursively, of its child pipelines.
+
+        The jobs endpoint leaves out trigger jobs (bridges). In repos like
+        rainbow every check lives in a child pipeline, so without the
+        bridges the MR pipeline looked empty — read as «no CI» and
+        announced as green — and a red mypy in a child stayed invisible.
+        """
+        pipeline = project.pipelines.get(pipeline_id, lazy=True)
+        out: list[PipelineJob] = []
+        for job in pipeline.jobs.list(all=True):
+            attrs = getattr(job, "attributes", None) or {}
+            job_id = int(attrs.get("id") or getattr(job, "id", 0))
+            status = str(attrs.get("status") or "")
+            tail = ""
+            # log_tail_lines semantics:
+            #   > 0  — fetch + keep last N lines
+            #   < 0  — fetch full log (no truncation; DevOps auto-fix path)
+            #   == 0 — skip log fetch entirely (Reviewer's status probe)
+            if log_tail_lines != 0 and status == "failed":
+                tail = _fetch_job_log_tail(project, job_id, log_tail_lines)
+            out.append(PipelineJob(
+                id=job_id, name=prefix + str(attrs.get("name") or ""),
+                stage=str(attrs.get("stage") or ""), status=status,
+                web_url=str(attrs.get("web_url") or ""), log_excerpt=tail,
+                allow_failure=bool(attrs.get("allow_failure", False)),
+            ))
+        for bridge in pipeline.bridges.list(all=True):
+            attrs = getattr(bridge, "attributes", None) or {}
+            name = prefix + str(attrs.get("name") or "")
+            downstream = attrs.get("downstream_pipeline") or {}
+            child: list[PipelineJob] = []
+            if downstream.get("id") and depth < _MAX_CHILD_PIPELINE_DEPTH:
+                child_project = project
+                child_project_id = downstream.get("project_id")
+                if child_project_id and int(child_project_id) != int(project.id):
+                    child_project = self._client.projects.get(int(child_project_id), lazy=True)
+                child = self._pipeline_jobs(
+                    child_project, int(downstream["id"]),
+                    log_tail_lines=log_tail_lines, prefix=f"{name}/", depth=depth + 1,
+                )
+            if child:
+                out.extend(child)
+                continue
+            out.append(PipelineJob(
+                id=int(attrs.get("id") or 0), name=name,
+                stage=str(attrs.get("stage") or ""),
+                status=str(attrs.get("status") or ""),
+                web_url=str(attrs.get("web_url") or ""),
+                allow_failure=bool(attrs.get("allow_failure", False)),
+                is_trigger=True,
+            ))
+        return out
+
+    async def play_manual_triggers(self, repo_key: str, iid: int) -> list[str]:
+        def _run() -> list[str]:
+            project = self._client.projects.get(self._project_path(repo_key))
+            mr = project.mergerequests.get(iid)
+            pipelines = mr.pipelines.list(per_page=1, get_all=False)
+            if not pipelines:
+                return []
+            bridges = {
+                str(b.attributes.get("name") or ""): int(b.attributes.get("id") or 0)
+                for b in project.pipelines.get(int(pipelines[0].id), lazy=True)
+                .bridges.list(all=True)
+                if b.attributes.get("status") == "manual"
+            }
+            changed = [
+                str(c.get("new_path") or "")
+                for c in (mr.changes().get("changes") or [])
+            ]
+            names = select_triggers(list(bridges), changed)
+            for name in names:
+                # REST /jobs/:id/play doesn't take bridges; GraphQL does.
+                self._graphql(
+                    "mutation($id: CiProcessableID!) "
+                    "{ jobPlay(input: {id: $id}) { errors } }",
+                    {"id": f"gid://gitlab/Ci::Bridge/{bridges[name]}"},
+                    errors_at="jobPlay",
+                )
+            return names
+
+        names = await asyncio.to_thread(_run)
+        if names:
+            logger.info(
+                "Started manual triggers on {}!{}: {}", repo_key, iid, ", ".join(names),
+            )
+        return names
+
+    def _graphql(
+        self, query: str, variables: dict[str, Any], *, errors_at: str,
+    ) -> dict[str, Any]:
+        # A full URL bypasses the /api/v4 prefix but keeps the client's
+        # auth and TLS settings.
+        body = cast(dict[str, Any], self._client.http_post(
+            f"{self._client.url}/api/graphql",
+            post_data={"query": query, "variables": variables},
+        ))
+        errors = body.get("errors") or (
+            (body.get("data") or {}).get(errors_at) or {}
+        ).get("errors")
+        if errors:
+            raise VcsError(f"GitLab GraphQL {errors_at} failed: {errors}")
+        return body.get("data") or {}
 
     async def retry_latest_pipeline(self, repo_key: str, iid: int) -> None:
         def _run() -> int:
@@ -1173,6 +1261,35 @@ def _comment_from_gitlab_dict(
     base = _comment_from_gitlab(note, iid)
     base.discussion_id = discussion_id or None
     return base
+
+
+# Trigger → child → grandchild is as deep as real repos go; the cap only
+# guards against a misconfigured trigger loop.
+_MAX_CHILD_PIPELINE_DEPTH = 3
+
+
+def select_triggers(triggers: list[str], changed_paths: list[str]) -> list[str]:
+    """Which manual child-pipeline triggers an MR's checks need.
+
+    A trigger is named after the service it builds (``03:rainbow-job-
+    schedule-manager`` → ``rainbow-job-schedule-manager/``), so the ones
+    whose name is a directory of a changed file are picked. When the MR
+    touches a subdirectory no trigger is named after (shared code like
+    ``rainbow-common/``), every trigger is picked: any service may be
+    broken by it. Root-level files alone (docs) need no checks.
+    """
+    def _service(trigger: str) -> str:
+        return re.sub(r"^\d+:", "", trigger).strip()
+
+    dirs = {
+        part for path in changed_paths for part in path.split("/")[:-1] if part
+    }
+    picked = [t for t in triggers if _service(t) in dirs]
+    if picked:
+        return picked
+    if dirs:
+        return list(triggers)
+    return []
 
 
 def _fetch_job_log_tail(project: Any, job_id: int, tail_lines: int) -> str:

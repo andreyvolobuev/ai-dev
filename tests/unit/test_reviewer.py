@@ -66,6 +66,12 @@ class _StubVcs(VcsPort):
                 web_url="https://gitlab/x/jobs/1",
             )]
         self._ci_jobs = ci_jobs
+        self.manual_triggers: list[str] = []
+        self.started_triggers: list[str] = []
+
+    async def play_manual_triggers(self, repo_key: str, iid: int) -> list[str]:
+        self.started_triggers.extend(self.manual_triggers)
+        return list(self.manual_triggers)
 
     async def get_latest_pipeline_jobs(
         self, repo_key: str, iid: int, *, log_tail_lines: int = 80,
@@ -152,6 +158,8 @@ class _RecordingChat(ChatPort):
         self.sent_dms: list[tuple[str, str]] = []
         # Parallel to sent_channels: thread_root_id of each channel post.
         self.sent_thread_roots: list[str | None] = []
+        # username → custom status emoji (🌴 palm_tree, 🤒 face_with_thermometer).
+        self.statuses: dict[str, str] = {}
 
     async def read_thread(self, thread_root_id: str) -> Sequence[ChatMessage]:
         return []
@@ -171,7 +179,10 @@ class _RecordingChat(ChatPort):
         return None
 
     async def find_user_by_username(self, username: str) -> ChatUser | None:
-        return ChatUser(id=f"uid-{username}", username=username)
+        return ChatUser(
+            id=f"uid-{username}", username=username,
+            status_emoji=self.statuses.get(username),
+        )
 
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:  # pragma: no cover
         return None
@@ -437,6 +448,56 @@ async def test_review_ping_fires_once_on_first_observation(
 
 
 @pytest.mark.asyncio
+async def test_review_ping_tags_repo_reviewers_except_those_away(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """!1031: «Ребята, …» sat unnoticed for a day until a human tagged the
+    Rainbow reviewers by hand. The ping tags them itself — minus whoever's
+    MM status says vacation (🌴) or sick leave (🤒)."""
+    await _insert_mr(session_factory, review_ping_sent=False)
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    chat = _RecordingChat()
+    chat.statuses = {"g.golovin": "palm_tree", "d.boyarshin": "face_with_thermometer"}
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    cfg = _cfg()
+    cfg.repositories[0].reviewers = ["e.yakovlev", "g.golovin", "a.gulvanyuk", "d.boyarshin"]
+    cfg.notifications.mattermost.review_ping = "{mentions} Ребята, приглашаю на {web_url}"
+    agent = _agent(vcs, communicator, session_factory, cfg)
+
+    await agent.tick()
+
+    [(_, body)] = chat.sent_channels
+    assert body.startswith("@e.yakovlev @a.gulvanyuk Ребята")
+    assert "g.golovin" not in body and "d.boyarshin" not in body
+
+
+@pytest.mark.asyncio
+async def test_review_ping_falls_back_to_channel_when_everyone_is_away(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _insert_mr(session_factory, review_ping_sent=False)
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    chat = _RecordingChat()
+    chat.statuses = {"g.golovin": "palm_tree"}
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    cfg = _cfg()
+    cfg.repositories[0].reviewers = ["g.golovin"]
+    cfg.notifications.mattermost.review_ping = "{mentions} Ребята, приглашаю на {web_url}"
+    agent = _agent(vcs, communicator, session_factory, cfg)
+
+    await agent.tick()
+
+    [(_, body)] = chat.sent_channels
+    assert body.startswith("@channel Ребята")
+
+
+@pytest.mark.asyncio
 async def test_review_ping_goes_to_the_tickets_team_thread(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -525,6 +586,33 @@ async def test_review_ping_held_while_pipeline_running(
 
     stats = await agent.tick()
     assert stats.review_pings_sent == 0
+
+
+@pytest.mark.asyncio
+async def test_pipeline_waiting_on_manual_triggers_is_not_green(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """rainbow!1031: every check sits behind manual child-pipeline
+    triggers. Nothing ran, yet the bot called it «CI зелёный» three times.
+    It must start the triggers itself and hold the ping meanwhile."""
+    await _insert_mr(session_factory, review_ping_sent=False)
+    trigger = PipelineJob(
+        id=7, name="01:rapid", stage="build", status="manual",
+        web_url="https://gitlab/x/jobs/7", is_trigger=True,
+    )
+    vcs = _StubVcs(
+        comments={("bellingshausen", 42): []},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+        ci_jobs=[trigger],
+    )
+    vcs.manual_triggers = ["01:rapid"]
+    chat = _RecordingChat()
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+    agent = _agent(vcs, communicator, session_factory, _cfg())
+
+    stats = await agent.tick()
+    assert stats.review_pings_sent == 0
+    assert vcs.started_triggers == ["01:rapid"]
 
 
 @pytest.mark.asyncio
