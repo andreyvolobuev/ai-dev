@@ -371,6 +371,10 @@ def build_container(config_dir: Path | str = "config") -> Container:
         injection_filter=injection_filter,
         prompts_loader=prompts_loader,
         trace=trace,
+        chat=chat,
+        task_tracker=task_tracker,
+        researcher=researcher,
+        settings=settings,
     )
     task_intake_inbox: TaskIntakeInbox | None = None
     if chat is not None:

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
 from loguru import logger
 from sqlalchemy import delete, select, update
@@ -56,6 +57,10 @@ _WARNING_TEMPLATES: dict[str, str] = {
 # подмена шаблоном: длинная простыня ломает голос бота (1-3 фразы) и
 # превращает бота в рупор для инъекции.
 _MAX_BUSY_REPLY_CHARS = 300
+# A claim with no issue key this old belongs to a process that died
+# mid-create (pod restart): a live create takes seconds. Past this it no
+# longer blocks a redelivery — otherwise the ask is swallowed for good.
+_ABANDONED_CLAIM_AFTER = timedelta(minutes=10)
 
 
 @dataclass
@@ -141,25 +146,27 @@ class TaskIntakeInbox:
         if claim_id is None:
             return IntakeOutcome(action="skipped", reason="duplicate_post")
 
-        requester = await self._chat.get_user_by_id(event.author_id)
-        customer = _requester_label(requester, event.author_id)
-        # Unassigned by default: only an explicitly named person is set.
-        assignee, warnings = await self._resolve_assignee(hint=decision.assignee_hint)
-
         cfg = self._config.agents.task_intake
         summary = _with_summary_prefix(decision.summary, cfg.summary_prefix)
-        spec = NewTaskSpec(
-            project=cfg.project,
-            issue_type=cfg.issue_type,
-            summary=summary,
-            description=_compose_description(decision.description, permalink=permalink),
-            labels=list(cfg.labels),
-            assignee=assignee,
-            components=list(cfg.components),
-            sprint_name=cfg.sprint_name or None,
-            customer=customer,
-        )
+        # Everything after the claim is guarded: a crash that skips
+        # _release leaves the post claimed with no ticket, and every
+        # redelivery then reads as a duplicate — ✅, no ticket, no reply.
         try:
+            requester = await self._chat.get_user_by_id(event.author_id)
+            customer = _requester_label(requester, event.author_id)
+            # Unassigned by default: only an explicitly named person is set.
+            assignee, warnings = await self._resolve_assignee(hint=decision.assignee_hint)
+            spec = NewTaskSpec(
+                project=cfg.project,
+                issue_type=cfg.issue_type,
+                summary=summary,
+                description=_compose_description(decision.description, permalink=permalink),
+                labels=list(cfg.labels),
+                assignee=assignee,
+                components=list(cfg.components),
+                sprint_name=cfg.sprint_name or None,
+                customer=customer,
+            )
             created = await self._tracker.create_task(spec)
         except Exception as exc:
             logger.exception("TaskIntake: create_task failed for post {}", event.id)
@@ -453,6 +460,7 @@ class TaskIntakeInbox:
         re-evaluates update/busy against the ticket the first delivery
         already created.
         """
+        await self._drop_abandoned_claim(source_post_id)
         async with self._session_factory() as session:
             stmt = (
                 select(IntakeRequestRow.id)
@@ -460,6 +468,23 @@ class TaskIntakeInbox:
                 .limit(1)
             )
             return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+    async def _drop_abandoned_claim(self, source_post_id: str) -> None:
+        cutoff = datetime.now(UTC) - _ABANDONED_CLAIM_AFTER
+        async with self._session_factory() as session:
+            result = await session.execute(
+                delete(IntakeRequestRow).where(
+                    IntakeRequestRow.source_post_id == source_post_id,
+                    IntakeRequestRow.issue_key.is_(None),
+                    IntakeRequestRow.created_at < cutoff,
+                )
+            )
+            await session.commit()
+        if getattr(result, "rowcount", 0):
+            logger.warning(
+                "TaskIntake: dropped abandoned claim for post {} — retrying the ask",
+                source_post_id,
+            )
 
     async def _claim(self, event: ChatMessage, root_id: str) -> int | None:
         async with self._session_factory() as session:

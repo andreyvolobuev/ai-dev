@@ -27,7 +27,7 @@ import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -44,6 +44,12 @@ from virtual_dev.application.services.prompts import PromptsLoader
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.ports.code_agent import CodeAgentPort, CodeAgentRequest
 from virtual_dev.infrastructure.config import AppConfig
+
+if TYPE_CHECKING:
+    from virtual_dev.application.services.researcher import ResearcherToolkit
+    from virtual_dev.domain.ports.chat import ChatPort
+    from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
+    from virtual_dev.infrastructure.config import Settings
 
 
 class IntakeAction(StrEnum):
@@ -102,6 +108,17 @@ _DENIED_TOOLS: tuple[str, ...] = (
     "NotebookEdit",
     "Task",
 )
+# Read-only context tools from the shared group: a request often points at
+# another thread, ticket, MR or Confluence page, and the ticket is only as
+# good as what the model could read. Everything else in ``shared`` (repo
+# code, KB, MR history) stays denied — intake files tickets, it doesn't
+# research the codebase.
+_CONTEXT_TOOLS: frozenset[str] = frozenset({
+    "read_mattermost_thread",
+    "read_jira_ticket",
+    "read_merge_request",
+    "fetch_url",
+})
 _FALLBACK_PROMPT = (
     "You are the Task Intake agent. Decide between "
     "{create, update, busy} and call submit_task_intake exactly once.\n\n"
@@ -121,8 +138,12 @@ class TaskIntakeAgent:
         config: AppConfig,
         prompts_loader: PromptsLoader,
         injection_filter: InjectionFilter | None = None,
-        max_turns: int = 4,
+        max_turns: int = 10,
         trace: AgentTrace | None = None,
+        chat: ChatPort | None = None,
+        task_tracker: TaskTrackerPort | None = None,
+        researcher: ResearcherToolkit | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._code_agent = code_agent
         self._config = config
@@ -130,6 +151,10 @@ class TaskIntakeAgent:
         self._filter = injection_filter or InjectionFilter()
         self._max_turns = max_turns
         self._trace = trace
+        self._chat = chat
+        self._task_tracker = task_tracker
+        self._researcher = researcher
+        self._settings = settings
 
     async def decide(
         self,
@@ -204,8 +229,22 @@ class TaskIntakeAgent:
         # Regression pinned in tests/unit/test_task_intake_agent.py.
         captured: dict[str, Any] = {}
         run_state: dict[str, Any] = {"terminal": False}
-        ctx = ToolContext(submit_capture=captured, run_state=run_state)
-        mcp_servers, allowed, _ = build_tool_servers(ctx, only_groups={"intake"})
+        ctx = ToolContext(
+            chat=self._chat,
+            task_tracker=self._task_tracker,
+            researcher=self._researcher,
+            settings=self._settings,
+            submit_capture=captured,
+            run_state=run_state,
+        )
+        mcp_servers, all_names, _ = build_tool_servers(
+            ctx, only_groups={"intake", "shared"},
+        )
+        # Under bypassPermissions the allow-list doesn't hide a tool; only
+        # a deny rule does — so the shared tools intake must not use are
+        # denied by name.
+        allowed = [n for n in all_names if _is_intake_tool(n)]
+        denied_mcp = [n for n in all_names if not _is_intake_tool(n)]
         # No Read/Glob/Grep in the allow-list: intake has nowhere to go on
         # disk. The allow-list alone does not enforce that (see
         # ``_DENIED_TOOLS``), so the deny list below is the real boundary.
@@ -229,7 +268,7 @@ class TaskIntakeAgent:
             )
             request.extras["mcp_servers"] = mcp_servers
             request.extras["allowed_tool_names"] = allowed
-            request.extras["disallowed_tool_names"] = list(_DENIED_TOOLS)
+            request.extras["disallowed_tool_names"] = [*_DENIED_TOOLS, *denied_mcp]
             request.extras["submit_capture"] = captured
             result = await self._code_agent.run_task(request)
         return captured, result
@@ -284,6 +323,12 @@ class TaskIntakeAgent:
             "понял задачу без чтения треда."
         )
         return "\n".join(parts)
+
+
+def _is_intake_tool(full_name: str) -> bool:
+    """``mcp__<server>__<tool>`` -> may intake call it?"""
+    server, _, tool_name = full_name.removeprefix("mcp__").partition("__")
+    return server.endswith("intake") or tool_name in _CONTEXT_TOOLS
 
 
 def _render_thread(thread: Sequence[ChatMessage]) -> str:

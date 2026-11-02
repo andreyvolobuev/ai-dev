@@ -247,3 +247,23 @@ async def test_existing_ticket_fields_from_jira_are_wrapped() -> None:
     assert "<untrusted_content" in head
     assert 'source="jira:DM-4821"' in head
     assert "</untrusted_content" in tail
+
+
+async def test_intake_can_read_linked_threads_and_tickets_but_not_code() -> None:
+    """«Заведи тикет на баг из треда <ссылка>» — без чтения той ссылки
+    описание выходит пустым. Код и KB интейку по-прежнему не нужны."""
+    fake = _FakeCodeAgent()
+    agent = TaskIntakeAgent(
+        code_agent=fake,
+        config=_cfg(),
+        prompts_loader=PromptsLoader(Path("config") / "prompts"),
+        chat=object(),          # type: ignore[arg-type]
+        task_tracker=object(),  # type: ignore[arg-type]
+    )
+    await agent.decide(post=_post("@ai-dev заведи задачу"), thread=[])
+
+    assert fake.last_request is not None
+    allowed = fake.last_request.extras.get("allowed_tool_names") or []
+    tools = {name.rsplit("__", 1)[-1] for name in allowed}
+    assert {"read_mattermost_thread", "read_jira_ticket", "submit_task_intake"} <= tools
+    assert not tools & {"read_file", "search_code", "kb_search", "search_mr_history"}

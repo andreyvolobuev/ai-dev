@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -1021,3 +1021,74 @@ async def test_sprint_true_without_a_configured_queue_is_ignored(
 
     assert outcome.action == "failed"
     assert tracker.patches == []
+
+
+class _CrashingChat(_FakeChat):
+    async def get_user_by_id(self, user_id: str) -> ChatUser | None:
+        raise RuntimeError("MM login expired")
+
+
+async def test_crash_before_jira_reports_and_releases_the_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A leftover claim made every later delivery a silent «duplicate»:
+    ✅ on the post, no ticket, no word in the thread."""
+    chat = _CrashingChat()
+    tracker = _FakeTracker()
+    outcome = await _inbox(
+        agent=_FakeAgent([_create_decision()]), tracker=tracker, chat=chat,
+        session_factory=session_factory,
+    ).handle(_ask())
+
+    assert outcome.action == "failed"
+    assert outcome.reply_sent
+    assert "не вышло" in chat.sent[0][1]
+    assert tracker.specs == []
+    async with session_factory() as session:
+        rows = list((await session.execute(select(IntakeRequestRow))).scalars())
+    assert rows == []
+
+
+async def _seed_claim(
+    session_factory: async_sessionmaker[AsyncSession], *, age: timedelta,
+) -> None:
+    async with session_factory() as session:
+        session.add(IntakeRequestRow(
+            source_post_id="p-1", mm_root_id="p-1", mm_channel_id="chan-1",
+            requester_mm_user_id="u1", issue_key=None,
+            created_at=datetime.now(UTC) - age,
+        ))
+        await session.commit()
+
+
+async def test_abandoned_claim_does_not_swallow_the_ask(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The process holding the claim died mid-create (pod restart): no key
+    was ever stored. A redelivery long after must file the ticket."""
+    await _seed_claim(session_factory, age=timedelta(minutes=30))
+    chat = _FakeChat(users={"u1": _user()})
+    tracker = _FakeTracker()
+
+    outcome = await _inbox(
+        agent=_FakeAgent([_create_decision()]), tracker=tracker, chat=chat,
+        session_factory=session_factory,
+    ).handle(_ask())
+
+    assert outcome.action == "created"
+    assert len(tracker.specs) == 1
+
+
+async def test_claim_in_flight_still_blocks_a_duplicate(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_claim(session_factory, age=timedelta(seconds=30))
+    tracker = _FakeTracker()
+
+    outcome = await _inbox(
+        agent=_FakeAgent([_create_decision()]), tracker=tracker,
+        chat=_FakeChat(users={"u1": _user()}), session_factory=session_factory,
+    ).handle(_ask())
+
+    assert outcome.reason == "duplicate_post"
+    assert tracker.specs == []
