@@ -877,6 +877,46 @@ async def test_silence_on_team_proposal_is_consent(
 
 
 @pytest.mark.asyncio
+async def test_planning_deadline_never_fails_a_task_past_planning(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """DM-3784: the plan went in, the MR was open for two days, then a
+    deadline left over from planning fired — the task went failed and the
+    lead got a 45-step «застряла» DM. The deadline dies with the plan, and
+    even a stale one can't touch a task Dev / Reviewer own."""
+    await _seed_task_row(session_factory)
+    chat = _FakeChat(users={"lead": "uid-lead"})
+    plan_run = AnalystRunResult(
+        effects=[AnalystEffect(kind="plan_submitted", payload={
+            "summary": "ok", "status": "ready", "target_repo_key": "x",
+        })],
+        cost_usd=0.0, turns=1, stopped_reason="end_turn", plan=_ready_plan(),
+    )
+    inbox = _make_inbox(session_factory, chat, _ScriptedAnalyst([_team_ask(), plan_run]))
+    await inbox.handle(_msg())
+    async with session_scope(session_factory) as session:
+        from sqlalchemy import select
+
+        row = (await session.execute(select(TaskRow))).scalar_one()
+        row.analyst_deadline_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    await inbox.sweep_deadlines()   # silence = consent → plan submitted
+    assert (await _load_row(session_factory)).analyst_deadline_at is None
+
+    async with session_scope(session_factory) as session:
+        from sqlalchemy import select
+
+        row = (await session.execute(select(TaskRow))).scalar_one()
+        row.internal_status = TaskStatus.MR_OPEN.value
+        row.analyst_deadline_at = datetime.now(timezone.utc) - timedelta(days=2)
+    chat.sent_dms.clear()
+
+    await inbox.sweep_deadlines()
+
+    assert (await _load_row(session_factory)).internal_status == TaskStatus.MR_OPEN.value
+    assert chat.sent_dms == []
+
+
+@pytest.mark.asyncio
 async def test_overdue_dm_ask_pings_lead_and_keeps_listening(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

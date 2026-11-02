@@ -194,15 +194,20 @@ class AnalystSessionRepository:
     async def find_overdue(
         self, *, now: datetime,
     ) -> list[TaskRow]:
-        """Tasks whose ``analyst_deadline_at`` has passed and aren't
-        already terminal."""
+        """Tasks still being planned whose ``analyst_deadline_at`` has passed.
+
+        Only planning statuses: the deadline is the analyst's, and once the
+        plan is in the ticket belongs to Dev / Reviewer. The old blocklist
+        (``ready / failed / done``) let ``coding`` and ``mr_open`` through —
+        DM-3784 had its MR open for two days when a deadline left over from
+        planning fired, flipped it to failed and DM'd the lead a 45-step
+        «застряла» wall.
+        """
         async with self._session_factory() as session:
             rows = list((await session.execute(
                 select(TaskRow).where(
                     TaskRow.analyst_deadline_at.is_not(None),
-                    TaskRow.internal_status.notin_(
-                        ["ready", "failed", "done"],
-                    ),
+                    TaskRow.internal_status.in_(_PLANNING_STATUSES),
                 )
             )).scalars().all())
         out: list[TaskRow] = []
@@ -323,6 +328,14 @@ class AnalystSessionRepository:
             if row is None:
                 return
             row.last_analyst_started_at = None
+
+    async def clear_deadline(self, task_id: int) -> None:
+        async with session_scope(self._session_factory) as session:
+            row = (await session.execute(
+                select(TaskRow).where(TaskRow.id == task_id)
+            )).scalar_one_or_none()
+            if row is not None:
+                row.analyst_deadline_at = None
 
     async def update_links(
         self, task_id: int, links_json: list[dict[str, Any]],

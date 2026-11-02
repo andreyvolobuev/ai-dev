@@ -685,6 +685,8 @@ class AnalystInbox:
         await self._set_internal_status(task_row.id, TaskStatus.READY)
         await self._sessions.clear_awaiting(task_row.id)
         await self._sessions.clear_started_at(task_row.id)
+        # Planning is over — its deadline must not outlive it.
+        await self._sessions.clear_deadline(task_row.id)
         self.stats.plans_finalised += 1
 
         if self._post_to_tracker and self._task_tracker is not None:
