@@ -142,7 +142,15 @@ class TaskIntakeInbox:
         decision: IntakeDecision,
     ) -> IntakeOutcome:
         assert self._tracker is not None
-        claim_id = await self._claim(event, root_id)
+        try:
+            claim_id = await self._claim(event, root_id)
+        except Exception as exc:
+            logger.exception("TaskIntake: claim failed for post {}", event.id)
+            sent = await self._reply(
+                event, root_id,
+                self._templates.intake_failed.format(reason=_public_cause(exc)),
+            )
+            return IntakeOutcome(action="failed", reply_sent=sent)
         if claim_id is None:
             return IntakeOutcome(action="skipped", reason="duplicate_post")
 
@@ -461,6 +469,9 @@ class TaskIntakeInbox:
         already created.
         """
         await self._drop_abandoned_claim(source_post_id)
+        return await self._claim_exists(source_post_id)
+
+    async def _claim_exists(self, source_post_id: str) -> bool:
         async with self._session_factory() as session:
             stmt = (
                 select(IntakeRequestRow.id)
@@ -499,6 +510,12 @@ class TaskIntakeInbox:
                 await session.flush()
             except IntegrityError:
                 await session.rollback()
+                # Only a row for this very post is a duplicate. Any other
+                # IntegrityError (e.g. the id sequence behind the table after
+                # a DB restore) must surface — read as «duplicate» it left
+                # ✅ on the post with no ticket and no reply.
+                if not await self._claim_exists(event.id):
+                    raise
                 logger.info(
                     "TaskIntake: post {} already claimed — not creating a "
                     "second ticket", event.id,

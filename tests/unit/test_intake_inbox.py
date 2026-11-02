@@ -12,8 +12,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import Session
 
 from virtual_dev.application.agents.task_intake import (
     IntakeAction,
@@ -1091,4 +1092,39 @@ async def test_claim_in_flight_still_blocks_a_duplicate(
     ).handle(_ask())
 
     assert outcome.reason == "duplicate_post"
+    assert tracker.specs == []
+
+
+async def test_claim_failure_that_is_not_a_duplicate_is_reported(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """09:36 on 2026-11-02: one run, no other claimer, yet the insert hit an
+    IntegrityError (id sequence behind the table after a DB restart). It was
+    read as «already claimed» — ✅, no ticket, no word in the thread."""
+    async with session_factory() as session:
+        session.add(IntakeRequestRow(
+            id=1, source_post_id="other", mm_root_id="other",
+            mm_channel_id="chan-1", requester_mm_user_id="u1",
+        ))
+        await session.commit()
+
+    def _reuse_taken_id(session: Session, *_: Any) -> None:
+        for obj in session.new:
+            if isinstance(obj, IntakeRequestRow) and obj.source_post_id == "p-1":
+                obj.id = 1
+
+    chat = _FakeChat(users={"u1": _user()})
+    tracker = _FakeTracker()
+    event.listen(Session, "before_flush", _reuse_taken_id)
+    try:
+        outcome = await _inbox(
+            agent=_FakeAgent([_create_decision()]), tracker=tracker, chat=chat,
+            session_factory=session_factory,
+        ).handle(_ask())
+    finally:
+        event.remove(Session, "before_flush", _reuse_taken_id)
+
+    assert outcome.action == "failed"
+    assert outcome.reply_sent
+    assert "не вышло" in chat.sent[0][1]
     assert tracker.specs == []
