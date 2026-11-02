@@ -25,8 +25,8 @@ def test_shipped_config_enables_intake_with_dmp_sup_label() -> None:
     # answering "The issue type selected is invalid".
     assert intake.issue_type == "Задача"
     assert intake.labels == ["dmp-sup"]
-    # Tickets go to the grooming queue, never into the running sprint.
-    assert intake.sprint_name == "DM. Распределительная пещера"
+    # Tickets go to the backlog: no sprint at all, never the running one.
+    assert intake.sprint_name == ""
     assert intake.components == ["DM-Common"]
     assert intake.summary_prefix == "[SUPPORT] "
     assert intake.customer_field == "customfield_32545"
