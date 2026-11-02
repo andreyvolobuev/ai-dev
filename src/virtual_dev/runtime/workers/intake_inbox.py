@@ -594,12 +594,11 @@ def _compose_description(body: str, *, permalink: str) -> str:
     it, and guessing such a thing is not allowed. The requester lives in
     the tracker's customer field, not in the text.
     """
-    parts = [body.strip() or "(без описания)", ""]
-    if permalink:
-        parts.append(f"Обсуждение: {permalink}")
-    parts.append("")
-    parts.append("Задачу завела Аида Нейронова по просьбе в Mattermost.")
-    return "\n".join(parts)
+    footer = (
+        f"Завела Аида по [просьбе в Mattermost|{permalink}]." if permalink
+        else "Завела Аида по просьбе в Mattermost."
+    )
+    return f"{body.strip() or '(без описания)'}\n\n{footer}"
 
 
 def _with_summary_prefix(summary: str, prefix: str) -> str:

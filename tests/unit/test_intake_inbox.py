@@ -297,9 +297,8 @@ async def test_requester_goes_into_the_customer_field_not_the_description(
     assert spec.customer == "@ivanov"
     assert "Просьба от" not in spec.description
     assert "@ivanov" not in spec.description
-    assert "Обсуждение: https://mm.example/dm/pl/p-1" in spec.description
     assert spec.description.rstrip().endswith(
-        "Задачу завела Аида Нейронова по просьбе в Mattermost."
+        "Завела Аида по [просьбе в Mattermost|https://mm.example/dm/pl/p-1]."
     )
 
 
