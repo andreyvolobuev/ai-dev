@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from virtual_dev.application.agents import (
@@ -113,7 +114,7 @@ def _test_config() -> AppConfig:
         notifications=NotificationsCfg(mattermost=MmTemplatesCfg(
             thread_reply_no_dev_agent="нет dev-агента",
             thread_reply_no_task="нет тикета",
-            thread_reply_iteration_crashed="dev упал",
+            thread_reply_iteration_blocked="затык: {blocker}",
             thread_reply_iteration_done="готово {commit_sha_short} на {branch}",
             thread_reply_iteration_no_changes="без изменений",
             thread_reply_iteration_metadata_only="обновила метаданные MR",
@@ -161,6 +162,12 @@ class _ScriptedDev:
     async def handle_iteration(self, **kwargs) -> DevResult:  # type: ignore[no-untyped-def]
         self.calls.append(kwargs)
         return self._result
+
+    def in_progress(self, branch: str) -> None:
+        return None
+
+    def queued(self, branch: str) -> int:
+        return 0
 
 
 async def _insert_mr(
@@ -320,16 +327,16 @@ async def test_iterate_metadata_only_acks_success(
     replies = [body for _, body, root in chat.sent if root == "root-m1"]
     assert "обновила метаданные MR" in replies
     assert "без изменений" not in replies
-    assert "dev упал" not in replies
+    assert not any(r.startswith("затык") for r in replies)
 
 
 @pytest.mark.asyncio
-async def test_iterate_failed_posts_crashed_template(
+async def test_iterate_failed_posts_the_blocker(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A FAILED iteration (merge conflict, model status=failed) must post
-    the crashed template — not «без изменений», which reads as "your ask
-    needed no change" while the change silently never happened."""
+    """A FAILED iteration must name what's in the way — not «без
+    изменений», which reads as "your ask needed no change", and not «пните
+    меня ещё раз» (rainbow!1031). A conscious status=failed is not retried."""
     await _insert_mr(session_factory, root_id="root-m2")
     events = [_human_post(id="post-m2", thread_root_id="root-m2", text="почини тест")]
     chat = _ScriptedChat(events)
@@ -342,7 +349,9 @@ async def test_iterate_failed_posts_crashed_template(
     communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
     dev = _ScriptedDev(DevResult(
         outcome=DevOutcome.FAILED, branch_name="ai-dev/dm-1",
-        stopped_reason="merge-conflict-with-master",
+        stopped_reason="model-returned-failed",
+        blocker="в ветке нет файла из замечания",
+        note="traceback-ish detail",
     ))
     listener = MmThreadListener(
         chat=chat, communicator=communicator,
@@ -358,8 +367,14 @@ async def test_iterate_failed_posts_crashed_template(
     await asyncio.wait_for(task, timeout=2)
 
     replies = [body for _, body, root in chat.sent if root == "root-m2"]
-    assert "dev упал" in replies
+    assert "затык: в ветке нет файла из замечания" in replies
     assert "без изменений" not in replies
+    assert len(dev.calls) == 1
+
+    async with session_factory() as session:
+        row = (await session.execute(select(MergeRequestRow))).scalar_one()
+    assert row.last_iteration_outcome == "failed"
+    assert row.last_iteration_detail == "traceback-ish detail"
 
 
 @pytest.mark.asyncio
@@ -1080,3 +1095,51 @@ async def test_responder_branches_come_from_live_mr_not_the_stale_row(
     await asyncio.wait_for(task, timeout=2)
 
     assert responder.kwargs[0]["mr_target_branch"] == "tags-dev"
+
+
+@pytest.mark.asyncio
+async def test_progress_question_gets_runtime_facts_and_file_is_attached(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """«В чём затык? пришли md-файл с отчётом» (rainbow!1031): the bot had
+    only its own chat lines to go on and said it can't attach files. The
+    responder now sees what the last iteration did and why it failed, and
+    a file it returns is posted with the reply."""
+    await _insert_mr(session_factory, root_id="root-f")
+    async with session_scope(session_factory) as session:
+        row = (await session.execute(select(MergeRequestRow))).scalar_one()
+        row.last_iteration_outcome = "failed"
+        row.last_iteration_summary = "не вышло: GitLab не принял пуш"
+        row.last_iteration_detail = "! [rejected] (stale info)"
+        row.last_iteration_at = datetime.now(timezone.utc)
+    events = [_human_post(
+        id="post-f", thread_root_id="root-f", text="в чём затык? пришли md с отчётом",
+    )]
+    chat = _ScriptedChat(events)
+    responder = _ScriptedResponder([ResponderDecision(
+        action=ResponderAction.REPLY,
+        reply_text="Затык в пуше — отчёт в файле.",
+        reasoning="progress-question",
+        attachment=("report.md", "# Отчёт\nпуш отклонён"),
+    )])
+    listener = MmThreadListener(
+        chat=chat,
+        communicator=CommunicatorService(chat, InjectionFilter(), respect_working_hours=False),
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))},  # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await _settle(lambda: len(chat.sent) >= 1)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    work_state = responder.kwargs[0]["work_state"]
+    assert "не вышло: GitLab не принял пуш" in work_state
+    assert "! [rejected] (stale info)" in work_state
+    (_, body, root), = chat.sent
+    assert root == "root-f"
+    assert body.startswith("Затык в пуше — отчёт в файле.")
+    assert "report.md" in body and "пуш отклонён" in body

@@ -34,6 +34,18 @@ _SUBMIT_MR_SCHEMA: dict[str, Any] = {
         # values are used verbatim (no ticket prefix is prepended).
         "mr_title": {"type": "string"},
         "mr_description": {"type": "string"},
+        # Iteration-only: 1-2 Russian sentences posted to the review
+        # thread — what was done, or what's in the way on status=failed.
+        # Replaces templates that said «код уже соответствует замечанию»
+        # in reply to «пересобери ветку».
+        "thread_note": {"type": "string"},
+        # Iteration-only: the commit holding the result when it was built
+        # outside the workspace branch (a worktree). The runtime moves the
+        # branch there before pushing.
+        "result_sha": {"type": "string"},
+        # Iteration-only: a rewritten history waits for the reviewer's ok
+        # on a side branch instead of replacing the MR branch right away.
+        "hold_push": {"type": "boolean"},
     },
     "required": ["title", "description", "status"],
 }
@@ -55,11 +67,19 @@ def build(ctx: ToolContext):
         "has asked for it repeatedly. Status is 'success' "
         "if the change is ready for review, 'failed' if you couldn't "
         "complete the task. The runtime commits + pushes + opens the "
-        "draft MR for you — don't shell out to git yourself. When "
+        "draft MR for you — don't commit yourself except for history "
+        "work (rebase / squash / rebuild), and never push. When "
         "iterating on an existing MR, `title` only names the commit; "
         "to change the MR's actual title/description in GitLab (e.g. "
         "the reviewer asked to rename it), pass `mr_title` / "
-        "`mr_description` — they are applied verbatim.",
+        "`mr_description` — they are applied verbatim. On an iteration "
+        "also pass `thread_note`: one or two Russian sentences for the "
+        "review thread — what you did, or on failure what's in the way. "
+        "Built the result outside the workspace branch (a worktree)? "
+        "Pass its commit as `result_sha`. Rewrote history and the repo "
+        "rules or the reviewer want to approve it before it replaces "
+        "the MR branch? Pass `hold_push: true` — it's parked on "
+        "`staged/<branch>` until they say ok.",
         _SUBMIT_MR_SCHEMA,
     )
     async def _submit_mr(args: dict[str, Any]) -> dict[str, Any]:
@@ -82,7 +102,9 @@ def build(ctx: ToolContext):
 # Claude Code", "Co-Authored-By: Claude"), which would tell every
 # reviewer what's behind Аида — the Dev prompt forbids exactly that,
 # and a prompt rule doesn't reliably beat the CLI's habit.
-_HUMAN_FACING_FIELDS = ("title", "description", "notes", "mr_title", "mr_description")
+_HUMAN_FACING_FIELDS = (
+    "title", "description", "notes", "mr_title", "mr_description", "thread_note",
+)
 
 
 __all__ = ["TOOL_GROUP", "_SUBMIT_MR_SCHEMA", "build"]

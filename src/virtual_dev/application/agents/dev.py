@@ -54,6 +54,7 @@ from virtual_dev.application.services.agent_trace import (
 )
 from virtual_dev.application.services.repo_instructions import render_repo_instructions
 from virtual_dev.application.services.ticket_reset import was_reset_since
+from virtual_dev.application.services.transcript import render_transcript
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus
 from virtual_dev.domain.models.plan import Plan, PlanStatus
@@ -186,7 +187,28 @@ class DevOutcome(str, Enum):
     # with the no-changes/failure template.
     METADATA_UPDATED = "metadata_updated"
     MR_OPENED = "mr_opened"
+    # A rewritten history parked on ``staged/<branch>``: the repo rules or
+    # the reviewer want to see it before the MR branch is overwritten.
+    STAGED = "staged"
     FAILED = "failed"
+
+
+# Where a history that waits for a human's ok is parked on origin.
+STAGED_BRANCH_PREFIX = "staged/"
+
+
+def staged_branch_for(branch: str) -> str:
+    return f"{STAGED_BRANCH_PREFIX}{branch}"
+
+
+@dataclass
+class IterationInProgress:
+    """What the agent is busy with right now — the responder answers
+    «в чём затык?» / «что получилось?» from this instead of guessing."""
+
+    branch: str
+    feedback: str
+    started_at: datetime
 
 
 @dataclass
@@ -200,6 +222,16 @@ class DevResult:
     iterations: int = 0
     stopped_reason: str = ""
     submission: dict[str, Any] = field(default_factory=dict)
+    # Iterations: one or two Russian sentences for the review thread —
+    # what was done, in the model's own words (``thread_note``).
+    note: str = ""
+    # Iterations that FAILED: what's in the way, one short phrase for the
+    # thread («GitLab не принял пуш: …»). Empty on success.
+    blocker: str = ""
+    # Where the pre-rewrite head was saved when history got rewritten.
+    backup_branch: str = ""
+    # STAGED: the side branch holding the history that waits for an ok.
+    staged_branch: str = ""
 
 
 _DEV_PROMPT_NAME = "dev"
@@ -210,13 +242,16 @@ _DEV_FALLBACK_PROMPT = (
 )
 
 
-def _render_thread_transcript(thread: Sequence[ChatMessage]) -> str:
-    lines: list[str] = []
-    for msg in thread:
-        who = "bot" if msg.trusted else f"@{msg.author_id}"
-        ts = msg.timestamp.isoformat() if msg.timestamp else ""
-        lines.append(f"{who} [{ts}]\n{msg.text}".rstrip())
-    return "\n\n".join(lines)
+def _first_line(text: str) -> str:
+    return (text.strip().splitlines() or [""])[0][:200]
+
+
+def _first_sentence(text: str) -> str:
+    line = _first_line(text)
+    for stop in (". ", "! ", "? "):
+        if stop in line:
+            return line.split(stop, 1)[0]
+    return line.rstrip(".")
 
 
 def _strip_ticket_prefix(title: str, external_id: str) -> str:
@@ -274,10 +309,21 @@ class DevAgent:
         # git operations and overwriting each other's files mid-run. All
         # model-driven work on the workspace serializes on this lock.
         self._workspace_lock = asyncio.Lock()
+        self._in_progress: IterationInProgress | None = None
+        # branch → iterations waiting for the lock behind the running one.
+        self._queued: dict[str, int] = {}
 
     @property
     def agent_key(self) -> str:
         return self._agent_key
+
+    def in_progress(self, branch: str) -> IterationInProgress | None:
+        """The iteration running on ``branch`` right now, if any."""
+        current = self._in_progress
+        return current if current is not None and current.branch == branch else None
+
+    def queued(self, branch: str) -> int:
+        return self._queued.get(branch, 0)
 
     # --- entry ---
 
@@ -515,12 +561,29 @@ class DevAgent:
         the feedback text, and push a new commit. GitLab auto-updates
         the MR.
         """
-        async with self._workspace_lock:
-            return await self._handle_iteration_locked(
-                tracker=tracker, external_id=external_id,
-                branch_name=branch_name, feedback=feedback,
-                feedback_kind=feedback_kind, thread=thread,
-            )
+        self._queued[branch_name] = self._queued.get(branch_name, 0) + 1
+        waiting = True
+        try:
+            async with self._workspace_lock:
+                self._queued[branch_name] -= 1
+                waiting = False
+                self._in_progress = IterationInProgress(
+                    branch=branch_name, feedback=feedback,
+                    started_at=datetime.now(timezone.utc),
+                )
+                try:
+                    return await self._handle_iteration_locked(
+                        tracker=tracker, external_id=external_id,
+                        branch_name=branch_name, feedback=feedback,
+                        feedback_kind=feedback_kind, thread=thread,
+                    )
+                finally:
+                    self._in_progress = None
+        finally:
+            if waiting:
+                self._queued[branch_name] -= 1
+            if self._queued.get(branch_name, 0) <= 0:
+                self._queued.pop(branch_name, None)
 
     async def _handle_iteration_locked(
         self,
@@ -540,36 +603,22 @@ class DevAgent:
 
         workspace_path = await self._vcs.ensure_clone(self._repo_key)
         await self._vcs.checkout_existing_branch(self._repo_key, branch_name)
+        old_head = await self._vcs.head_sha(self._repo_key)
 
-        # Refresh against master before iterating: stale branches that have
-        # diverged silently produce a "Merge conflict" pipeline failure
-        # the LLM can't act on. Pull master in proactively; on a merge
-        # conflict, give up cleanly and surface FAILED so the human can
-        # rebase manually (#12 in techdebt).
-        base_branch = self._default_branch()
-        merge_error = await self._vcs.merge_base_into_current(
-            self._repo_key, base_branch,
-        )
-        if merge_error is not None:
-            logger.warning(
-                "Dev[{}] iteration aborted for {}: merge of {} failed: {}",
-                self._agent_key, external_id, base_branch, merge_error,
-            )
-            await self._emit_iteration_failed(
-                external_id, branch_name,
-                reason=f"merge-conflict-with-{base_branch}",
-                detail=merge_error,
-            )
-            return DevResult(
-                outcome=DevOutcome.FAILED,
-                branch_name=branch_name,
-                stopped_reason=f"merge-conflict-with-{base_branch}",
-            )
+        # No merge of master before the run any more: it put merge commits
+        # into a history the team keeps clean and rebases on request only
+        # (rainbow!1031), and a conflict failed the run before the model
+        # could resolve it. The model is told about conflicts and decides.
+        conflicts = await self._vcs.base_conflicts(self._repo_key, self._default_branch())
+        staged_branch = staged_branch_for(branch_name)
+        staged_sha = await self._vcs.remote_branch_sha(self._repo_key, staged_branch)
 
         request = self._build_iteration_request(
             plan=plan, task_row=task_row,
             workspace_path=workspace_path, feedback=feedback,
             feedback_kind=feedback_kind, thread=thread,
+            base_conflicts=conflicts,
+            staged=(staged_branch, staged_sha) if staged_sha else None,
         )
         try:
             captured, result = await self._call_model(request)
@@ -583,6 +632,18 @@ class DevAgent:
                 detail=f"{type(exc).__name__}: {exc}",
             )
             raise
+
+        def _failed(blocker: str, reason: str, detail: str = "") -> DevResult:
+            return DevResult(
+                outcome=DevOutcome.FAILED,
+                branch_name=branch_name,
+                cost_usd=result.cost_usd,
+                iterations=result.turns,
+                stopped_reason=reason,
+                submission=captured,
+                blocker=blocker,
+                note=detail,
+            )
 
         status_val = str(captured.get("status") or "success").lower() if captured else "failed"
         if not captured or status_val == "failed":
@@ -598,13 +659,15 @@ class DevAgent:
                 ),
                 detail=notes or result.stopped_reason,
             )
-            return DevResult(
-                outcome=DevOutcome.FAILED,
-                branch_name=branch_name,
-                cost_usd=result.cost_usd,
-                iterations=result.turns,
-                stopped_reason=result.stopped_reason,
-                submission=captured,
+            if not captured:
+                return _failed(
+                    "прогон оборвался, не дойдя до результата",
+                    "model-did-not-submit", result.stopped_reason,
+                )
+            note = str(captured.get("thread_note") or "").strip()
+            return _failed(
+                note or _first_sentence(notes) or "не получилось, а почему — не поняла",
+                "model-returned-failed", notes,
             )
 
         # Reviewer asks like «поправь заголовок MR» can't be expressed as a
@@ -612,14 +675,42 @@ class DevAgent:
         # the working tree, so a pure-retitle iteration isn't lost as
         # NO_CHANGES with the title silently unchanged.
         metadata_applied = await self._apply_mr_metadata(task_row, captured)
+        note = str(captured.get("thread_note") or "").strip()
+
+        # The result may live outside the workspace branch — reviewers hand
+        # over recipes that build in a separate worktree (rainbow!1031).
+        # The runtime pushes the workspace branch, so bring the result here;
+        # otherwise the run reads as «no changes» and the work is lost.
+        result_sha = str(captured.get("result_sha") or "").strip()
+        if result_sha:
+            try:
+                await self._vcs.move_branch_to(self._repo_key, result_sha)
+            except VcsError as exc:
+                await self._emit_iteration_failed(
+                    external_id, branch_name, reason="bad-result-sha", detail=str(exc),
+                )
+                return _failed(
+                    f"не нашла у себя коммит `{result_sha[:12]}`, который собрала",
+                    "bad-result-sha", str(exc),
+                )
 
         commit_message = (
             f"[{task_row.external_id}] {_strip_ticket_prefix(str(captured.get('title') or 'iteration'), task_row.external_id)}"
         )
-        commit_sha = await self._safe_commit_all(
-            task_row=task_row, message=commit_message,
-        )
-        if not commit_sha:
+        try:
+            await self._vcs.commit_all(self._repo_key, commit_message)
+        except VcsRogueCommitError as exc:
+            # An iteration must never flip the task to FAILED: the MR is
+            # alive, the next message retries. Say what's in the way.
+            await self._emit_iteration_failed(
+                external_id, branch_name, reason="rogue-commit", detail=str(exc),
+            )
+            return _failed(
+                "коммиты вышли не от моего имени — такие не пушу",
+                "rogue-commit", str(exc),
+            )
+        head = await self._vcs.head_sha(self._repo_key)
+        if head == old_head:
             # A clean tree after the metadata was applied is a SUCCESS
             # (pure-retitle / description fix), not a failure. Seen live:
             # this returned NO_CHANGES and the review thread got the
@@ -637,6 +728,7 @@ class DevAgent:
                     iterations=result.turns,
                     stopped_reason=result.stopped_reason,
                     submission=captured,
+                    note=note,
                 )
             logger.info(
                 "Dev[{}] iteration: no changes to commit for {}",
@@ -649,6 +741,7 @@ class DevAgent:
                 iterations=result.turns,
                 stopped_reason=result.stopped_reason,
                 submission=captured,
+                note=note,
             )
         if await self._was_reset_since(tracker, external_id, run_started):
             logger.warning(
@@ -663,19 +756,72 @@ class DevAgent:
                 iterations=result.turns,
                 stopped_reason=result.stopped_reason,
             )
-        await self._vcs.push(self._repo_key, branch_name)
+        # A rebuilt / rebased / squashed history doesn't descend from the
+        # old head: a plain push is refused as non-fast-forward. Every
+        # «пересобери ветку» on rainbow!1031 died here (or on the merge
+        # and rogue-commit guards before it) and the thread got «пните
+        # меня ещё раз» six times.
+        backup = ""
+        rewritten = not await self._vcs.is_ancestor(self._repo_key, old_head, head)
+        try:
+            if rewritten and captured.get("hold_push"):
+                # The team approves a rewritten history before it replaces
+                # the MR branch: park it, the ok arrives as the next ask.
+                await self._vcs.push_head_to(self._repo_key, staged_branch)
+                logger.info(
+                    "Dev[{}] staged rewritten {} at {} on {}",
+                    self._agent_key, branch_name, head, staged_branch,
+                )
+                return DevResult(
+                    outcome=DevOutcome.STAGED,
+                    branch_name=branch_name,
+                    commit_sha=head,
+                    cost_usd=result.cost_usd,
+                    iterations=result.turns,
+                    stopped_reason=result.stopped_reason,
+                    submission=captured,
+                    note=note,
+                    staged_branch=staged_branch,
+                )
+            if rewritten:
+                backup = await self._vcs.push_rewritten(
+                    self._repo_key, branch_name, old_sha=old_head,
+                )
+            else:
+                await self._vcs.push(self._repo_key, branch_name)
+        except VcsError as exc:
+            await self._emit_iteration_failed(
+                external_id, branch_name, reason="push-rejected", detail=str(exc),
+            )
+            return _failed(
+                f"GitLab не принял пуш: {_first_line(str(exc))}",
+                "push-rejected", str(exc),
+            )
         logger.info(
-            "Dev[{}] iteration pushed {} on {}",
-            self._agent_key, commit_sha, branch_name,
+            "Dev[{}] iteration pushed {} on {}{}",
+            self._agent_key, head, branch_name,
+            f" (history rewritten, backup {backup})" if backup else "",
         )
+        if staged_sha:
+            # Whatever waited for approval is either on the branch now or
+            # superseded by this push — a stale staged history would be
+            # offered again on the next «ок».
+            try:
+                await self._vcs.delete_remote_branch(self._repo_key, staged_branch)
+            except Exception:
+                logger.warning(
+                    "Dev[{}] could not delete {}", self._agent_key, staged_branch,
+                )
         return DevResult(
             outcome=DevOutcome.MR_OPENED,   # MR already exists — semantically "updated"
             branch_name=branch_name,
-            commit_sha=commit_sha,
+            commit_sha=head,
             cost_usd=result.cost_usd,
             iterations=result.turns,
             stopped_reason=result.stopped_reason,
             submission=captured,
+            note=note,
+            backup_branch=backup,
         )
 
     async def _emit_iteration_failed(
@@ -706,6 +852,8 @@ class DevAgent:
         workspace_path: str, feedback: str,
         feedback_kind: str = "mr_review",
         thread: Sequence[ChatMessage] | None = None,
+        base_conflicts: Sequence[str] = (),
+        staged: tuple[str, str] | None = None,
     ) -> CodeAgentRequest:
         from virtual_dev.tools import render_tools_catalog
 
@@ -717,6 +865,7 @@ class DevAgent:
         user_prompt = self._render_iteration_prompt(
             task_row=task_row, plan=plan, feedback=feedback,
             feedback_kind=feedback_kind, thread=thread,
+            base_conflicts=base_conflicts, staged=staged,
         )
         request = CodeAgentRequest(
             agent_key=self._agent_key,
@@ -729,12 +878,29 @@ class DevAgent:
         request.extras["mcp_servers"] = mcp_servers
         request.extras["allowed_tool_names"] = allowed_tool_names
         request.extras["submit_capture"] = captured
+        request.extras["env"] = self._git_identity_env()
         return request
+
+    def _git_identity_env(self) -> dict[str, str]:
+        """History work means the model commits itself. Without this its
+        commits carried whatever identity the checkout had — or a
+        colleague's, when a recipe in the thread exported one — and the
+        rogue-commit guard refused the push."""
+        identity = self._vcs.commit_identity()
+        if identity is None:
+            return {}
+        name, email = identity
+        return {
+            "GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email,
+            "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email,
+        }
 
     def _render_iteration_prompt(
         self, *, task_row: TaskRow, plan: Plan, feedback: str,
         feedback_kind: str = "mr_review",
         thread: Sequence[ChatMessage] | None = None,
+        base_conflicts: Sequence[str] = (),
+        staged: tuple[str, str] | None = None,
     ) -> str:
         parts: list[str] = []
         parts.append(f"# Iteration on {task_row.tracker}:{task_row.external_id}")
@@ -766,8 +932,34 @@ class DevAgent:
                 "the thread."
             )
             parts.append("<untrusted_content source=\"mm:thread\">")
-            parts.append(_render_thread_transcript(thread))
+            parts.append(render_transcript(
+                thread, self._config.agents.working_hours.timezone,
+            ))
             parts.append("</untrusted_content>")
+            parts.append("")
+        if base_conflicts:
+            parts.append(f"## The branch conflicts with `{self._default_branch()}`")
+            parts.append(
+                "Merging the default branch into this branch would conflict in: "
+                + ", ".join(f"`{p}`" for p in base_conflicts[:20])
+                + ". GitLab can't merge the MR until that's resolved. Resolve "
+                "it the way the reviewers / repo rules want (rebase or merge "
+                "— see «Rewriting history» in your instructions); if nobody "
+                "said, merge the default branch in and fix the conflicts."
+            )
+            parts.append("")
+        if staged is not None:
+            staged_branch, staged_sha = staged
+            parts.append("## A rewritten history waits for approval")
+            parts.append(
+                f"You built it earlier and parked it on `origin/{staged_branch}` "
+                f"(`{staged_sha[:12]}`) instead of pushing. If the reviewer has "
+                "approved it («ок», «пушь»), that is the whole task: "
+                f"`git reset --hard origin/{staged_branch}`, check it with "
+                "`git log --oneline`, and submit without `hold_push` — the "
+                "runtime pushes it. If they asked for changes instead, start "
+                "from it and fix what they asked."
+            )
             parts.append("")
         if feedback_kind == "mr_review":
             parts.append(_CLAUDE_MD_INSTRUCTION)
@@ -775,7 +967,12 @@ class DevAgent:
         parts.append(
             "When you're done (or can't proceed), call `submit_mr` with status "
             "'success' or 'failed'. title is a short imperative like "
-            "'address review: ...'. Do NOT commit/push yourself — the runtime does."
+            "'address review: ...'. Fill `thread_note`: one or two Russian "
+            "sentences for the review thread about what you did (or what's "
+            "in the way). Ordinary changes: don't commit — the runtime does. "
+            "History work (rebase / squash / rebuild): commit yourself, never "
+            "push — see «Rewriting history». Do only what was asked: no "
+            "changes of your own initiative on top."
         )
         return "\n".join(parts)
 

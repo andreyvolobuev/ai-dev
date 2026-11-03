@@ -251,3 +251,54 @@ def test_responder_prompt_ranks_gitlab_facts_above_prose() -> None:
         Path(__file__).parents[2] / "config" / "prompts" / "thread_responder.md"
     ).read_text("utf-8")
     assert "## Факты о MR" in prompt
+
+
+@pytest.mark.asyncio
+async def test_responder_reads_links_knows_its_work_and_can_attach_files(
+    tmp_path: Path,
+) -> None:
+    """rainbow!1031: the responder asked a human to paste a linked GitLab
+    comment, answered «в чём затык?» from its own chat lines, quoted UTC
+    times, said it can't attach a file and never saw the repo's rules."""
+    from virtual_dev.infrastructure.config import Settings
+
+    (tmp_path / "AGENTS.md").write_text("Ветку пересобирают по `docs/rebuild.md`.\n")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "rebuild.md").write_text("ШАГИ ПЕРЕСБОРКИ\n")
+    fake = _FakeCodeAgent(captured_to_inject={
+        "action": "reply", "reply_text": "Отчёт во вложении.", "reasoning": "r",
+        "attachment_name": "report.md", "attachment_content": "# Отчёт",
+    })
+    responder = ThreadResponderAgent(
+        code_agent=fake, config=_cfg(),
+        prompts_loader=PromptsLoader("/no-prompts-dir"),
+        injection_filter=InjectionFilter(), settings=Settings(),
+    )
+    noon_utc = datetime(2026, 11, 3, 11, 20, tzinfo=timezone.utc)
+    earlier = ChatMessage(
+        id="e", channel_id="c", author_id="e.yakovlev", text="ок!",
+        timestamp=noon_utc, thread_root_id="root-x", trusted=False,
+    )
+
+    decision = await responder.decide(
+        mr_title="t", mr_description="d", mr_web_url="u", plan=None,
+        thread=[earlier], latest_reply=_msg(id="p", author="a", text="в чём затык?"),
+        repo_workspace=str(tmp_path),
+        work_state="- Последняя правка: не вышло: GitLab не принял пуш",
+        linked_notes=[("https://g/-/merge_requests/1#note_5", "→ @e.yakovlev: тест не нужен")],
+    )
+
+    request = fake.last_request
+    assert request is not None
+    assert "не вышло: GitLab не принял пуш" in request.user_prompt
+    assert "тест не нужен" in request.user_prompt
+    assert "[2026-11-03 14:20]" in request.user_prompt
+    assert "ШАГИ ПЕРЕСБОРКИ" in request.system_prompt
+    allowed = request.extras["allowed_tool_names"]
+    assert "mcp__virtual_dev_shared__fetch_url" in allowed
+    assert not any(
+        name.startswith("mcp__virtual_dev_shared__")
+        and name.rsplit("__", 1)[1] not in ("fetch_url", "read_merge_request")
+        for name in allowed
+    )
+    assert decision.attachment == ("report.md", "# Отчёт")

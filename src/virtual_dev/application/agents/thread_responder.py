@@ -31,7 +31,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -46,11 +46,16 @@ from virtual_dev.application.services.injection_filter import (
     InjectionFilter,
 )
 from virtual_dev.application.services.prompts import PromptsLoader
+from virtual_dev.application.services.repo_instructions import render_repo_instructions
+from virtual_dev.application.services.transcript import local_time, render_transcript
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import Plan
 from virtual_dev.domain.ports.code_agent import CodeAgentPort, CodeAgentRequest
 from virtual_dev.domain.ports.vcs import VcsPort
-from virtual_dev.infrastructure.config import AppConfig
+from virtual_dev.infrastructure.config import AppConfig, Settings
+
+if TYPE_CHECKING:
+    from virtual_dev.application.services import ResearcherToolkit
 
 
 class ResponderAction(str, Enum):
@@ -72,9 +77,12 @@ class ResponderDecision:
     iteration_feedback: str = ""
     reasoning: str = ""
     cost_usd: float = 0.0
+    # A file to post with reply_text: (name, text).
+    attachment: tuple[str, str] | None = None
 
 
 _PROMPT_NAME = "thread_responder"
+_SHARED_TOOLS = frozenset({"read_merge_request", "fetch_url"})
 _FALLBACK_PROMPT = (
     "You are the Thread Responder. Decide between {reply, iterate, ignore} "
     "and call submit_response.\n\n"
@@ -96,8 +104,12 @@ class ThreadResponderAgent:
         injection_filter: InjectionFilter | None = None,
         max_turns: int = 20,
         trace: AgentTrace | None = None,
+        researcher: ResearcherToolkit | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._code_agent = code_agent
+        self._researcher = researcher
+        self._settings = settings
         self._config = config
         self._prompts = prompts_loader
         self._filter = injection_filter or InjectionFilter()
@@ -118,6 +130,8 @@ class ThreadResponderAgent:
         mr_source_branch: str = "",
         mr_target_branch: str = "",
         ci: CiReading | None = None,
+        work_state: str = "",
+        linked_notes: Sequence[tuple[str, str]] = (),
     ) -> ResponderDecision:
         prompt = self._render_prompt(
             mr_title=mr_title, mr_description=mr_description,
@@ -127,6 +141,8 @@ class ThreadResponderAgent:
             mr_source_branch=mr_source_branch,
             mr_target_branch=mr_target_branch,
             ci=ci,
+            work_state=work_state,
+            linked_notes=linked_notes,
         )
         captured, result = await self._call_model(prompt, repo_workspace)
 
@@ -145,12 +161,18 @@ class ThreadResponderAgent:
                 action = ResponderAction(str(captured.get("action") or "").lower())
             except ValueError:
                 action = ResponderAction.IGNORE
+            attachment_name = str(captured.get("attachment_name") or "").strip()
+            attachment_content = str(captured.get("attachment_content") or "")
             decision = ResponderDecision(
                 action=action,
                 reply_text=str(captured.get("reply_text") or "").strip(),
                 iteration_feedback=str(captured.get("iteration_feedback") or "").strip(),
                 reasoning=str(captured.get("reasoning") or "").strip(),
                 cost_usd=result.cost_usd,
+                attachment=(
+                    (attachment_name, attachment_content)
+                    if attachment_name and attachment_content.strip() else None
+                ),
             )
 
         # Surface every decision (including the failure mode where the
@@ -175,6 +197,9 @@ class ThreadResponderAgent:
 
     # --- internals ---
 
+    def _timezone(self) -> str:
+        return self._config.agents.working_hours.timezone
+
     async def _call_model(
         self, prompt: str, workspace: str | None,
     ) -> tuple[dict[str, Any], Any]:
@@ -193,21 +218,40 @@ class ThreadResponderAgent:
         # guard that pins both fields.
         captured: dict[str, Any] = {}
         run_state: dict[str, Any] = {"terminal": False}
-        ctx = ToolContext(submit_capture=captured, run_state=run_state)
-        mcp_servers, allowed, _ = build_tool_servers(
-            ctx, only_groups={"responder"},
+        ctx = ToolContext(
+            submit_capture=captured, run_state=run_state,
+            researcher=self._researcher, settings=self._settings,
         )
+        mcp_servers, allowed, _ = build_tool_servers(
+            ctx, only_groups={"responder", "shared"},
+        )
+        # Links in the thread must be followed, not handed back to the
+        # human («напиши суть в треде»): MR links and comments through the
+        # API, everything else as a plain fetch. The rest of the shared
+        # group (code search, KB, attachments) is the analyst's surface.
+        allowed = [
+            name for name in allowed
+            if not name.startswith("mcp__virtual_dev_shared__")
+            or name.removeprefix("mcp__virtual_dev_shared__") in _SHARED_TOOLS
+        ]
         # Filesystem builtins for reading the repo if the model wants
         # context — same surface as before.
         allowed.extend(["Read", "Glob", "Grep"])
 
+        system_prompt = self._prompts.render(
+            _PROMPT_NAME,
+            fallback=_FALLBACK_PROMPT,
+            untrusted_warning=SYSTEM_PROMPT_ABOUT_UNTRUSTED,
+        )
+        # The repo's own rules (rainbow keeps «пересобери ветку» there):
+        # the responder turns asks into tasks and must read them the way
+        # the team does.
+        repo_rules = render_repo_instructions(workspace)
+        if repo_rules:
+            system_prompt = f"{system_prompt}\n\n{repo_rules}"
         request = CodeAgentRequest(
             agent_key=self.agent_key,
-            system_prompt=self._prompts.render(
-                _PROMPT_NAME,
-                fallback=_FALLBACK_PROMPT,
-                untrusted_warning=SYSTEM_PROMPT_ABOUT_UNTRUSTED,
-            ),
+            system_prompt=system_prompt,
             user_prompt=prompt,
             working_dir=workspace,
             max_turns=self._max_turns,
@@ -234,6 +278,8 @@ class ThreadResponderAgent:
         mr_source_branch: str = "",
         mr_target_branch: str = "",
         ci: CiReading | None = None,
+        work_state: str = "",
+        linked_notes: Sequence[tuple[str, str]] = (),
     ) -> str:
         parts: list[str] = []
         parts.append("# Review thread context")
@@ -255,6 +301,19 @@ class ThreadResponderAgent:
                 )
             if ci is not None:
                 parts.append(f"**CI на последнем коммите:** {_render_ci_fact(ci)}")
+            parts.append("")
+        if work_state:
+            parts.append("## Твоя работа по этому MR (факты рантайма)")
+            parts.append(work_state)
+            parts.append("")
+        if linked_notes:
+            # Comment bodies are human-written — untrusted like the thread.
+            parts.append("## Комментарии GitLab по ссылкам из треда (прочитаны через API)")
+            for url, rendered in linked_notes:
+                parts.append(f"### {url}")
+                parts.append(self._filter.wrap(
+                    rendered, source="gitlab:mr:note",
+                ).wrapped_text)
             parts.append("")
         if ci is not None and ci.failed_jobs:
             # Job logs echo code, test names and commit text anyone with
@@ -294,13 +353,14 @@ class ThreadResponderAgent:
             parts.append("")
         parts.append("## Thread so far (oldest first)")
         wrapped_thread = self._filter.wrap(
-            _render_thread(thread), source="mm:thread",
+            render_transcript(thread, self._timezone()), source="mm:thread",
         )
         parts.append(wrapped_thread.wrapped_text)
         parts.append("")
         parts.append("## Latest reply (needs your response)")
         wrapped_latest = self._filter.wrap(
-            f"@{latest.author_id}:\n{latest.text}",
+            f"@{latest.author_id} [{local_time(latest.timestamp, self._timezone())}]:\n"
+            f"{latest.text}",
             source=f"mm:post:{latest.id}",
         )
         parts.append(wrapped_latest.wrapped_text)
@@ -332,15 +392,6 @@ def _render_failed_logs(ci: CiReading) -> str:
     return "\n\n".join(
         f"### {j.name}\n{j.log_excerpt or '(лога нет)'}" for j in ci.failed_jobs
     )
-
-
-def _render_thread(thread: Sequence[ChatMessage]) -> str:
-    lines: list[str] = []
-    for msg in thread:
-        who = "bot" if msg.trusted else f"@{msg.author_id}"
-        ts = msg.timestamp.isoformat() if msg.timestamp else ""
-        lines.append(f"{who} [{ts}]\n{msg.text}".rstrip())
-    return "\n\n".join(lines)
 
 
 async def resolve_mr_branches(

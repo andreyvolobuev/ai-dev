@@ -169,7 +169,16 @@ class MmTemplatesCfg(_StrictModel):
     pipeline_autofix_restart_ack: str = ""
     thread_reply_no_dev_agent: str = ""
     thread_reply_no_task: str = ""
+    # Deprecated (asked the human to «пнуть» the bot) — failures go
+    # through thread_reply_iteration_blocked now. Kept so old copies of
+    # notifications.yaml still load.
     thread_reply_iteration_crashed: str = ""
+    # {blocker} — one line: what's in the way after automatic retries.
+    thread_reply_iteration_blocked: str = ""
+    # {note}, {staged_branch}, {commit_sha_short} — a rewritten history
+    # parked until the reviewer's ok.
+    thread_reply_iteration_staged: str = ""
+    # {summary} (what the commit did), {commit_sha_short}, {branch}.
     thread_reply_iteration_done: str = ""
     thread_reply_iteration_no_changes: str = ""
     # Iteration updated only the MR title/description (no commit) — a

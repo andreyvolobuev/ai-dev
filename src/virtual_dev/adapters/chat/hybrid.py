@@ -54,6 +54,15 @@ class HybridChat(ChatPort):
     ) -> ChatMessage:
         return await self._writes.send_to_channel(channel_id, text, thread_root_id)
 
+    async def send_file_to_channel(
+        self, channel_id: str, text: str, *, filename: str, content: bytes,
+        thread_root_id: str | None = None,
+    ) -> ChatMessage:
+        return await self._writes.send_file_to_channel(
+            channel_id, text, filename=filename, content=content,
+            thread_root_id=thread_root_id,
+        )
+
     async def add_reaction(self, post_id: str, emoji_name: str) -> None:
         await self._writes.add_reaction(post_id, emoji_name)
 

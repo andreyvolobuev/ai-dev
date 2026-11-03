@@ -102,6 +102,10 @@ def _pid_alive(pid: int) -> bool:
 class VcsError(RuntimeError):
     """Raised when a git or GitLab API call fails."""
 
+    # A failed git command's stdout: some commands (``merge-tree``) report
+    # their result there and signal it with the exit code.
+    stdout: str = ""
+
 
 class VcsRogueCommitError(VcsError):
     """Raised by ``commit_all`` when local HEAD is ahead of origin but
@@ -610,6 +614,105 @@ class GitLabVcs(VcsPort):
                     await asyncio.sleep(wait)
             assert last_exc is not None
             raise last_exc
+
+    async def head_sha(self, repo_key: str) -> str:
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            return (await self._run_git(path, "rev-parse", "HEAD")).strip()
+
+    async def is_ancestor(self, repo_key: str, ancestor: str, descendant: str = "HEAD") -> bool:
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            try:
+                await self._run_git(path, "merge-base", "--is-ancestor", ancestor, descendant)
+            except VcsError:
+                return False
+            return True
+
+    async def base_conflicts(self, repo_key: str, base: str) -> list[str]:
+        """Files that would conflict if ``origin/<base>`` were merged into
+        HEAD — computed without touching the branch (``git merge-tree``).
+
+        Iterations used to merge master in before every run. That put a
+        merge commit into the history of a team that asked not to change
+        the base until told (rainbow!1031), and a real conflict failed the
+        run before the model could resolve it. Now the merge is the
+        model's call, and this only tells it whether one is needed.
+        Any git trouble reads as «no conflict»: the check must never block
+        an iteration on its own.
+        """
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            try:
+                await self._ensure_origin_ref(path, base)
+                await self._connect_shallow_histories(path, base)
+                await self._run_git(
+                    path, "merge-tree", "--write-tree", "--name-only",
+                    "--no-messages", f"origin/{base}", "HEAD",
+                )
+            except VcsError as exc:
+                # Exit 1 = conflicts: stdout is the tree oid, then the
+                # conflicted paths, one per line.
+                lines = [ln.strip() for ln in exc.stdout.splitlines() if ln.strip()]
+                if "exit=1" not in str(exc) or not lines:
+                    logger.warning("VCS: merge-tree check against {} failed: {}", base, exc)
+                    return []
+                return lines[1:]
+            return []
+
+    async def push_rewritten(self, repo_key: str, branch: str, *, old_sha: str) -> str:
+        """Publish a rewritten history (rebase / squash / rebuild).
+
+        The old head goes to ``backup/<branch>-<sha8>`` on origin first, so
+        nothing a human approved is lost; then the branch is moved with
+        ``--force-with-lease`` against that exact head — if anyone pushed
+        to the branch meanwhile, GitLab refuses instead of erasing it.
+        Returns the backup branch name.
+        """
+        backup = f"backup/{branch}-{old_sha[:8]}"
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            repo_url = self._repo(repo_key).url
+            target = (
+                self._https_push_url_for(repo_key)
+                if repo_url.startswith(("git@", "https://", "http://")) else "origin"
+            )
+            await self._run_git(path, "push", target, f"{old_sha}:refs/heads/{backup}")
+            await self._run_git(
+                path, "push", f"--force-with-lease={branch}:{old_sha}",
+                target, f"HEAD:refs/heads/{branch}",
+            )
+            await self._run_git(path, "update-ref", f"refs/remotes/origin/{branch}", "HEAD")
+        logger.info("Pushed rewritten {} (backup {})", branch, backup)
+        return backup
+
+    def commit_identity(self) -> tuple[str, str] | None:
+        return self._identity.name, self._identity.email
+
+    async def move_branch_to(self, repo_key: str, sha: str) -> None:
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            await self._run_git(path, "reset", "--hard", sha)
+
+    async def remote_branch_sha(self, repo_key: str, branch: str) -> str | None:
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            try:
+                await self._ensure_origin_ref(path, branch)
+                return (await self._run_git(path, "rev-parse", f"origin/{branch}")).strip()
+            except VcsError:
+                return None
+
+    async def push_head_to(self, repo_key: str, branch: str) -> None:
+        async with self._lock(repo_key):
+            path = await self._ensure_local(repo_key)
+            repo_url = self._repo(repo_key).url
+            target = (
+                self._https_push_url_for(repo_key)
+                if repo_url.startswith(("git@", "https://", "http://")) else "origin"
+            )
+            await self._run_git(path, "push", "--force", target, f"HEAD:refs/heads/{branch}")
+            await self._run_git(path, "update-ref", f"refs/remotes/origin/{branch}", "HEAD")
 
     async def current_branch(self, repo_key: str) -> str:
         # Same per-repo lock as the mutating ops: `git status`/`rev-parse`
@@ -1169,9 +1272,11 @@ class GitLabVcs(VcsPort):
 
         if proc.returncode != 0:
             stderr = (stderr or "").strip()
-            raise VcsError(
+            error = VcsError(
                 f"git {args[0]} failed (exit={proc.returncode}): {stderr or '(no stderr)'}"
             )
+            error.stdout = stdout or ""
+            raise error
         return stdout or ""
 
 

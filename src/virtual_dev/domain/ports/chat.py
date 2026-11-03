@@ -36,6 +36,17 @@ class ChatPort(ABC):
     ) -> ChatMessage:
         """Send a message to a channel, optionally threaded under ``thread_root_id``."""
 
+    async def send_file_to_channel(
+        self, channel_id: str, text: str, *, filename: str, content: bytes,
+        thread_root_id: str | None = None,
+    ) -> ChatMessage:
+        """Send a message with one attached file. Non-abstract: a chat
+        without uploads gets the file inlined into the text."""
+        body = content.decode("utf-8", errors="replace")
+        return await self.send_to_channel(
+            channel_id, f"{text}\n\n`{filename}`:\n```\n{body}\n```", thread_root_id,
+        )
+
     @abstractmethod
     async def read_thread(self, thread_root_id: str) -> Sequence[ChatMessage]:
         """Return every message in the thread, oldest first."""

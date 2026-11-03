@@ -192,6 +192,18 @@ class MergeRequestRow(Base):
     # 'gitlab' for a top-level MR comment. Set when iteration is
     # triggered, cleared together with iteration_pending_ci_sha.
     iteration_ack_target: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # What the pending iteration did, in the model's words — the CI-green
+    # ack says it instead of a generic «внесла правки».
+    iteration_pending_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The last iteration's outcome (DevOutcome value), its one-line summary
+    # as posted to the thread, and the full reason behind a failure. The
+    # responder answers «в чём затык?» / «что получилось?» from these.
+    last_iteration_outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_iteration_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_iteration_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_iteration_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

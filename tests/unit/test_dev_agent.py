@@ -51,6 +51,7 @@ class _FakeVcs(VcsPort):
         self._branch = "main"
         self._dirty_files: set[str] = set()
         self.mr_payload: dict[str, Any] = {}
+        self.head = "0ld0000000000"
 
     async def ensure_clone(self, repo_key: str) -> str:
         self.calls.append(("ensure_clone", (repo_key,)))
@@ -74,7 +75,11 @@ class _FakeVcs(VcsPort):
         if not self._dirty_files:
             return ""
         self._dirty_files.clear()
+        self.head = "abc123"
         return "abc123"
+
+    async def head_sha(self, repo_key: str) -> str:
+        return self.head
 
     async def push(self, repo_key: str, branch: str, *, force: bool = False) -> None:
         self.calls.append(("push", (repo_key, branch, force)))
@@ -512,17 +517,13 @@ async def test_dev_raises_permanent_on_dirty_working_tree(
 
 
 @pytest.mark.asyncio
-async def test_iteration_aborts_on_rogue_commit_detection(
+async def test_iteration_refuses_to_push_a_rogue_commit(
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path: Path,
 ) -> None:
-    """If the model bypassed the prompt rule and ran ``git commit`` via
-    Bash, ``commit_all`` raises ``VcsRogueCommitError`` (HEAD author
-    isn't the bot). handle_iteration must NOT push that commit — pushing
-    would put the local user's identity on the MR. Instead it flips the
-    task to FAILED and raises ``CodeAgentPermanentError`` so the
-    listener surfaces a clear "iteration crashed" signal rather than
-    silently inheriting the wrong author."""
+    """A commit authored by someone else (``commit_all`` raises
+    ``VcsRogueCommitError``) is never pushed. The MR is alive, so the task
+    is not failed — the iteration reports what's in the way instead."""
     await _insert_task(session_factory)
     await _insert_plan(session_factory)
 
@@ -531,9 +532,7 @@ async def test_iteration_aborts_on_rogue_commit_detection(
             self.calls.append(("commit_all", (repo_key, message)))
             raise VcsRogueCommitError(
                 "branch 'ai-dev/dm-7' HEAD ab29843d authored by "
-                "'an.volobuev@2gis.local' (not bot identity "
-                "'virtual-dev@datamining.2gis.ru'); model self-committed "
-                "via Bash despite the prompt rule. Refusing to push."
+                "'e.yakovlev@2gis.ru' (not bot identity)"
             )
 
     vcs = _RogueVcs(tmp_path / "workspace")
@@ -550,21 +549,20 @@ async def test_iteration_aborts_on_rogue_commit_detection(
         },
     )
 
-    with pytest.raises(CodeAgentPermanentError):
-        await dev.handle_iteration(
-            tracker="jira", external_id="DM-7",
-            branch_name="ai-dev/dm-7",
-            feedback="please rename foo",
-        )
+    result = await dev.handle_iteration(
+        tracker="jira", external_id="DM-7",
+        branch_name="ai-dev/dm-7",
+        feedback="please rename foo",
+    )
 
+    assert result.outcome is DevOutcome.FAILED
+    assert result.stopped_reason == "rogue-commit"
+    assert "не от моего имени" in result.blocker
     async with session_factory() as session:
         task_row = (await session.execute(
             select(TaskRow).where(TaskRow.external_id == "DM-7")
         )).scalar_one()
-    assert task_row.internal_status == TaskStatus.FAILED.value
-
-    # commit_all was attempted (and rejected) but push must NOT have run
-    # — pushing the rogue commit is exactly what we're preventing.
+    assert task_row.internal_status != TaskStatus.FAILED.value
     kinds = [c[0] for c in vcs.calls]
     assert "commit_all" in kinds
     assert "push" not in kinds
@@ -646,47 +644,45 @@ async def test_iteration_applies_mr_title_and_description_update(
 
 
 @pytest.mark.asyncio
-async def test_iteration_merge_failure_is_traced_with_detail(
+async def test_iteration_tells_the_model_about_base_conflicts_instead_of_merging(
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path: Path,
 ) -> None:
-    """Seen live (DM-2740): every iteration silently died on «refusing to
-    merge unrelated histories» and neither the UI nor the thread said WHY.
-    A failed pre-merge must surface an `iteration_failed` trace event with
-    the actual git error, so the activity feed answers «what happened»."""
+    """Merging master before every run put merge commits into a history
+    the team keeps clean, and a conflict failed the run before the model
+    could resolve it (rainbow!1031). Conflicts are now a fact in the
+    prompt; nothing is merged up front."""
     await _insert_task(session_factory)
     await _insert_plan(session_factory)
 
     class _ConflictVcs(_FakeVcs):
+        async def base_conflicts(self, repo_key: str, base: str) -> list[str]:
+            return ["rapid/app/schemas.py"]
+
         async def merge_base_into_current(
             self, repo_key: str, base: str,
-        ) -> str | None:
-            return "fatal: refusing to merge unrelated histories"
+        ) -> str | None:  # pragma: no cover - must not be called
+            self.calls.append(("merge_base_into_current", (repo_key, base)))
+            return None
 
     vcs = _ConflictVcs(tmp_path / "workspace")
     code_agent = _FakeCodeAgent(CodeAgentResult(
         final_text="", turns=1, input_tokens=0, output_tokens=0,
         cost_usd=0.0, stopped_reason="end_turn",
     ))
-    trace = _RecordingTrace()
     dev = _make_dev(
         session_factory, vcs=vcs, code_agent=code_agent,
         preset_submission={"status": "success", "title": "t", "description": ""},
-        trace=trace,
     )
 
-    result = await dev.handle_iteration(
+    await dev.handle_iteration(
         tracker="jira", external_id="DM-7",
         branch_name="ai-dev/dm-7", feedback="почини",
     )
 
-    assert result.outcome is DevOutcome.FAILED
-    assert result.stopped_reason.startswith("merge-conflict-with-")
-    failed = [e for e in trace.events if e.type == "iteration_failed"]
-    assert failed, f"no iteration_failed event; got {[e.type for e in trace.events]}"
-    payload = failed[0].payload
-    assert payload["external_id"] == "DM-7"
-    assert "unrelated histories" in payload["detail"]
+    assert "merge_base_into_current" not in [c[0] for c in vcs.calls]
+    prompt = dev.last_request.user_prompt if dev.last_request else ""
+    assert "rapid/app/schemas.py" in prompt
 
 
 @pytest.mark.asyncio
@@ -1507,3 +1503,190 @@ def test_dev_prompt_forbids_inventing_mr_settings() -> None:
     mr_section = prompt.split("## MR submission", 1)[1]
 
     assert "Не выдумывай настройки MR" in mr_section
+
+
+class _HistoryVcs(_FakeVcs):
+    """The model rewrote history: the new HEAD doesn't descend from the
+    old one. Records how the runtime publishes it."""
+
+    def __init__(self, workspace: Path, *, staged_sha: str | None = None) -> None:
+        super().__init__(workspace)
+        self.staged_sha = staged_sha
+        self.moved_to: str | None = None
+
+    def commit_identity(self) -> tuple[str, str] | None:
+        return "Аида Нейронова", "virtual-dev@example"
+
+    async def commit_all(self, repo_key: str, message: str) -> str:
+        self.calls.append(("commit_all", (repo_key, message)))
+        self.head = self.moved_to or "rebuilt0000000"
+        return self.head
+
+    async def is_ancestor(self, repo_key: str, ancestor: str, descendant: str = "HEAD") -> bool:
+        return False
+
+    async def move_branch_to(self, repo_key: str, sha: str) -> None:
+        self.calls.append(("move_branch_to", (repo_key, sha)))
+        self.moved_to = sha
+
+    async def remote_branch_sha(self, repo_key: str, branch: str) -> str | None:
+        return self.staged_sha if branch.startswith("staged/") else None
+
+    async def push_head_to(self, repo_key: str, branch: str) -> None:
+        self.calls.append(("push_head_to", (repo_key, branch)))
+
+    async def push_rewritten(self, repo_key: str, branch: str, *, old_sha: str) -> str:
+        self.calls.append(("push_rewritten", (repo_key, branch, old_sha)))
+        return f"backup/{branch}-{old_sha[:8]}"
+
+    async def delete_remote_branch(self, repo_key: str, branch: str) -> None:
+        self.calls.append(("delete_remote_branch", (repo_key, branch)))
+
+
+def _ok_agent() -> _FakeCodeAgent:
+    return _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=1, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
+
+
+@pytest.mark.asyncio
+async def test_rewritten_history_is_force_pushed_with_backup_and_identity(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path,
+) -> None:
+    """«Пересобери ветку» on rainbow!1031 died on a plain non-fast-forward
+    push and on commits carrying a colleague's identity. The model's own
+    commits get the bot's identity through the env; a rewritten history
+    goes out with a lease and a backup of the old head."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _HistoryVcs(tmp_path / "workspace")
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=_ok_agent(),
+        preset_submission={
+            "status": "success", "title": "пересборка", "description": "",
+            "thread_note": "Пересобрала ветку: 3 коммита кода и 2 «Тесты: …»",
+        },
+    )
+
+    result = await dev.handle_iteration(
+        tracker="jira", external_id="DM-7", branch_name="ai-dev/dm-7",
+        feedback="пересобери ветку",
+    )
+
+    assert result.outcome is DevOutcome.MR_OPENED
+    assert result.backup_branch == "backup/ai-dev/dm-7-0ld00000"
+    assert result.note.startswith("Пересобрала ветку")
+    kinds = [c[0] for c in vcs.calls]
+    assert "push_rewritten" in kinds and "push" not in kinds
+    assert dev.last_request is not None
+    env = dev.last_request.extras["env"]
+    assert env["GIT_AUTHOR_EMAIL"] == env["GIT_COMMITTER_EMAIL"] == "virtual-dev@example"
+
+
+@pytest.mark.asyncio
+async def test_hold_push_parks_the_history_on_a_staged_branch(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path,
+) -> None:
+    """The team approves a rebuilt history before it replaces the MR
+    branch: it waits on staged/<branch>, the MR branch is untouched."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _HistoryVcs(tmp_path / "workspace")
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=_ok_agent(),
+        preset_submission={
+            "status": "success", "title": "пересборка", "description": "",
+            "thread_note": "Пересобрала ветку", "hold_push": True,
+        },
+    )
+
+    result = await dev.handle_iteration(
+        tracker="jira", external_id="DM-7", branch_name="ai-dev/dm-7",
+        feedback="пересобери ветку, пуш после моего ок",
+    )
+
+    assert result.outcome is DevOutcome.STAGED
+    assert result.staged_branch == "staged/ai-dev/dm-7"
+    kinds = [c[0] for c in vcs.calls]
+    assert ("push_head_to", ("bellingshausen", "staged/ai-dev/dm-7")) in vcs.calls
+    assert "push_rewritten" not in kinds and "push" not in kinds
+
+
+@pytest.mark.asyncio
+async def test_approved_staged_history_is_offered_then_pushed_and_cleaned_up(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path,
+) -> None:
+    """On the next ask the model is told the staged history exists; once
+    it's pushed to the MR branch the staged branch goes away."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _HistoryVcs(tmp_path / "workspace", staged_sha="5ta9ed0000000")
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=_ok_agent(),
+        preset_submission={"status": "success", "title": "push", "description": ""},
+    )
+
+    result = await dev.handle_iteration(
+        tracker="jira", external_id="DM-7", branch_name="ai-dev/dm-7", feedback="ок, пушь",
+    )
+
+    assert dev.last_request is not None
+    assert "origin/staged/ai-dev/dm-7" in dev.last_request.user_prompt
+    assert result.outcome is DevOutcome.MR_OPENED
+    assert ("delete_remote_branch", ("bellingshausen", "staged/ai-dev/dm-7")) in vcs.calls
+
+
+@pytest.mark.asyncio
+async def test_result_built_in_a_worktree_is_brought_to_the_branch(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path,
+) -> None:
+    """Recipes in the thread built the result in ~/wt/…; the runtime only
+    pushes the workspace branch, so the run read as «no changes» and the
+    rebuilt history never reached origin (rainbow!1031, c8c42cb2)."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _HistoryVcs(tmp_path / "workspace")
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=_ok_agent(),
+        preset_submission={
+            "status": "success", "title": "fold", "description": "",
+            "result_sha": "c8c42cb20000",
+        },
+    )
+
+    result = await dev.handle_iteration(
+        tracker="jira", external_id="DM-7", branch_name="ai-dev/dm-7", feedback="влей коммит",
+    )
+
+    assert ("move_branch_to", ("bellingshausen", "c8c42cb20000")) in vcs.calls
+    assert result.commit_sha == "c8c42cb20000"
+
+
+@pytest.mark.asyncio
+async def test_in_progress_is_visible_while_an_iteration_runs(
+    session_factory: async_sessionmaker[AsyncSession], tmp_path: Path,
+) -> None:
+    """«В чём затык?» asked mid-run is answered from what actually runs."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    seen: list[object] = []
+
+    class _Peeking(_FakeCodeAgent):
+        async def run_task(self, request: CodeAgentRequest) -> CodeAgentResult:
+            seen.append(dev.in_progress("ai-dev/dm-7"))
+            return await super().run_task(request)
+
+    dev = _make_dev(
+        session_factory, vcs=_FakeVcs(tmp_path / "workspace"),
+        code_agent=_Peeking(_ok_agent().result),
+        preset_submission={"status": "success", "title": "t", "description": ""},
+    )
+    await dev.handle_iteration(
+        tracker="jira", external_id="DM-7", branch_name="ai-dev/dm-7", feedback="почини тест",
+    )
+
+    running = seen[0]
+    assert running is not None and getattr(running, "feedback", "") == "почини тест"
+    assert dev.in_progress("ai-dev/dm-7") is None
+    assert dev.queued("ai-dev/dm-7") == 0

@@ -235,7 +235,7 @@ def _cfg(
             escalation_dm="MR `{repo_key}!{iid}` no reviewer activity {idle_hours}h: {web_url}",
             thread_reply_iteration_done="✅ CI зелёный — коммит {commit_sha_short} на {branch}",
             thread_reply_iteration_no_changes="без изменений",
-            thread_reply_iteration_crashed="dev упал",
+            thread_reply_iteration_blocked="затык: {blocker}",
             thread_reply_iteration_metadata_only="обновила метаданные MR",
         )),
     )
@@ -322,6 +322,16 @@ def _agent(
         bot_username="virtual-dev",
     )
 
+
+
+class _IdleDevState:
+    """What the reviewer reads off a dev besides ``handle_iteration``."""
+
+    def in_progress(self, branch: str) -> None:
+        return None
+
+    def queued(self, branch: str) -> int:
+        return 0
 
 @pytest.mark.asyncio
 async def test_reviewer_routes_classification_through_injected_classifier(
@@ -1514,7 +1524,7 @@ async def test_gitlab_iterate_passes_responder_feedback_to_dev(
         feedback="Удалить буллет про critical из CLAUDE.md, убедиться что коммит попал в MR.",
     )
 
-    class _CapturingDev:
+    class _CapturingDev(_IdleDevState):
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
@@ -1590,7 +1600,7 @@ async def test_gitlab_iterate_posts_acknowledgement(
         feedback="remove the accidental certifi dependency",
     )
 
-    class _StubDev:
+    class _StubDev(_IdleDevState):
         async def handle_iteration(self, **kwargs: object) -> object:
             return DevResult(
                 outcome=DevOutcome.MR_OPENED,
@@ -1654,7 +1664,7 @@ async def test_gitlab_iterate_without_commit_tells_the_reviewer(
         feedback="fix the MR title format",
     )
 
-    class _NoChangesDev:
+    class _NoChangesDev(_IdleDevState):
         async def handle_iteration(self, **kwargs: object) -> object:
             return DevResult(outcome=DevOutcome.NO_CHANGES, branch_name="ai-dev/dm-1-42")
 
@@ -1857,7 +1867,7 @@ async def test_gitlab_iterate_metadata_only_acks_success(
         feedback="update the MR description",
     )
 
-    class _MetadataOnlyDev:
+    class _MetadataOnlyDev(_IdleDevState):
         async def handle_iteration(self, **kwargs: object) -> object:
             return DevResult(
                 outcome=DevOutcome.METADATA_UPDATED, branch_name="ai-dev/dm-1-42",
@@ -1874,7 +1884,7 @@ async def test_gitlab_iterate_metadata_only_acks_success(
     bodies = [body for _, _, body in vcs.posted_mr_comments]
     assert "обновила метаданные MR" in bodies, f"MR comments = {bodies}"
     assert "без изменений" not in bodies
-    assert "dev упал" not in bodies
+    assert not any(b.startswith("затык") for b in bodies)
 
 
 @pytest.mark.asyncio
@@ -1918,7 +1928,7 @@ async def test_gitlab_iterate_failed_tells_the_reviewer(
         feedback="fix the flaky test",
     )
 
-    class _FailedDev:
+    class _FailedDev(_IdleDevState):
         async def handle_iteration(self, **kwargs: object) -> object:
             return DevResult(
                 outcome=DevOutcome.FAILED, branch_name="ai-dev/dm-1-42",
@@ -1934,7 +1944,7 @@ async def test_gitlab_iterate_failed_tells_the_reviewer(
     await agent.tick()
 
     assert any(
-        body == "dev упал" for _, _, body in vcs.posted_mr_comments
+        body.startswith("затык") for _, _, body in vcs.posted_mr_comments
     ), f"failure follow-up not posted; MR comments = {vcs.posted_mr_comments}"
 
 
@@ -1978,8 +1988,11 @@ async def test_gitlab_iterate_crash_tells_the_reviewer_and_stops_retrying(
         feedback="fix the typings",
     )
 
-    class _CrashingDev:
+    class _CrashingDev(_IdleDevState):
+        calls = 0
+
         async def handle_iteration(self, **kwargs: object) -> object:
+            _CrashingDev.calls += 1
             raise RuntimeError("workspace exploded")
 
     agent = ReviewerAgent(
@@ -1992,8 +2005,11 @@ async def test_gitlab_iterate_crash_tells_the_reviewer_and_stops_retrying(
 
     # The failure is announced to the humans…
     assert any(
-        body == "dev упал" for _, _, body in vcs.posted_mr_comments
+        body.startswith("затык: прогон падает с ошибкой RuntimeError")
+        for _, _, body in vcs.posted_mr_comments
     ), f"crash follow-up not posted; MR comments = {vcs.posted_mr_comments}"
+    # The crash is retried in place — nobody has to «пнуть» the bot…
+    assert _CrashingDev.calls == 3
     # …and the comment does NOT stay pending (no infinite promise loop).
     async with session_factory() as s:
         row = (await s.execute(
@@ -2053,7 +2069,7 @@ async def test_failed_ack_keeps_comment_pending_and_skips_iteration(
 
     iterated: list[dict] = []
 
-    class _StubDev:
+    class _StubDev(_IdleDevState):
         async def handle_iteration(self, **kwargs: object) -> object:
             iterated.append(dict(kwargs))
             return DevResult(
@@ -2273,7 +2289,7 @@ async def test_gitlab_ack_not_reposted_when_restart_loses_tick_state(
         async def get_mr_diff(self, repo_key: str, iid: int) -> str:
             return ""
 
-    class _CountingDev:
+    class _CountingDev(_IdleDevState):
         def __init__(self) -> None:
             self.calls: list[dict] = []
 

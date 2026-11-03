@@ -32,6 +32,10 @@ _SUBMIT_RESPONSE_SCHEMA: dict[str, Any] = {
         "reply_text": {"type": "string"},
         "iteration_feedback": {"type": "string"},
         "reasoning": {"type": "string"},
+        # A file posted with reply_text — when a person asks for one
+        # («пришли md-файл с отчётом»). Name with extension + full text.
+        "attachment_name": {"type": "string"},
+        "attachment_content": {"type": "string"},
     },
     "required": ["action", "reasoning"],
 }
@@ -52,7 +56,10 @@ def build(ctx: ToolContext):
         "a response, 'propose_alternative' to push back with a better "
         "approach when the reviewer's request would degrade the system "
         "(N+1, broken invariants, perf regression) — same payload as "
-        "'reply' (use reply_text for the explanation + alternative).",
+        "'reply' (use reply_text for the explanation + alternative). "
+        "Asked for a file (a report, a log)? Put its name in "
+        "attachment_name and its text in attachment_content — it is "
+        "attached to reply_text; never say you can't attach files.",
         _SUBMIT_RESPONSE_SCHEMA,
     )
     async def _submit(args: dict[str, Any]) -> dict[str, Any]:
@@ -78,7 +85,9 @@ def build(ctx: ToolContext):
             })
         submit_capture.clear()
         # reply_text is posted to the review thread verbatim.
-        submit_capture.update(scrub_human_fields(args, ("reply_text",)))
+        submit_capture.update(
+            scrub_human_fields(args, ("reply_text", "attachment_content")),
+        )
         run_state["terminal"] = True
         return wrap_text({"recorded": True, "instruction": "Decision recorded."})
 

@@ -39,9 +39,16 @@ _PREAMBLE = (
     "Precedence: on workflow mechanics this runtime's rules win — the "
     "runtime commits, pushes and opens the MR for you, and you report via "
     "your terminal tool instead of waiting for a user's approval in chat. "
-    "Repo rules like \"commit only when the user asks\" or \"wait for "
-    "approval\" are about interactive sessions; do not stall on them."
+    "Repo rules like \"commit only when the user asks\" are about "
+    "interactive sessions; do not stall on them. A rule to push a "
+    "rewritten history only after a human's ok is honoured with "
+    "`hold_push` (see «Rewriting history»)."
 )
+
+# Repo docs that AGENTS.md points to by a relative path («пересобирают по
+# `docs/branch-rebuild.md`»). A pointer alone was not enough: the model
+# read the rule but not the procedure behind it.
+_DOC_REF_RE = re.compile(r"(?<![\w/.])((?:[\w.-]+/)*[\w.-]+\.md)\b")
 
 
 def render_repo_instructions(
@@ -71,7 +78,10 @@ def render_repo_instructions(
 
     agents_md = root / _AGENTS_MD
     if agents_md.is_file():
-        _take(_AGENTS_MD, _read(agents_md))
+        agents_text = _read(agents_md)
+        _take(_AGENTS_MD, agents_text)
+        for rel in _referenced_docs(root, agents_text):
+            _take(rel, _read(root / rel))
 
     context_dir = root / _CONTEXT_DIR
     if context_dir.is_dir():
@@ -108,6 +118,24 @@ def render_repo_instructions(
             + "\n".join(f"- {item}" for item in optional)
         )
     return "\n".join(parts)
+
+
+def _referenced_docs(root: Path, text: str) -> list[str]:
+    """Markdown files inside the repo that ``text`` mentions, in order.
+    ``.opencode/context`` is left out — it has its own priority rules."""
+    resolved_root = root.resolve()
+    seen: list[str] = []
+    for match in _DOC_REF_RE.finditer(text):
+        rel = match.group(1)
+        if rel in seen or rel in (_AGENTS_MD, "CLAUDE.md"):
+            continue
+        path = (root / rel).resolve()
+        if not path.is_file() or not path.is_relative_to(resolved_root):
+            continue
+        if path.is_relative_to((root / _CONTEXT_DIR).resolve()):
+            continue
+        seen.append(rel)
+    return seen
 
 
 def _read(path: Path) -> str:

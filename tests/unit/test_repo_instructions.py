@@ -60,3 +60,22 @@ def test_critical_files_over_budget_become_mandatory_reads(tmp_path: Path) -> No
     assert "C" * 100 not in block
     assert "MUST `Read`" in block
     assert "`.opencode/context/chris-review.md`" in block
+
+
+def test_docs_referenced_from_agents_md_are_inlined(tmp_path: Path) -> None:
+    """rainbow's AGENTS.md says «пересобирают по `docs/branch-rebuild.md`»:
+    a pointer alone left the procedure unread."""
+    _write(
+        tmp_path, "AGENTS.md",
+        "- После ревью ветку пересобирают по `docs/branch-rebuild.md`.\n"
+        "- Нет такого: `docs/missing.md`. Наружу: ../outside.md\n",
+    )
+    _write(tmp_path, "docs/branch-rebuild.md", "REBUILD PROCEDURE\n")
+    _write(tmp_path.parent, "outside.md", "OUTSIDE\n")
+
+    block = render_repo_instructions(tmp_path)
+
+    assert "### `docs/branch-rebuild.md`" in block
+    assert "REBUILD PROCEDURE" in block
+    assert "OUTSIDE" not in block
+    assert "docs/missing.md`\n" not in block.split("### `AGENTS.md`", 1)[0]

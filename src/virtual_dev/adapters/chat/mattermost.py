@@ -421,6 +421,30 @@ class MattermostChat(ChatPort):
 
         return await asyncio.to_thread(_run)
 
+    async def send_file_to_channel(
+        self, channel_id: str, text: str, *, filename: str, content: bytes,
+        thread_root_id: str | None = None,
+    ) -> ChatMessage:
+        def _run() -> ChatMessage:
+            self._ensure_login()
+            uploaded = self._driver.files.upload_file(
+                channel_id=channel_id, files={"files": (filename, content)},
+            )
+            infos = uploaded.get("file_infos") if isinstance(uploaded, dict) else None
+            if not infos:
+                raise RuntimeError(f"upload_file returned unexpected: {uploaded!r}")
+            options: dict[str, Any] = {
+                "channel_id": channel_id,
+                "message": text,
+                "file_ids": [str(info["id"]) for info in infos],
+            }
+            if thread_root_id:
+                options["root_id"] = thread_root_id
+            post = self._driver.posts.create_post(options=options)
+            return self._post_to_message(cast(dict[str, Any], post))
+
+        return await asyncio.to_thread(_run)
+
     async def direct_channel_id(self, user_id: str) -> str | None:
         def _run() -> str | None:
             self._ensure_login()

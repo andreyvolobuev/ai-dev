@@ -8,12 +8,15 @@ tickets and chat threads link to.
 
 from __future__ import annotations
 
-import re
 from typing import Any
-from urllib.parse import urlparse
 
 from claude_agent_sdk import tool
 
+from virtual_dev.application.services.gitlab_links import (
+    note_id_of,
+    render_discussion,
+    resolve_mr_url,
+)
 from virtual_dev.tools import ToolContext
 from virtual_dev.tools._helpers import error_text, text_result
 
@@ -21,32 +24,6 @@ TOOL_GROUP = "shared"
 
 _MAX_DESCRIPTION_CHARS = 4_000
 _MAX_DIFF_CHARS = 16_000
-
-_MR_URL_RE = re.compile(r"^/(?P<project>.+?)/-/merge_requests/(?P<iid>\d+)")
-
-
-def _project_path_of(repo_url: str) -> str:
-    """``git@host:group/proj.git`` / ``https://host/group/proj.git`` →
-    ``group/proj``. Mirrors the GitLab adapter's mapping."""
-    if ":" in repo_url and "@" in repo_url and not repo_url.startswith(("http://", "https://")):
-        path = repo_url.split(":", 1)[1]
-    else:
-        path = urlparse(repo_url).path.lstrip("/")
-    return path.removesuffix(".git")
-
-
-def resolve_mr_url(url: str, repositories: Any) -> tuple[str, int] | None:
-    """Map an MR web URL onto ``(repo_key, iid)`` using the configured
-    repositories. None when the URL isn't an MR link of a known repo."""
-    parsed = urlparse(url)
-    match = _MR_URL_RE.match(parsed.path or "")
-    if not match:
-        return None
-    project = match.group("project").removesuffix(".git")
-    for repo in repositories:
-        if _project_path_of(repo.url) == project:
-            return repo.key, int(match.group("iid"))
-    return None
 
 
 def build(ctx: ToolContext):
@@ -59,8 +36,9 @@ def build(ctx: ToolContext):
         "Read a GitLab merge request through the authenticated API: title, "
         "status, branches, description and the current diff. Pass either "
         "`url` (the MR link, e.g. https://gitlab.../-/merge_requests/869) "
-        "or `repo_key` + `iid`. Use this instead of fetch_url for MR links "
-        "— the web page only serves a login redirect.",
+        "or `repo_key` + `iid`. A link to a comment (`…#note_123`) also "
+        "returns that comment with its discussion. Use this instead of "
+        "fetch_url for MR links — the web page only serves a login redirect.",
         {
             "type": "object",
             "properties": {
@@ -103,6 +81,19 @@ async def run(researcher, args: dict[str, Any]) -> dict[str, Any]:
         diff = await vcs.get_mr_diff(repo_key, iid)
     except Exception as exc:
         return error_text(f"GitLab API error for {repo_key}!{iid}: {exc}")
+    note_section = ""
+    note_id = note_id_of(url) if url else None
+    if note_id:
+        try:
+            comments = await vcs.list_review_comments(repo_key, iid)
+        except Exception as exc:
+            note_section = f"## Linked comment\n(GitLab API error: {exc})\n\n"
+        else:
+            rendered = render_discussion(comments, note_id)
+            note_section = (
+                f"## Linked comment (note {note_id})\n"
+                f"{rendered or '(no such comment on the MR — deleted?)'}\n\n"
+            )
 
     description = (mr.description or "")[:_MAX_DESCRIPTION_CHARS]
     diff_out = diff or "(empty diff)"
@@ -115,6 +106,7 @@ async def run(researcher, args: dict[str, Any]) -> dict[str, Any]:
         f"status={mr.status.value}  author={mr.author_username}  "
         f"{mr.source_branch} → {mr.target_branch}\n"
         f"pipeline={mr.pipeline_status.value}  url: {mr.web_url}\n\n"
+        f"{note_section}"
         f"## Description\n{description or '(empty)'}\n\n"
         f"## Diff\n{diff_out}"
         + ("\n\n(…diff truncated)" if truncated else "")

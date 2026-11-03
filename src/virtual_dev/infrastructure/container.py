@@ -364,6 +364,8 @@ def build_container(config_dir: Path | str = "config") -> Container:
         injection_filter=injection_filter,
         prompts_loader=prompts_loader,
         trace=trace,
+        researcher=researcher,
+        settings=settings,
     )
     task_intake = TaskIntakeAgent(
         code_agent=code_agent,

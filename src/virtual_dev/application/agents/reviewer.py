@@ -29,6 +29,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Literal, Protocol
 
 if TYPE_CHECKING:
+    from virtual_dev.application.agents.dev import DevAgent
     from virtual_dev.application.services.health_tracker import HealthTracker
 
 from loguru import logger
@@ -49,6 +50,14 @@ from virtual_dev.application.services.agent_trace import (
 from virtual_dev.application.services.analyst_session_repo import AnalystSessionRepository
 from virtual_dev.application.services.ci_state import read_ci
 from virtual_dev.application.services.communicator import CommunicatorService
+from virtual_dev.application.services.iteration_report import (
+    iteration_done_ack,
+    iteration_reply,
+    pending_ack_note,
+    record_iteration,
+    render_work_state,
+    run_iteration_with_retry,
+)
 from virtual_dev.domain.models.merge_request import MRStatus, ReviewComment
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
 from virtual_dev.domain.ports.vcs import VcsPort
@@ -112,7 +121,7 @@ class ReviewerAgent:
         # iteration. Both are optional — when None the Reviewer falls
         # back to the previous "observe-only" behaviour.
         responder: object | None = None,   # ThreadResponderAgent (avoid circular import)
-        dev_agents: dict[str, object] | None = None,
+        dev_agents: dict[str, DevAgent] | None = None,
         health: "HealthTracker | None" = None,
         trace: AgentTrace | None = None,
         mr_summarizer: object | None = None,   # MrSummarizer (avoid import cycle)
@@ -368,12 +377,10 @@ class ReviewerAgent:
                 row.repo_key, row.iid,
             )
             return
-        try:
-            text = self._config.notifications.mattermost.thread_reply_iteration_done.format(
-                commit_sha_short=sha[:12], branch=row.source_branch,
-            )
-        except (KeyError, IndexError):
-            text = self._config.notifications.mattermost.thread_reply_iteration_done
+        text = iteration_done_ack(
+            self._config.notifications.mattermost,
+            note=row.iteration_pending_note or "", sha=sha, branch=row.source_branch,
+        )
         await self._communicator.send_channel(channel_id, text, thread_root_id=root_id)
         logger.info(
             "Reviewer: posted MM iteration-done ack for {}!{} sha={}",
@@ -566,6 +573,7 @@ class ReviewerAgent:
             mr_diff=mr_diff,
             mr_source_branch=source_branch,
             mr_target_branch=target_branch,
+            work_state=self._work_state(row),
         )
         logger.info(
             "Reviewer: GitLab comment decision={} reasoning={!r}",
@@ -645,46 +653,36 @@ class ReviewerAgent:
             ):
                 await self._release_comment_claim(row, latest.id)
                 return False
-            try:
-                # The dev gets the responder's distilled instruction, NOT
-                # the raw comment. Seen live (DM-2740): passing latest.body
-                # meant «ping» reached the dev as the whole task («nothing
-                # actionable» → no commit) and «ну и сиди без аппрува,
-                # железяка» became status=failed — while the responder's
-                # detailed iteration_feedback was silently dropped. The
-                # discussion transcript travels along so the dev can
-                # cross-check the paraphrase against the human originals
-                # (mirrors the MM-thread path).
-                result = await dev.handle_iteration(   # type: ignore[union-attr]
-                    tracker="jira",
-                    external_id=row.task_external_id,
-                    branch_name=row.source_branch,
-                    feedback=decision.iteration_feedback or latest.body,
-                    thread=[*transcript, latest_chat],
-                )
-            except Exception:
-                # The ack above already promised action. Retrying (return
-                # False) re-runs the whole LLM iteration every tick and
-                # re-promises with nothing to show — seen live as days of
-                # «коммит будет здесь» with zero commits. Announce the
-                # failure and mark handled; a human ping re-triggers.
-                logger.exception("Reviewer: GitLab iteration crashed")
-                templates = self._config.notifications.mattermost
-                crashed = templates.thread_reply_iteration_crashed
-                if crashed and not await self._post_comment_reply(
-                    row, latest, crashed,
-                ):
-                    logger.warning(
-                        "Reviewer: crash follow-up failed to post for {}!{}",
-                        row.repo_key, row.iid,
-                    )
-                return True
-            if result.commit_sha:
+            # The dev gets the responder's distilled instruction, NOT the
+            # raw comment. Seen live (DM-2740): passing latest.body meant
+            # «ping» reached the dev as the whole task («nothing
+            # actionable» → no commit) and «ну и сиди без аппрува,
+            # железяка» became status=failed — while the responder's
+            # detailed iteration_feedback was silently dropped. The
+            # discussion transcript travels along so the dev can
+            # cross-check the paraphrase against the human originals
+            # (mirrors the MM-thread path). Transient failures are retried
+            # inside; the result is never re-run from here — the ack above
+            # already promised action, and a retry per tick re-promised
+            # for days with nothing to show.
+            assert dev is not None and row.task_external_id is not None
+            external_id = row.task_external_id
+            result = await run_iteration_with_retry(lambda: dev.handle_iteration(
+                tracker="jira",
+                external_id=external_id,
+                branch_name=row.source_branch,
+                feedback=decision.iteration_feedback or latest.body,
+                thread=[*transcript, latest_chat],
+            ))
+            from virtual_dev.application.agents.dev import DevOutcome
+            followup: str | None = None
+            if result.outcome is DevOutcome.MR_OPENED and result.commit_sha:
                 # Mark as pending CI confirmation. The green-CI status ack
                 # always lands in the MM review thread, never as a GitLab
                 # note (GitLab gets only inline replies to review threads).
                 await self._mark_iteration_pending(
                     row.id, sha=result.commit_sha, ack_target="mm",
+                    note=pending_ack_note(result),
                 )
                 stats.gitlab_iterations_dispatched += 1
                 logger.info(
@@ -694,22 +692,10 @@ class ReviewerAgent:
                 )
             else:
                 # The ack above promised action; an iteration that ends
-                # with no commit (nothing to change, merge conflict, model
-                # failure) must say so — silence after «уже делаю» reads
-                # as the bot ghosting the reviewer. Best-effort: a dropped
-                # follow-up is logged, not retried — retrying would re-run
-                # the whole LLM iteration.
-                from virtual_dev.application.agents.dev import DevOutcome
-                templates = self._config.notifications.mattermost
-                if result.outcome == DevOutcome.FAILED:
-                    followup = templates.thread_reply_iteration_crashed
-                elif result.outcome == DevOutcome.METADATA_UPDATED:
-                    # Metadata-only iteration (title/description fixed via
-                    # the VCS API) is a success — ack it as such. There is
-                    # no commit, hence no CI to wait for.
-                    followup = templates.thread_reply_iteration_metadata_only
-                else:
-                    followup = templates.thread_reply_iteration_no_changes
+                # with no pushed commit must say what came of it — silence
+                # after «уже делаю» reads as the bot ghosting the reviewer.
+                # Best-effort: a dropped follow-up is logged, not retried.
+                followup = iteration_reply(result, self._config.notifications.mattermost)
                 if followup and not await self._post_comment_reply(
                     row, latest, followup,
                 ):
@@ -717,6 +703,7 @@ class ReviewerAgent:
                         "Reviewer: no-commit follow-up failed to post "
                         "for {}!{}", row.repo_key, row.iid,
                     )
+            await record_iteration(self._session_factory, row.id, result, posted=followup)
 
         # ITERATE that ran (with or without a commit), or a no-op decision
         # (IGNORE / empty reply_text): nothing failed transiently, so the
@@ -754,8 +741,18 @@ class ReviewerAgent:
             return str(Path(repo_cfg.local_path).expanduser().resolve())
         return None   # Reviewer doesn't have settings; no workspaces_dir fallback
 
+    def _work_state(self, row: MergeRequestRow) -> str:
+        dev = self._dev_agents.get(row.repo_key)
+        return render_work_state(
+            row,
+            in_progress=dev.in_progress(row.source_branch) if dev else None,
+            queued=dev.queued(row.source_branch) if dev else 0,
+            staged_sha=None,
+            timezone_name=self._config.agents.working_hours.timezone,
+        )
+
     async def _mark_iteration_pending(
-        self, row_id: int, *, sha: str, ack_target: str,
+        self, row_id: int, *, sha: str, ack_target: str, note: str = "",
     ) -> None:
         async with session_scope(self._session_factory) as session:
             row = (await session.execute(
@@ -765,6 +762,7 @@ class ReviewerAgent:
                 return
             row.iteration_pending_ci_sha = sha
             row.iteration_ack_target = ack_target
+            row.iteration_pending_note = note or None
 
     async def _notify_ready_for_review(
         self, row: MergeRequestRow, live_title: str,
@@ -1172,6 +1170,7 @@ class ReviewerAgent:
             if clear_iteration_pending:
                 row.iteration_pending_ci_sha = None
                 row.iteration_ack_target = None
+                row.iteration_pending_note = None
 
     async def _persist_final_state(self, row_id: int, new_status: str) -> None:
         async with session_scope(self._session_factory) as session:

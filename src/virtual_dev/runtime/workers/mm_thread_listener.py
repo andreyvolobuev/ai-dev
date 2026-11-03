@@ -40,6 +40,7 @@ from virtual_dev.application.agents import (
     ResponderAction,
     ThreadResponderAgent,
 )
+from virtual_dev.application.agents.dev import staged_branch_for
 from virtual_dev.application.agents.thread_responder import resolve_mr_branches
 from virtual_dev.runtime.workers.analyst_inbox import AnalystInbox
 from virtual_dev.runtime.workers.intake_inbox import TaskIntakeInbox
@@ -49,6 +50,14 @@ from virtual_dev.application.services.ci_state import (
     render_failed_jobs,
 )
 from virtual_dev.application.services.communicator import CommunicatorService
+from virtual_dev.application.services.gitlab_links import read_linked_notes
+from virtual_dev.application.services.iteration_report import (
+    iteration_reply,
+    pending_ack_note,
+    record_iteration,
+    render_work_state,
+    run_iteration_with_retry,
+)
 from virtual_dev.application.services.ticket_reset import reset_ticket_state
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
@@ -640,6 +649,9 @@ class MmThreadListener:
                 self._vcs, row.repo_key, row.iid, log_tail_lines=_CI_LOG_TAIL_LINES,
             )
 
+        linked_notes = await read_linked_notes(
+            self._vcs, self._config.repositories, [event.text],
+        )
         decision = await self._responder.decide(
             mr_title=row.title,
             mr_description=row.description or "",
@@ -652,6 +664,8 @@ class MmThreadListener:
             mr_source_branch=source_branch,
             mr_target_branch=target_branch,
             ci=ci,
+            work_state=await self._work_state(row),
+            linked_notes=linked_notes,
         )
         logger.info(
             "MmThreadListener: decision={} reasoning={!r}",
@@ -696,7 +710,9 @@ class MmThreadListener:
         delivered = True
 
         if decision.action == ResponderAction.REPLY and decision.reply_text:
-            delivered = await self._post_reply(channel_id, root_id, decision.reply_text)
+            delivered = await self._post_reply(
+                channel_id, root_id, decision.reply_text, attachment=decision.attachment,
+            )
             if delivered:
                 self.stats.replies_posted += 1
 
@@ -729,6 +745,11 @@ class MmThreadListener:
             # it's deciding whether to act on the latest message; the dev
             # just needs the conversation as the humans wrote it.
             feedback = decision.iteration_feedback
+            if linked_notes:
+                # The dev sees the thread, where a comment is only a link.
+                feedback += "\n\nКомментарии GitLab по ссылкам из треда:\n" + "\n\n".join(
+                    f"{url}\n{rendered}" for url, rendered in linked_notes
+                )
             if ci is not None and ci.failed_jobs:
                 # The responder sees log tails; the fix needs whole logs.
                 full = await read_ci(
@@ -818,52 +839,37 @@ class MmThreadListener:
             return
 
         tracker = "jira"   # Phase 3.5: single-tracker assumption
-        try:
-            result = await dev.handle_iteration(
-                tracker=tracker,
-                external_id=row.task_external_id,
-                branch_name=row.source_branch,
-                feedback=feedback,
-                thread=thread,
-            )
-        except Exception:
-            logger.exception("MmThreadListener: iteration crashed")
-            await self._post_reply(channel_id, root_id, templates.thread_reply_iteration_crashed)
-            return
+        assert row.task_external_id is not None
+        external_id = row.task_external_id
+        result = await run_iteration_with_retry(lambda: dev.handle_iteration(
+            tracker=tracker,
+            external_id=external_id,
+            branch_name=row.source_branch,
+            feedback=feedback,
+            thread=thread,
+        ))
 
-        if result.commit_sha:
+        posted: str | None = None
+        if result.outcome is DevOutcome.MR_OPENED and result.commit_sha:
             # Silent push. Mark the MR as "iteration pending CI" so the
             # Reviewer poll announces in the thread when CI flips green.
             await self._mark_iteration_pending(
                 row.id, sha=result.commit_sha, reset_autofix=True,
+                note=pending_ack_note(result),
             )
             logger.info(
                 "MmThreadListener: iteration pushed silently {}!{} sha={}, "
                 "thread ack will follow once CI is green",
                 row.repo_key, row.iid, result.commit_sha[:12],
             )
-        elif result.outcome is DevOutcome.FAILED:
-            # The iteration genuinely failed (merge conflict, model
-            # status=failed). Announcing it as "no changes needed" reads
-            # as the ask being satisfied while nothing happened.
-            await self._post_reply(
-                channel_id, root_id, templates.thread_reply_iteration_crashed,
-            )
-        elif result.outcome is DevOutcome.METADATA_UPDATED:
-            # MR title/description fixed via the VCS API — a success with
-            # no commit, hence no CI gate to wait for. Ack immediately.
-            await self._post_reply(
-                channel_id, root_id, templates.thread_reply_iteration_metadata_only,
-            )
         else:
-            # Nothing to push → nothing to wait for. Tell the user we
-            # didn't change anything; no CI gate involved.
-            await self._post_reply(
-                channel_id, root_id, templates.thread_reply_iteration_no_changes,
-            )
+            posted = iteration_reply(result, templates)
+            if posted:
+                await self._post_reply(channel_id, root_id, posted)
+        await record_iteration(self._session_factory, row.id, result, posted=posted)
 
     async def _mark_iteration_pending(
-        self, row_id: int, *, sha: str, reset_autofix: bool,
+        self, row_id: int, *, sha: str, reset_autofix: bool, note: str = "",
     ) -> None:
         async with session_scope(self._session_factory) as session:
             row = (await session.execute(
@@ -873,6 +879,7 @@ class MmThreadListener:
                 return
             row.iteration_pending_ci_sha = sha
             row.iteration_ack_target = "mm"
+            row.iteration_pending_note = note or None
             if reset_autofix:
                 row.pipeline_autofix_attempts = 0
                 row.pipeline_infra_retries = 0
@@ -927,13 +934,38 @@ class MmThreadListener:
                 )
             )
 
-    async def _post_reply(self, channel_id: str, root_id: str, text: str) -> bool:
+    async def _post_reply(
+        self, channel_id: str, root_id: str, text: str,
+        *, attachment: tuple[str, str] | None = None,
+    ) -> bool:
         """Post into the thread; return whether it was actually delivered
-        (False on rate-limit / outside-hours / send error)."""
+        (False on rate-limit / send error). Every post here answers a
+        person who just wrote to the bot, hence reactive."""
         outcome = await self._communicator.send_channel(
-            channel_id, text, thread_root_id=root_id,
+            channel_id, text, thread_root_id=root_id, reactive=True,
+            attachment=(
+                (attachment[0], attachment[1].encode("utf-8")) if attachment else None
+            ),
         )
         return outcome.sent
+
+    async def _work_state(self, row: MergeRequestRow) -> str:
+        dev = self._dev_agents.get(row.repo_key)
+        staged_sha: str | None = None
+        if self._vcs is not None and row.last_iteration_outcome == DevOutcome.STAGED.value:
+            try:
+                staged_sha = await self._vcs.remote_branch_sha(
+                    row.repo_key, staged_branch_for(row.source_branch),
+                )
+            except Exception:
+                logger.exception("MmThreadListener: staged branch lookup failed")
+        return render_work_state(
+            row,
+            in_progress=dev.in_progress(row.source_branch) if dev else None,
+            queued=dev.queued(row.source_branch) if dev else 0,
+            staged_sha=staged_sha,
+            timezone_name=self._config.agents.working_hours.timezone,
+        )
 
     async def _load_mr_by_thread(self, thread_root_id: str) -> MergeRequestRow | None:
         async with self._session_factory() as session:

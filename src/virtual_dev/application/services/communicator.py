@@ -67,6 +67,9 @@ class SendOutcome:
     skip_reason: str | None = None
 
 
+_REACTIVE_RATE_MULTIPLIER = 4
+
+
 @dataclass
 class _RateBucket:
     """Sliding-window rate limiter state for one target (user/channel)."""
@@ -147,17 +150,20 @@ class CommunicatorService:
         *,
         thread_root_id: str | None = None,
         reactive: bool = False,
+        attachment: tuple[str, bytes] | None = None,
     ) -> SendOutcome:
-        """Post to channel (optionally inside a thread).
+        """Post to channel (optionally inside a thread), with an optional
+        ``(filename, content)`` file attached.
 
         ``reactive=True`` — direct response to a human's mention or request.
         Such a response bypasses working-hours gate: the person is waiting now,
-        silence reads as broken. Rate limit still applies.
+        silence reads as broken. It is counted in a separate, wider
+        rate-limit budget than unprompted posts.
         """
         return await self._send(
             "chan", channel_id, text,
             channel_id=channel_id, thread_root_id=thread_root_id,
-            reactive=reactive,
+            reactive=reactive, attachment=attachment,
         )
 
     async def _send(
@@ -169,6 +175,7 @@ class CommunicatorService:
         channel_id: str | None,
         thread_root_id: str | None,
         reactive: bool = False,
+        attachment: tuple[str, bytes] | None = None,
     ) -> SendOutcome:
         if self._chat is None:
             logger.debug("Communicator: chat not configured; skipping {}", kind)
@@ -186,9 +193,14 @@ class CommunicatorService:
             )
             return SendOutcome(sent=False, skip_reason="outside_working_hours")
 
-        bucket = self._buckets.setdefault(
-            f"{kind}:{target_key}", _RateBucket(limit=self._rate_limit)
-        )
+        # A reply to a person who is talking to the bot right now doesn't
+        # draw on the budget for unprompted posts: a busy review thread
+        # spent all 20 in one hour, and the reply with the result was
+        # dropped while the reviewer waited for it (rainbow!1031). Its own,
+        # wider budget still stops a reply loop.
+        bucket_key = f"{kind}:{target_key}:reactive" if reactive else f"{kind}:{target_key}"
+        limit = self._rate_limit * _REACTIVE_RATE_MULTIPLIER if reactive else self._rate_limit
+        bucket = self._buckets.setdefault(bucket_key, _RateBucket(limit=limit))
         if not bucket.try_consume(now):
             logger.warning(
                 "Communicator: rate limit hit for {} {!r} ({}/h); dropping",
@@ -199,6 +211,13 @@ class CommunicatorService:
         try:
             if kind == "dm" and channel_id is None:
                 message = await self._chat.send_direct(target_key, text)
+            elif attachment is not None:
+                assert channel_id is not None
+                filename, content = attachment
+                message = await self._chat.send_file_to_channel(
+                    channel_id, text, filename=filename, content=content,
+                    thread_root_id=thread_root_id,
+                )
             else:
                 assert channel_id is not None
                 message = await self._chat.send_to_channel(

@@ -183,6 +183,44 @@ class VcsPort(ABC):
         pipelines can ignore it."""
         raise NotImplementedError
 
+    async def head_sha(self, repo_key: str) -> str:
+        """SHA of the workspace's current HEAD."""
+        raise NotImplementedError
+
+    async def is_ancestor(self, repo_key: str, ancestor: str, descendant: str = "HEAD") -> bool:
+        """True when ``ancestor`` is in ``descendant``'s history — a push
+        of ``descendant`` over ``ancestor`` is a fast-forward."""
+        return True
+
+    async def base_conflicts(self, repo_key: str, base: str) -> list[str]:
+        """Files that would conflict merging ``origin/<base>`` into HEAD.
+        Non-abstract: fakes without real git see no conflicts."""
+        return []
+
+    async def push_rewritten(self, repo_key: str, branch: str, *, old_sha: str) -> str:
+        """Back up ``old_sha`` on origin and force-push HEAD over it with a
+        lease; return the backup branch name."""
+        raise NotImplementedError
+
+    def commit_identity(self) -> tuple[str, str] | None:
+        """``(name, email)`` the bot's commits are authored by.
+        Non-abstract: fakes without real git have none."""
+        return None
+
+    async def move_branch_to(self, repo_key: str, sha: str) -> None:
+        """Point the checked-out branch at ``sha`` (``reset --hard``): the
+        model built its result somewhere else, e.g. in a worktree."""
+        raise NotImplementedError
+
+    async def remote_branch_sha(self, repo_key: str, branch: str) -> str | None:
+        """Tip of ``origin/<branch>`` right now, or None if it doesn't exist."""
+        return None
+
+    async def push_head_to(self, repo_key: str, branch: str) -> None:
+        """Force-push HEAD to ``origin/<branch>`` — a side branch the bot
+        owns (a staged history waiting for a human's ok)."""
+        raise NotImplementedError
+
     async def play_manual_triggers(self, repo_key: str, iid: int) -> list[str]:
         """Start the manual trigger jobs of the MR's latest pipeline that
         cover the changed code; return the names started.

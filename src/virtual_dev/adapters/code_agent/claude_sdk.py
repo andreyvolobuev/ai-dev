@@ -316,8 +316,12 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
             kwargs["disallowed_tools"] = list(denied_tool_names)
         if self._cli_path:
             kwargs["cli_path"] = self._cli_path
-        if self._env:
-            kwargs["env"] = self._env
+        # Per-run env (extras["env"], e.g. the bot's git identity for the
+        # Dev agent's own commits) layers over the process-wide one.
+        run_env = request.extras.get("env")
+        env = {**self._env, **(run_env if isinstance(run_env, dict) else {})}
+        if env:
+            kwargs["env"] = env
         if stderr_sink is not None:
             # Capture CLI subprocess stderr line-by-line. Surfaced in logs on
             # failure so "Command failed with exit code 1 — check stderr" is

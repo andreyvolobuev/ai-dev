@@ -215,16 +215,23 @@ async def test_reactive_send_ignores_working_hours(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reactive_send_still_respects_rate_limit() -> None:
-    """Bypassing working hours is not indulgence for spam."""
+async def test_reactive_send_has_its_own_wider_budget() -> None:
+    """Replies to people talking to the bot don't draw on the budget for
+    unprompted posts: a busy review thread spent all of it and the reply
+    with the result was dropped (rainbow!1031). Their own, wider budget
+    still stops a reply loop."""
     chat = _RecordingChat()
     svc = CommunicatorService(
         chat, InjectionFilter(), rate_limit_per_hour=1, respect_working_hours=False,
     )
 
-    first = await svc.send_channel("chan-1", "раз", reactive=True)
-    second = await svc.send_channel("chan-1", "два", reactive=True)
+    proactive = await svc.send_channel("chan-1", "пинг")
+    proactive_again = await svc.send_channel("chan-1", "пинг ещё")
+    replies = [
+        await svc.send_channel("chan-1", f"ответ {i}", reactive=True) for i in range(5)
+    ]
 
-    assert first.sent is True
-    assert second.sent is False
-    assert second.skip_reason == "rate_limited"
+    assert proactive.sent is True
+    assert proactive_again.skip_reason == "rate_limited"
+    assert [r.sent for r in replies] == [True, True, True, True, False]
+    assert replies[-1].skip_reason == "rate_limited"
