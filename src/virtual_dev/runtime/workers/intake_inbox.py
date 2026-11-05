@@ -158,7 +158,7 @@ class TaskIntakeInbox:
         summary = _with_summary_prefix(decision.summary, cfg.summary_prefix)
         # Everything after the claim is guarded: a crash that skips
         # _release leaves the post claimed with no ticket, and every
-        # redelivery then reads as a duplicate — ✅, no ticket, no reply.
+        # redelivery then reads as a duplicate — no ticket, no reply.
         try:
             requester = await self._chat.get_user_by_id(event.author_id)
             customer = _requester_label(requester, event.author_id)
@@ -513,7 +513,7 @@ class TaskIntakeInbox:
                 # Only a row for this very post is a duplicate. Any other
                 # IntegrityError (e.g. the id sequence behind the table after
                 # a DB restore) must surface — read as «duplicate» it left
-                # ✅ on the post with no ticket and no reply.
+                # the post with no ticket and no reply.
                 if not await self._claim_exists(event.id):
                     raise
                 logger.info(

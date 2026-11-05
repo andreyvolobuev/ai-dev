@@ -1032,7 +1032,7 @@ async def test_crash_before_jira_reports_and_releases_the_claim(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """A leftover claim made every later delivery a silent «duplicate»:
-    ✅ on the post, no ticket, no word in the thread."""
+    no ticket, no word in the thread."""
     chat = _CrashingChat()
     tracker = _FakeTracker()
     outcome = await _inbox(
@@ -1099,7 +1099,7 @@ async def test_claim_failure_that_is_not_a_duplicate_is_reported(
 ) -> None:
     """09:36 on 2026-11-02: one run, no other claimer, yet the insert hit an
     IntegrityError (id sequence behind the table after a DB restart). It was
-    read as «already claimed» — ✅, no ticket, no word in the thread."""
+    read as «already claimed» — no ticket, no word in the thread."""
     async with session_factory() as session:
         session.add(IntakeRequestRow(
             id=1, source_post_id="other", mm_root_id="other",

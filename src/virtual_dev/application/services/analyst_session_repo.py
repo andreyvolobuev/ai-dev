@@ -409,6 +409,16 @@ class AnalystSessionRepository:
         return [_row_to_step(r) for r in rows]
 
     # ---------------------------------------------------------------- fragments
+    async def fragment_exists(self, mm_post_id: str) -> bool:
+        """Is this post already stored as a fragment of any task?"""
+        async with self._session_factory() as session:
+            row = (await session.execute(
+                select(AnalystConversationFragmentRow.id)
+                .where(AnalystConversationFragmentRow.mm_post_id == mm_post_id)
+                .limit(1)
+            )).first()
+        return row is not None
+
     async def append_fragment(
         self,
         *,

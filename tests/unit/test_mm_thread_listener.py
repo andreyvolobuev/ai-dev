@@ -228,8 +228,8 @@ async def test_routes_reply_to_responder_and_posts_in_thread(
         body == "Вот как это работает: …" and root == "root-1"
         for _, body, root in chat.sent
     )
-    # ✅ reaction set.
-    assert ("post-a", _PROCESSED_REACTION) in chat.reactions
+    # Nothing marks the post: the reply itself is the signal.
+    assert chat.reactions == []
     # Dev NOT called (it was a reply, not iterate).
     assert dev.calls == []
 
@@ -289,8 +289,7 @@ async def test_iterate_triggers_dev_and_reports_back(
         )).scalar_one()
         assert row.iteration_pending_ci_sha == "deadbeef0000deadbeef"
         assert row.pipeline_autofix_attempts == 0   # reset by user-driven iter
-    # ✅ reaction set on the source comment.
-    assert ("post-b", _PROCESSED_REACTION) in chat.reactions
+    assert chat.reactions == []
 
 
 @pytest.mark.asyncio
@@ -381,10 +380,9 @@ async def test_iterate_failed_posts_the_blocker(
 async def test_skips_post_already_claimed_in_db(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """A post claimed in ``processed_thread_posts`` is skipped even when
-    the ✅-reaction is missing (add_reaction failed on a deleted post, or
-    another instance answered but its reaction hasn't propagated). Seen
-    live: catch-up re-ran the LLM on such posts every sweep."""
+    """A post claimed in ``processed_thread_posts`` is skipped. Seen live
+    before the claim existed: catch-up re-ran the LLM on such posts every
+    sweep."""
     await _insert_mr(session_factory, root_id="root-c1")
     event = _human_post(id="post-c1", thread_root_id="root-c1", text="вопрос по коду")
     chat = _ScriptedChat([event])
@@ -411,22 +409,17 @@ async def test_skips_post_already_claimed_in_db(
 
 
 @pytest.mark.asyncio
-async def test_reaction_failure_does_not_cause_duplicate_reply(
+async def test_replay_does_not_cause_duplicate_reply(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The ✅-reaction is only a fast-path marker. When it never sticks
-    (MM error, post deleted right after), a replay of the same post must
-    not produce a second LLM run or a second thread reply — the DB claim
-    is the authority."""
+    """A replay of the same post must not produce a second LLM run or a
+    second thread reply — the DB claim is the only marker, the post itself
+    carries none."""
     await _insert_mr(session_factory, root_id="root-c2")
     event = _human_post(id="post-c2", thread_root_id="root-c2", text="как это работает?")
 
-    class _NoReactionChat(_ScriptedChat):
-        async def add_reaction(self, post_id: str, emoji_name: str) -> None:
-            raise RuntimeError("MM flaked")
-
     # The same post delivered twice (WS + catch-up replay).
-    chat = _NoReactionChat([event, event])
+    chat = _ScriptedChat([event, event])
     responder = _ScriptedResponder([
         ResponderDecision(
             action=ResponderAction.REPLY, reply_text="Отвечаю.", reasoning="q",
@@ -533,35 +526,6 @@ async def test_skips_post_deleted_before_dispatch(
 
 
 @pytest.mark.asyncio
-async def test_skips_already_reacted_post(
-    session_factory: async_sessionmaker[AsyncSession],
-) -> None:
-    await _insert_mr(session_factory, root_id="root-3")
-    event = _human_post(id="post-c", thread_root_id="root-3", text="?")
-    chat = _ScriptedChat([event])
-    # Pre-seed the bot reaction — listener must treat this as already-handled.
-    chat._bot_reactions["post-c"] = [_PROCESSED_REACTION]
-    responder = _ScriptedResponder([])    # should NOT be called
-    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
-    dev = _ScriptedDev(DevResult(outcome=DevOutcome.NO_CHANGES))
-    listener = MmThreadListener(
-        chat=chat, communicator=communicator,
-        responder=responder,   # type: ignore[arg-type]
-        dev_agents={"bellingshausen": dev},   # type: ignore[dict-item]
-        session_factory=session_factory,
-        config=_test_config(), settings=Settings(),
-    )
-
-    task = asyncio.create_task(listener.run_forever())
-    await asyncio.sleep(0.1)
-    await listener.stop()
-    await asyncio.wait_for(task, timeout=2)
-
-    assert responder.calls == 0
-    assert chat.sent == []
-
-
-@pytest.mark.asyncio
 async def test_skips_posts_without_thread_root(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -608,11 +572,12 @@ async def test_iterate_forwards_full_thread_transcript_to_dev(
                     text="actually let's call it baz", author="bob"),
     ]
     chat = _ScriptedChat(events)
-    # post-1 is prior history (already handled by the bot — pre-react ✅
+    # post-1 is prior history (already handled by the bot — pre-claimed
     # so the listener skips it on dispatch). post-2 is the new reply
     # that should drive the iteration. Both stay in the transcript that
     # ``read_thread`` returns.
-    chat._bot_reactions["post-1"] = [_PROCESSED_REACTION]
+    async with session_scope(session_factory) as session:
+        session.add(ProcessedThreadPostRow(post_id="post-1"))
     responder = _ScriptedResponder([ResponderDecision(
         action=ResponderAction.ITERATE,
         reply_text="Принято.",
@@ -656,9 +621,9 @@ async def test_concurrent_dispatch_of_same_post_is_processed_once(
     paths race on it.
 
     In production both the WebSocket listener and the 60s catch-up poller
-    call ``_dispatch``. The ✅ idempotency reaction is only added AFTER the
-    (multi-second) ``responder.decide`` + post, so without an in-flight
-    guard both dispatches pass the early ✅-check, both call the LLM, and
+    call ``_dispatch``. The DB claim is only taken AFTER the (multi-second)
+    ``responder.decide``, so without an in-flight guard both dispatches
+    pass the early claim check, both call the LLM, and
     the bot posts two *divergent* replies to a single human message —
     observed live as an offer ("if you want, I'll fix it — just say")
     immediately followed by a phantom "good catch, I'll fix it" with no
@@ -672,7 +637,7 @@ async def test_concurrent_dispatch_of_same_post_is_processed_once(
     chat = _ScriptedChat([event])
 
     # Responder that blocks inside decide() until released — this holds
-    # both racing dispatches open across the ✅-check→✅-set window, the
+    # both racing dispatches open across the check→claim window, the
     # exact condition the WS/catch-up overlap creates in production.
     release = asyncio.Event()
 
@@ -771,8 +736,7 @@ async def test_propose_alternative_posts_text_without_iterating(
     # Listener tracked it under a dedicated counter (separate from
     # plain ``replies_posted`` so we can measure push-back rate).
     assert listener.stats.alternatives_proposed == 1
-    # ✅ marker still set so we don't reprocess the source post.
-    assert ("post-alt", _PROCESSED_REACTION) in chat.reactions
+    assert chat.reactions == []
 
 
 @pytest.mark.asyncio
@@ -819,8 +783,9 @@ async def test_iterate_ack_failure_leaves_post_unmarked(
     await listener.stop()
     await asyncio.wait_for(task, timeout=2)
 
-    # Ack never reached the thread → no ✅, and no iteration we can't announce.
-    assert ("post-ackfail", _PROCESSED_REACTION) not in chat.reactions
+    # Ack never reached the thread → claim released, no iteration we can't
+    # announce.
+    assert not await listener._post_already_claimed("post-ackfail")
     assert dev.calls == []
 
 

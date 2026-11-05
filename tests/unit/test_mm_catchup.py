@@ -310,6 +310,52 @@ async def test_catchup_idempotent_on_replayed_fragment(
 
 
 @pytest.mark.asyncio
+async def test_catchup_does_not_hand_a_consumed_answer_to_the_next_task(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Posts carry no marker, so the replay is stopped by the stored fragment.
+    A plain DM routes by channel+author: without that check Alice's answer
+    to DM-1 would land in whatever ticket waits for her next. DM-2 was
+    discovered first and asks only now, so its cursor predates the answer."""
+    first = await _seed_task_awaiting(session_factory)
+    repo = AnalystSessionRepository(session_factory)
+    answer = ChatMessage(
+        id="consumed-1", channel_id="dm-uid-alice", author_id="uid-alice",
+        text="ответ на первый тикет",
+        timestamp=datetime.now(timezone.utc),
+        thread_root_id="", trusted=False,
+    )
+    await repo.append_fragment(
+        task_id=first.id, mm_post_id=answer.id, asked_post_id=None,
+        text=answer.text, received_at=answer.timestamp,
+    )
+    await repo.mark_fragments_flushed(first.id)
+    async with session_scope(session_factory) as session:
+        (await session.get(TaskRow, first.id)).awaiting_channel_id = None
+        second = TaskRow(
+            tracker="jira", external_id="DM-2",
+            title="t2", description="",
+            url="", priority="medium", external_status="To Do",
+            internal_status=TaskStatus.PLANNING.value,
+            awaiting_post_id="bot-post-q2",
+            awaiting_user_id="uid-alice",
+            awaiting_username="alice",
+            awaiting_channel_id="dm-uid-alice",
+            coalesce_window_seconds=600,
+            discovered_at=answer.timestamp - timedelta(hours=1),
+        )
+        session.add(second)
+        await session.flush()
+        second_id = second.id
+    chat = _CatchupChat(catchup_posts={"dm-uid-alice": [answer]})
+    listener = _listener(session_factory, chat, _make_inbox(session_factory, chat))
+
+    await listener.catch_up()
+
+    assert await repo.list_unflushed_fragments(second_id) == []
+
+
+@pytest.mark.asyncio
 async def test_catchup_skips_bot_authored_posts(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

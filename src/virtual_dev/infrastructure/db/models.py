@@ -417,9 +417,10 @@ class ProcessedThreadPostRow(Base):
 
     One row per Mattermost post the bot has responded to (including
     IGNORE decisions — "responded" means the decision was delivered).
-    The ✅-reaction on the post stays as the human-visible fast-path
-    marker, but it proved insufficient live (DM-2740): it is set only
-    after the multi-second responder run, it never sticks on posts the
+    Nothing marks the post in Mattermost: this table is the only record,
+    so reviewers' threads stay free of bot reactions. It replaced the
+    ✅-reaction, which proved insufficient live (DM-2740): that was set
+    only after the multi-second responder run, never stuck on posts the
     author deleted, and two instances (rolling deploy, stale pod) can't
     see each other's in-memory state — the same post got two replies.
 

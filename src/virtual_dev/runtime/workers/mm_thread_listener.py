@@ -190,7 +190,7 @@ class MmThreadListener:
         self._sub_max_backoff = subscription_max_backoff
         # Post ids currently being dispatched. Guards against the WS
         # listener and the catch-up poller processing the same post
-        # concurrently (the ✅-reaction marker is only set after the slow
+        # concurrently (the DB claim is only taken after the slow
         # responder.decide(), so it can't close that window on its own).
         self._inflight_posts: set[str] = set()
         self.stats = MmListenerStats()
@@ -313,8 +313,8 @@ class MmThreadListener:
 
         * Clarification fragments: ``UNIQUE(mm_post_id)`` on
           ``question_fragments`` collapses duplicates.
-        * Review thread comments: ``_dispatch`` checks the bot's
-          ✅-reaction before doing anything.
+        * Review thread comments: ``processed_thread_posts`` holds a
+          claim for every post the bot already handled.
 
         This makes the WebSocket subscription a *latency optimisation*
         rather than a correctness requirement — even if the WS dies for
@@ -438,8 +438,8 @@ class MmThreadListener:
                 out[ch] = anchor
 
         # Channels where someone recently asked for a ticket. Idempotency
-        # for the replay: the ✅-reaction guard plus the DB claim in
-        # _handle_intake, and the UNIQUE source_post_id in the inbox.
+        # for the replay: the DB claim in _handle_intake and the UNIQUE
+        # source_post_id in the inbox.
         for channel_id in intake_channels:
             if not channel_id:
                 continue
@@ -469,8 +469,8 @@ class MmThreadListener:
 
         # Idempotency across concurrent delivery paths. The WS listener
         # and the catch-up poller can hand us the SAME post at the same
-        # time; the ✅-reaction guard inside _dispatch_inner is only set
-        # AFTER the multi-second responder.decide(), so on its own it
+        # time; the DB claim inside _dispatch_inner is only taken AFTER
+        # the multi-second responder.decide(), so on its own it
         # leaves a window where both dispatches run the LLM and the bot
         # posts two divergent replies to one message. The claim below is
         # synchronous (no await between the membership test and add), so
@@ -586,7 +586,7 @@ class MmThreadListener:
         # way there is nothing safe to answer. Seen live: a reviewer
         # deleted+reposted a message; the stale event still ran the LLM
         # and the reply landed under a post that no longer existed. A
-        # transient fetch error self-heals: the post stays unreacted and
+        # transient fetch error self-heals: the post stays unclaimed and
         # the catch-up sweep retries it.
         fresh_post = await self._chat.get_post(event.id)
         if fresh_post is None:
@@ -596,18 +596,10 @@ class MmThreadListener:
             )
             return
 
-        # Idempotency fast-path: skip if we already reacted ✅.
-        if _PROCESSED_REACTION in fresh_post.bot_reactions:
-            logger.debug(
-                "MmThreadListener: skipping already-processed post {}", event.id,
-            )
-            return
-
-        # Idempotency authority: the DB claim. Covers what the reaction
-        # can't — add_reaction failed after delivery (post deleted, MM
-        # error), or another instance answered and its reaction hasn't
-        # landed yet. Without this, every catch-up sweep re-ran the LLM
-        # on such posts and could post a second reply.
+        # Idempotency: the DB claim. No marker on the post itself — a ✅ on
+        # every message in the thread was just noise for the people there.
+        # Without this check, every catch-up sweep would re-run the LLM on
+        # handled posts and could post a second reply.
         if await self._post_already_claimed(event.id):
             logger.debug(
                 "MmThreadListener: post {} already claimed in DB, skipping",
@@ -678,9 +670,9 @@ class MmThreadListener:
         if decision.action in (
             ResponderAction.REPLY, ResponderAction.PROPOSE_ALTERNATIVE,
         ) and not decision.reply_text:
-            # Model glitch: reply-class decision with no text. Marking the
-            # post ✅ (or claiming it) would silently ghost the human —
-            # leave it untouched so the catch-up sweep retries the decision.
+            # Model glitch: reply-class decision with no text. Claiming the
+            # post would silently ghost the human — leave it untouched so
+            # the catch-up sweep retries the decision.
             logger.warning(
                 "MmThreadListener: {} decision without reply_text on post {} — "
                 "leaving unprocessed for retry",
@@ -694,7 +686,7 @@ class MmThreadListener:
         # already delivering a response to this post — do nothing.
         # Claiming after decide() keeps the crash window tiny without
         # ghosting: a process that dies before the claim leaves the post
-        # unclaimed and unreacted, so catch-up retries it.
+        # unclaimed, so catch-up retries it.
         if not await self._claim_post(event.id):
             logger.info(
                 "MmThreadListener: post {} claimed by another instance/tick — "
@@ -702,11 +694,9 @@ class MmThreadListener:
             )
             return
 
-        # A post is only marked ✅-processed once we've actually delivered
-        # our response. IGNORE has nothing to send, so it counts as
-        # delivered; a dropped reply releases the claim and leaves the
-        # post unreacted so the catch-up sweep retries it rather than
-        # silently swallowing it.
+        # IGNORE has nothing to send, so it counts as delivered; a dropped
+        # reply releases the claim so the catch-up sweep retries it rather
+        # than silently swallowing it.
         delivered = True
 
         if decision.action == ResponderAction.REPLY and decision.reply_text:
@@ -762,16 +752,8 @@ class MmThreadListener:
             )
             self.stats.iterations_dispatched += 1
 
-        # React ✅ only when the response was delivered (or nothing needed
-        # sending) — a dropped reply releases the claim and stays
-        # unreacted so catch-up retries.
         if not delivered:
             await self._release_post_claim(event.id)
-            return
-        try:
-            await self._chat.add_reaction(event.id, _PROCESSED_REACTION)
-        except Exception:
-            logger.warning("MmThreadListener: add_reaction failed for post {}", event.id)
 
     async def _handle_task_fragment(
         self, task_row: TaskRow, event: ChatMessage,
@@ -780,15 +762,16 @@ class MmThreadListener:
 
         Phase 5.0: don't classify here. The AnswerCoalescer merges
         fragments after the idle window and re-runs the analyst.
-        Idempotency:
-        * Bot's ✅-reaction acts as a fast no-op for replays.
-        * ``analyst_conversation_fragments`` UNIQUE(task_id, mm_post_id)
-          makes a duplicate WS-delivery a silent no-op.
+        Idempotency: a post stored as a fragment of ANY task is done. The
+        UNIQUE(task_id, mm_post_id) alone is not enough: the catch-up sweep
+        replays old posts, and a plain DM answer routes by channel+author —
+        to whichever task awaits that person NOW, so an already-consumed
+        answer would land in the next ticket. A replay must not revive a
+        stuck task either.
         """
         assert self._analyst_inbox is not None
 
-        fresh_post = await self._chat.get_post(event.id)
-        if fresh_post is not None and _PROCESSED_REACTION in fresh_post.bot_reactions:
+        if await self._analyst_inbox.fragment_known(event.id):
             logger.debug(
                 "MmThreadListener: fragment {} already processed", event.id,
             )
@@ -802,8 +785,6 @@ class MmThreadListener:
                 task_row.id,
             )
             return
-        # No ✅-reaction here — that goes on the LAST fragment when
-        # the coalescer flushes (see AnalystInbox._coalesce_and_resume).
 
     async def _run_iteration(
         self,
@@ -1016,8 +997,7 @@ class MmThreadListener:
         return False
 
     async def _handle_intake(self, event: ChatMessage) -> bool:
-        """Hand the ask to intake, keeping the existing idempotency: the
-        check-mark reaction is the fast marker, the DB claim is the truth.
+        """Hand the ask to intake; the DB claim keeps it idempotent.
 
         Returns False when the post must stay available to the routes
         below (a declined ask the analyst is waiting for); True when
@@ -1029,11 +1009,6 @@ class MmThreadListener:
             logger.info(
                 "MmThreadListener: intake post {} unfetchable (deleted?) — skipping",
                 event.id,
-            )
-            return True
-        if _PROCESSED_REACTION in fresh_post.bot_reactions:
-            logger.debug(
-                "MmThreadListener: intake post {} already processed", event.id,
             )
             return True
         if not await self._claim_post(event.id):
@@ -1103,8 +1078,8 @@ class MmThreadListener:
             # channel where any ticket was filed in the last 24h gets the
             # `now - 24h` intake cursor, and _gather_channel_cursors takes
             # the minimum per channel, so that cursor overrides the
-            # analyst's last_fragment_at one. An unclaimed, un-reacted
-            # post was therefore re-pulled by every catch-up tick: the
+            # analyst's last_fragment_at one. An unclaimed post was
+            # therefore re-pulled by every catch-up tick: the
             # intake agent re-ran and posted another "busy" roughly once a
             # minute for the whole coalescer window.
             logger.info(
@@ -1116,7 +1091,7 @@ class MmThreadListener:
 
         if not outcome.reply_sent and outcome.action in ("failed", "busy"):
             # Same contract as the responder path: a dropped reply releases
-            # the claim and leaves the post unreacted so catch-up retries.
+            # the claim so catch-up retries.
             # Nothing was created, so a retry is safe and is the only way
             # the person hears back.
             logger.warning(
@@ -1128,20 +1103,13 @@ class MmThreadListener:
             return True
         if not outcome.reply_sent and outcome.action in ("created", "updated"):
             # The ticket already exists in Jira; a retry would hit the inbox
-            # duplicate guard and post nothing anyway. Keep claim and mark.
+            # duplicate guard and post nothing anyway. Keep the claim.
             logger.warning(
                 "MmThreadListener: intake {} {} for post {} but the reply "
                 "never landed",
                 outcome.action, outcome.issue_key, event.id,
             )
 
-        try:
-            await self._chat.add_reaction(event.id, _PROCESSED_REACTION)
-        except Exception:
-            logger.warning(
-                "MmThreadListener: add_reaction failed for intake post {}",
-                event.id,
-            )
         return True
 
     async def _analyst_awaits_post(self, event: ChatMessage) -> bool:

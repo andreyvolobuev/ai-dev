@@ -489,15 +489,15 @@ async def test_late_fragment_during_flush_is_not_lost(
 
     await inbox.append_fragment(task_row.id, _reply("reply-1", "first half"))
 
-    # Simulate the race: the ✅-reaction network call is when the user's
-    # second message arrives.
-    original_add_reaction = chat.add_reaction
+    # Simulate the race: the user's second message arrives right after the
+    # first batch is marked flushed, before awaiting is cleared.
+    original_mark_flushed = inbox._sessions.mark_fragments_flushed
 
-    async def _racy_add_reaction(post_id: str, emoji_name: str) -> None:
+    async def _racy_mark_flushed(*args: object, **kwargs: object) -> None:
+        await original_mark_flushed(*args, **kwargs)  # type: ignore[arg-type]
         await inbox.append_fragment(task_row.id, _reply("reply-2", "second half"))
-        await original_add_reaction(post_id, emoji_name)
 
-    chat.add_reaction = _racy_add_reaction  # type: ignore[method-assign]
+    inbox._sessions.mark_fragments_flushed = _racy_mark_flushed  # type: ignore[method-assign]
 
     async with session_scope(session_factory) as session:
         row = (await session.execute(
@@ -516,7 +516,7 @@ async def test_late_fragment_during_flush_is_not_lost(
         assert row.awaiting_post_id == "post-1"
 
     # Next tick: window past again → late fragment coalesces, analyst runs.
-    chat.add_reaction = original_add_reaction  # type: ignore[method-assign]
+    inbox._sessions.mark_fragments_flushed = original_mark_flushed  # type: ignore[method-assign]
     async with session_scope(session_factory) as session:
         row = (await session.execute(
             select(TaskRow).where(TaskRow.id == task_row.id)

@@ -215,6 +215,9 @@ class AnalystInbox:
             mm_channel_id, mm_user_id,
         )
 
+    async def fragment_known(self, mm_post_id: str) -> bool:
+        return await self._sessions.fragment_exists(mm_post_id)
+
     async def append_fragment(
         self, task_id: int, mm_post: ChatMessage,
     ) -> bool:
@@ -370,9 +373,6 @@ class AnalystInbox:
         await self._sessions.mark_fragments_flushed(
             task_row.id, [f.id for f in fragments],
         )
-        last_post_id = fragments[-1].mm_post_id
-        if last_post_id:
-            await self._communicator.add_reaction(last_post_id, "white_check_mark")
         if not await self._sessions.clear_awaiting(task_row.id):
             # A fragment landed after our snapshot (user typed one more
             # message during the flush). Awaiting stays armed, so the next

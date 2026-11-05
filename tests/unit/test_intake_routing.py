@@ -36,7 +36,6 @@ from virtual_dev.infrastructure.db import (
 )
 from virtual_dev.runtime.workers.intake_inbox import IntakeOutcome
 from virtual_dev.runtime.workers.mm_thread_listener import (
-    _PROCESSED_REACTION,
     _WORKING_REACTION,
     MmThreadListener,
 )
@@ -137,6 +136,9 @@ class _AnalystStub:
     ) -> object | None:
         return self._by_channel
 
+    async def fragment_known(self, mm_post_id: str) -> bool:
+        return mm_post_id in self.fragments
+
     async def append_fragment(self, task_id: int, event: ChatMessage) -> None:
         self.fragments.append(event.id)
 
@@ -210,7 +212,7 @@ async def test_mention_in_root_post_reaches_intake(
     )._dispatch(event)
 
     assert [e.id for e in intake.calls] == ["p-1"]
-    assert (("p-1", _PROCESSED_REACTION)) in chat.added_reactions
+    assert chat.added_reactions == []
 
 
 async def test_mention_in_thread_reaches_intake(
@@ -280,15 +282,15 @@ async def test_mention_in_review_thread_goes_to_responder(
 async def test_already_processed_post_is_not_reprocessed(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """✅ от бота = уже обработано (catch-up sweep приносит те же посты)."""
-    chat = _Chat(reactions={"p-5": [_PROCESSED_REACTION]})
+    """Claim в БД = уже обработано (catch-up sweep приносит те же посты)."""
+    chat = _Chat()
     event = _post("p-5", "@aida заведи задачу")
     chat.posts["p-5"] = event
     intake = _IntakeStub()
+    listener = _listener(chat=chat, session_factory=session_factory, intake=intake)
+    assert await listener._claim_post("p-5")
 
-    await _listener(
-        chat=chat, session_factory=session_factory, intake=intake,
-    )._dispatch(event)
+    await listener._dispatch(event)
 
     assert intake.calls == []
 
@@ -425,7 +427,6 @@ async def test_created_with_undelivered_reply_keeps_claim_and_reaction(
 
     await listener._dispatch(event)
 
-    assert ("p-13", _PROCESSED_REACTION) in chat.added_reactions
     assert await listener._post_already_claimed("p-13")
 
 
@@ -449,8 +450,7 @@ async def test_busy_falls_through_to_the_analyst_that_awaits_this_post(
 
     assert [e.id for e in intake.calls] == ["p-14"]
     assert analyst.fragments == ["p-14"]
-    # Без ✅: для живых маршрутов ниже пост не помечен обработанным.
-    # Claim при этом остаётся: он управляет только повторной доставкой,
+    # Claim остаётся: он управляет только повторной доставкой,
     # которая уже не нужна (см. тест на цикл дублей ниже).
     assert chat.added_reactions == []
     assert await listener._post_already_claimed("p-14")
@@ -485,7 +485,7 @@ async def test_busy_in_the_analyst_question_thread_also_falls_through(
 async def test_busy_without_a_waiting_analyst_task_is_still_final(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Обычный «занята»: пост обработан, ✅ стоит, claim держится — иначе
+    """Обычный «занята»: пост обработан, claim держится — иначе
     catch-up принёс бы пост снова и бот отказал бы второй раз."""
     chat = _Chat()
     event = _post("p-16", "@aida что думаешь про парсер?")
@@ -500,7 +500,6 @@ async def test_busy_without_a_waiting_analyst_task_is_still_final(
 
     assert [e.id for e in intake.calls] == ["p-16"]
     assert analyst.fragments == []
-    assert ("p-16", _PROCESSED_REACTION) in chat.added_reactions
     assert await listener._post_already_claimed("p-16")
 
 
@@ -515,7 +514,6 @@ async def test_busy_with_no_analyst_inbox_at_all_is_still_final(
 
     await listener._dispatch(event)
 
-    assert ("p-17", _PROCESSED_REACTION) in chat.added_reactions
     assert await listener._post_already_claimed("p-17")
 
 
@@ -637,8 +635,7 @@ async def test_loading_is_set_after_the_claim_and_removed_on_each_exit(
     # Already on the post while intake runs, gone once the handler is done.
     assert intake.events_seen == [("add", "p-30", _WORKING_REACTION)]
     assert _working_events(chat) == _loading("p-30")
-    assert ("p-30", _PROCESSED_REACTION) in chat.added_reactions
-    # The check mark lands before the spinner is taken off.
+    # The spinner is all the post ever carries: nothing stays behind.
     assert chat.events[-1] == ("remove", "p-30", _WORKING_REACTION)
     assert await listener._post_already_claimed("p-30")
 
@@ -725,5 +722,4 @@ async def test_a_failing_removal_does_not_break_the_check_mark(
 
     await listener._dispatch(event)
 
-    assert ("p-35", _PROCESSED_REACTION) in chat.added_reactions
     assert await listener._post_already_claimed("p-35")
