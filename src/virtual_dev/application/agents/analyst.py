@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from claude_agent_sdk.types import McpSdkServerConfig  # type: ignore[attr-defined]
+from claude_agent_sdk.types import McpServerConfig
 from loguru import logger
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -64,6 +64,8 @@ from virtual_dev.infrastructure.db.mappers import plan_to_row
 from virtual_dev.tools import (
     ToolContext,
     build_tool_servers,
+    merge_professor_mcp,
+    professor_catalog_extra,
     render_tools_catalog,
 )
 
@@ -214,12 +216,16 @@ class AnalystAgent:
         mcp_servers, allowed, groups = self._build_mcp(
             effects, submit_capture, run_state,
         )
+        extras = [
+            "**Filesystem builtins** (no MCP layer): `Read`, `Glob`, "
+            "`Grep` work directly on the target-repo working tree."
+        ]
+        wiki_catalog = professor_catalog_extra(self._settings)
+        if wiki_catalog:
+            extras.append(wiki_catalog)
         tools_catalog = render_tools_catalog(
             groups,
-            extra_builtins=(
-                "**Filesystem builtins** (no MCP layer): `Read`, `Glob`, "
-                "`Grep` work directly on the target-repo working tree."
-            ),
+            extra_builtins="\n\n".join(extras),
         )
 
         system_prompt = self._prompts.render(
@@ -660,7 +666,7 @@ class AnalystAgent:
         effects: list[AnalystEffect],
         submit_capture: dict[str, Any],
         run_state: dict[str, Any],
-    ) -> tuple[dict[str, McpSdkServerConfig], list[str], dict[str, list[Any]]]:
+    ) -> tuple[dict[str, McpServerConfig], list[str], dict[str, list[Any]]]:
         ctx = ToolContext(
             communicator=self._communicator,
             researcher=self._researcher,
@@ -678,6 +684,9 @@ class AnalystAgent:
         servers, allowed, groups = build_tool_servers(
             ctx, only_groups={"analyst", "shared"},
         )
+        # Optional remote LLM-Wiki surface. Disabled unless
+        # PROFESSOR_MCP_URL + PROFESSOR_MCP_TOKEN are both configured.
+        servers, allowed = merge_professor_mcp(self._settings, servers, allowed)
         # Filesystem builtins still come from the SDK, not from tools/.
         allowed.extend(["Read", "Glob", "Grep"])
         return servers, allowed, groups

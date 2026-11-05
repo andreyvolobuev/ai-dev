@@ -51,6 +51,7 @@ _SECRET_FIELDS: tuple[str, ...] = (
     "mattermost_token",
     "confluence_token",
     "admin_token",
+    "professor_mcp_token",
 )
 
 

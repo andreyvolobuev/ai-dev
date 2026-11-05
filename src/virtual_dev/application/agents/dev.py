@@ -64,11 +64,16 @@ from virtual_dev.domain.ports.code_agent import (
     CodeAgentRequest,
     CodeAgentResult,
 )
+from virtual_dev.domain.ports.professor_wiki import (
+    MANDATORY_REVIEW_TOPIC,
+    ProfessorWikiPort,
+)
 from virtual_dev.domain.ports.vcs import VcsPort
 from virtual_dev.infrastructure.config import AppConfig, Settings
 from virtual_dev.infrastructure.db import MergeRequestRow, PlanRow, TaskRow
 from virtual_dev.infrastructure.db.base import session_scope
 from virtual_dev.infrastructure.db.mappers import row_to_plan
+from virtual_dev.tools import merge_professor_mcp, professor_catalog_extra
 
 _SLUG_SAFE_RE = re.compile(r"[^a-z0-9]+")
 
@@ -288,6 +293,7 @@ class DevAgent:
         researcher: ResearcherToolkit | None = None,
         max_turns: int | None = None,
         trace: "AgentTrace | None" = None,
+        wiki: ProfessorWikiPort | None = None,
     ) -> None:
         self._agent_key = agent_key
         self._repo_key = repo_key
@@ -301,6 +307,7 @@ class DevAgent:
         self._config = config
         self._settings = settings
         self._trace = trace
+        self._wiki = wiki
         self._max_turns = max_turns or _dev_max_turns(config) or 30
         # One workspace per repo — but three independent callers (Reviewer
         # iterate, DevOps auto-fix, MM thread listener) can all reach this
@@ -346,6 +353,12 @@ class DevAgent:
         assert task_row is not None and plan_row is not None
         plan = row_to_plan(plan_row)
 
+        # Mandatory wiki preflight — BEFORE any side effects: if the team
+        # knowledge base is unreachable, the run must not start (no clone,
+        # no CODING flip). WikiUnavailableError propagates so the caller
+        # does NOT ack and the bus redelivers once the wiki recovers.
+        wiki_block = await self._mandatory_wiki_block()
+
         # Prepare workspace — clone + fresh task branch off default.
         # A VcsError here is USUALLY permanent (dirty working tree,
         # non-git local_path, missing repo config): flip to FAILED and
@@ -378,6 +391,7 @@ class DevAgent:
 
         request = self._build_request(
             plan=plan, task_row=task_row, workspace_path=workspace_path,
+            wiki_block=wiki_block,
         )
         try:
             captured, result = await self._call_model(request)
@@ -601,6 +615,10 @@ class DevAgent:
             return DevResult(outcome=DevOutcome.FAILED)
         plan = row_to_plan(plan_row)
 
+        # Mandatory wiki preflight before ANY side effects — same contract
+        # as the initial run: outage ⇒ raise, no ack, bus redelivers.
+        wiki_block = await self._mandatory_wiki_block()
+
         workspace_path = await self._vcs.ensure_clone(self._repo_key)
         await self._vcs.checkout_existing_branch(self._repo_key, branch_name)
         old_head = await self._vcs.head_sha(self._repo_key)
@@ -619,6 +637,7 @@ class DevAgent:
             feedback_kind=feedback_kind, thread=thread,
             base_conflicts=conflicts,
             staged=(staged_branch, staged_sha) if staged_sha else None,
+            wiki_block=wiki_block,
         )
         try:
             captured, result = await self._call_model(request)
@@ -854,13 +873,18 @@ class DevAgent:
         thread: Sequence[ChatMessage] | None = None,
         base_conflicts: Sequence[str] = (),
         staged: tuple[str, str] | None = None,
+        wiki_block: str = "",
     ) -> CodeAgentRequest:
         from virtual_dev.tools import render_tools_catalog
 
         mcp_servers, allowed_tool_names, groups, captured = self._build_tool_surface()
-        tools_catalog = render_tools_catalog(groups)
+        tools_catalog = render_tools_catalog(
+            groups,
+            extra_builtins=professor_catalog_extra(self._settings),
+        )
         system_prompt = self._compose_system_prompt(
             task_row, tools_catalog, workspace_path=workspace_path,
+            wiki_block=wiki_block,
         )
         user_prompt = self._render_iteration_prompt(
             task_row=task_row, plan=plan, feedback=feedback,
@@ -1031,6 +1055,12 @@ class DevAgent:
             if not name.startswith("mcp__virtual_dev_shared__")
             or name == "mcp__virtual_dev_shared__search_mr_history"
         ]
+        # Optional remote LLM-Wiki surface. Its names cannot be caught
+        # by the shared-prefix filter above. Disabled unless Professor
+        # URL + token are both configured.
+        mcp_servers, allowed_tool_names = merge_professor_mcp(
+            self._settings, mcp_servers, allowed_tool_names,
+        )
         # Full Claude Code tool surface in the workspace (filesystem +
         # bash) comes from the SDK builtins, not from ``tools/``.
         allowed_tool_names.extend(
@@ -1048,14 +1078,19 @@ class DevAgent:
     # --- request building ---
 
     def _build_request(
-        self, *, plan: Plan, task_row: TaskRow, workspace_path: str
+        self, *, plan: Plan, task_row: TaskRow, workspace_path: str,
+        wiki_block: str = "",
     ) -> CodeAgentRequest:
         from virtual_dev.tools import render_tools_catalog
 
         mcp_servers, allowed_tool_names, groups, captured = self._build_tool_surface()
-        tools_catalog = render_tools_catalog(groups)
+        tools_catalog = render_tools_catalog(
+            groups,
+            extra_builtins=professor_catalog_extra(self._settings),
+        )
         system_prompt = self._compose_system_prompt(
             task_row, tools_catalog, workspace_path=workspace_path,
+            wiki_block=wiki_block,
         )
         user_prompt = self._render_user_prompt(task_row=task_row, plan=plan)
         request = CodeAgentRequest(
@@ -1074,6 +1109,7 @@ class DevAgent:
     def _compose_system_prompt(
         self, task_row: TaskRow, tools_catalog: str = "",
         *, workspace_path: str | None = None,
+        wiki_block: str = "",
     ) -> str:
         base = self._prompts.render(
             _DEV_PROMPT_NAME,
@@ -1102,7 +1138,31 @@ class DevAgent:
         if repo_instructions:
             parts.append("")
             parts.append(repo_instructions)
+
+        # Mandatory wiki standard goes LAST so it isn't buried under
+        # per-repo instructions. Empty when the wiki integration is off.
+        if wiki_block:
+            parts.append("")
+            parts.append(wiki_block)
         return "\n".join(parts)
+
+    async def _mandatory_wiki_block(self) -> str:
+        """Preflight обязательной статьи Лоции (fail-closed).
+
+        Возвращает готовый блок для system prompt или бросает
+        ``WikiUnavailableError``: вызывающий обработчик НЕ делает ack,
+        сообщение переезжает по redelivery после восстановления Wiki.
+        Метод вызывается ДО любых побочных эффектов запуска (клон,
+        смена статуса) — при недоступности Wiki ничего не меняется.
+        """
+        if self._wiki is None:
+            return ""
+        article = await self._wiki.fetch_mandatory_article(MANDATORY_REVIEW_TOPIC)
+        logger.debug(
+            "Dev: mandatory wiki article loaded ({}, {} chars)",
+            article.topic, len(article.text),
+        )
+        return article.prompt_block()
 
     def _render_user_prompt(self, *, task_row: TaskRow, plan: Plan) -> str:
         parts: list[str] = []

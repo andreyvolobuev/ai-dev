@@ -51,11 +51,12 @@ from virtual_dev.application.services.transcript import local_time, render_trans
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import Plan
 from virtual_dev.domain.ports.code_agent import CodeAgentPort, CodeAgentRequest
+from virtual_dev.domain.ports.professor_wiki import MANDATORY_REVIEW_TOPIC, ProfessorWikiPort
 from virtual_dev.domain.ports.vcs import VcsPort
 from virtual_dev.infrastructure.config import AppConfig, Settings
-
 if TYPE_CHECKING:
     from virtual_dev.application.services import ResearcherToolkit
+from virtual_dev.tools import merge_professor_mcp
 
 
 class ResponderAction(str, Enum):
@@ -105,7 +106,14 @@ class ThreadResponderAgent:
         max_turns: int = 20,
         trace: AgentTrace | None = None,
         researcher: ResearcherToolkit | None = None,
+        # Optional for compatibility with existing constructions; the
+        # container always passes it. Wiki tools are only added when it
+        # is present and Professor is configured.
         settings: Settings | None = None,
+        # Mandatory-review provider (Stage 2). Optional for the same
+        # reason; when absent, no article is injected and no preflight
+        # runs.
+        wiki: ProfessorWikiPort | None = None,
     ) -> None:
         self._code_agent = code_agent
         self._researcher = researcher
@@ -115,6 +123,8 @@ class ThreadResponderAgent:
         self._filter = injection_filter or InjectionFilter()
         self._max_turns = max_turns
         self._trace = trace
+        self._settings = settings
+        self._wiki = wiki
 
     async def decide(
         self,
@@ -133,6 +143,13 @@ class ThreadResponderAgent:
         work_state: str = "",
         linked_notes: Sequence[tuple[str, str]] = (),
     ) -> ResponderDecision:
+        # Fail-closed preflight (Stage 5): обязательный стандарт ревью
+        # должен быть в контексте ДО принятия решения. При недоступности
+        # Wiki исключение уходит наружу — вызывающий (reviewer polling)
+        # не делает claim/ack, lease истекает, шина делает redelivery.
+        # Пустой polling сюда не доходит: decide() зовётся только на
+        # реальный ответ в треде.
+        wiki_block = await self._mandatory_wiki_block()
         prompt = self._render_prompt(
             mr_title=mr_title, mr_description=mr_description,
             mr_web_url=mr_web_url, plan=plan,
@@ -144,7 +161,7 @@ class ThreadResponderAgent:
             work_state=work_state,
             linked_notes=linked_notes,
         )
-        captured, result = await self._call_model(prompt, repo_workspace)
+        captured, result = await self._call_model(prompt, repo_workspace, wiki_block=wiki_block)
 
         if not captured:
             logger.warning(
@@ -201,7 +218,7 @@ class ThreadResponderAgent:
         return self._config.agents.working_hours.timezone
 
     async def _call_model(
-        self, prompt: str, workspace: str | None,
+        self, prompt: str, workspace: str | None, wiki_block: str = "",
     ) -> tuple[dict[str, Any], Any]:
         from virtual_dev.tools import ToolContext, build_tool_servers
 
@@ -234,18 +251,22 @@ class ThreadResponderAgent:
             if not name.startswith("mcp__virtual_dev_shared__")
             or name.removeprefix("mcp__virtual_dev_shared__") in _SHARED_TOOLS
         ]
+        # Optional remote LLM-Wiki surface for follow-up wiki lookups
+        # while making the review decision. Disabled unless Professor
+        # URL + token are both configured.
+        if self._settings is not None:
+            mcp_servers, allowed = merge_professor_mcp(
+                self._settings, mcp_servers, allowed,
+            )
         # Filesystem builtins for reading the repo if the model wants
         # context — same surface as before.
         allowed.extend(["Read", "Glob", "Grep"])
 
-        system_prompt = self._prompts.render(
-            _PROMPT_NAME,
-            fallback=_FALLBACK_PROMPT,
-            untrusted_warning=SYSTEM_PROMPT_ABOUT_UNTRUSTED,
-        )
-        # The repo's own rules (rainbow keeps «пересобери ветку» there):
-        # the responder turns asks into tasks and must read them the way
-        # the team does.
+        # Base prompt + mandatory wiki standard (Stage 5); the repo's own
+        # rules (rainbow keeps «пересобери ветку» there) go after it — the
+        # responder turns asks into tasks and must read them the way the
+        # team does.
+        system_prompt = self._compose_system_prompt(wiki_block)
         repo_rules = render_repo_instructions(workspace)
         if repo_rules:
             system_prompt = f"{system_prompt}\n\n{repo_rules}"
@@ -264,6 +285,37 @@ class ThreadResponderAgent:
         request.extras["submit_capture"] = captured
         result = await self._code_agent.run_task(request)
         return captured, result
+
+    def _compose_system_prompt(self, wiki_block: str) -> str:
+        """Базовый промпт + обязательный стандарт ревью последним блоком.
+
+        Блок идёт после `{untrusted_warning}` — как и у Dev, «стандарт
+        читают последним, применяют всегда».
+        """
+        system_prompt = self._prompts.render(
+            _PROMPT_NAME,
+            fallback=_FALLBACK_PROMPT,
+            untrusted_warning=SYSTEM_PROMPT_ABOUT_UNTRUSTED,
+        )
+        if wiki_block:
+            system_prompt = f"{system_prompt}\n\n{wiki_block}"
+        return system_prompt
+
+    async def _mandatory_wiki_block(self) -> str:
+        """Полный текст обязательного стандарта ревью из LLM-Wiki.
+
+        ``None`` → интеграция выключена (пустой блок). Ошибка доставки —
+        ``WikiUnavailableError`` наружу: решение не принимается, вызывающий
+        код не делает claim/ack (fail-closed, Stage 5).
+        """
+        if self._wiki is None:
+            return ""
+        article = await self._wiki.fetch_mandatory_article(MANDATORY_REVIEW_TOPIC)
+        logger.debug(
+            "ThreadResponder: mandatory wiki article loaded ({}, {} chars)",
+            article.topic, len(article.text),
+        )
+        return article.prompt_block()
 
     def _render_prompt(
         self,

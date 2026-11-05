@@ -18,6 +18,7 @@ from virtual_dev.adapters.chat import MattermostChat
 from virtual_dev.adapters.code_agent import ClaudeAgentSdkCodeAgent
 from virtual_dev.adapters.embedder import FastembedEmbedder
 from virtual_dev.adapters.knowledge_base import ConfluenceKb
+from virtual_dev.adapters.knowledge_base.professor_wiki import professor_wiki_from_settings
 from virtual_dev.adapters.llm import ClaudeAgentSdkLlm
 from virtual_dev.adapters.message_bus import SqlAlchemyMessageBus
 from virtual_dev.adapters.mr_history import LocalMrHistory
@@ -339,6 +340,8 @@ def build_container(config_dir: Path | str = "config") -> Container:
     # Build Dev-agents first so DevOps + Reviewer can share the same
     # instances for iteration dispatch.
     dev_agents: dict[str, DevAgent] = {}
+    # Mandatory LLM-Wiki article provider (None = integration disabled).
+    professor_wiki = professor_wiki_from_settings(settings)
     if vcs is not None:
         for repo in config.repositories:
             if not repo.agents.backend:
@@ -356,6 +359,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
                 settings=settings,
                 researcher=researcher if mr_history else None,
                 trace=trace,
+                wiki=professor_wiki,
             )
 
     thread_responder = ThreadResponderAgent(
@@ -366,6 +370,7 @@ def build_container(config_dir: Path | str = "config") -> Container:
         trace=trace,
         researcher=researcher,
         settings=settings,
+        wiki=professor_wiki,
     )
     task_intake = TaskIntakeAgent(
         code_agent=code_agent,

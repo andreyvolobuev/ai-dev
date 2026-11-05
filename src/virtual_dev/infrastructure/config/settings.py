@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     confluence_user: str = ""
     confluence_token: str = ""
 
+    # --- Professor LLM-Wiki (read-only MCP) ---
+    # Streamable-HTTP MCP endpoint, including the /mcp path, and a
+    # Professor registry token (persona=developer, no can_propose).
+    # Both empty = integration disabled. Exactly one value = startup
+    # error, not a later 401 in the middle of a model run.
+    professor_mcp_url: str = ""
+    professor_mcp_token: str = ""
+
     # --- LLM / Claude gateway ---
     # By default the bot uses the local `claude` CLI login (Claude Max) — leave
     # both empty. To route Claude Agent SDK through a corporate Anthropic-

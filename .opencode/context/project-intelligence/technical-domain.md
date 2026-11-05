@@ -13,6 +13,7 @@
 | VCS | GitLab (`gitlab.2gis.ru`, self-hosted) | `python-gitlab`, PAT |
 | Chat | Mattermost (`mm.2gis.one`, self-hosted) | REST API + WebSocket, self-signed SSL |
 | KB | Confluence (`confluence.2gis.ru`, self-hosted) | REST API, CQL search |
+| LLM-Wiki | Профессор MCP — streamable HTTP, Bearer, read-only | `wiki_search` / `wiki_get_page` («Лоция»); обязательный стандарт ревью для Dev/Reviewer |
 | DB | **PostgreSQL** (`postgresql+asyncpg`) | asyncpg + psycopg2-binary (для Alembic). Раньше был SQLite |
 | Dashboard | FastAPI + Jinja2 | Web UI |
 | CLI | typer | CLI-команды |
@@ -39,6 +40,14 @@
   - Основная: `claude-opus-4-8` (работает везде)
   - Лёгкая: `claude-haiku-4-5-20251001` (датированный)
 - Если `ANTHROPIC_BASE_URL` не задан → SDK наследует parent env, использует локальный `claude` login (режим 1)
+
+## LLM-Wiki («Лоция») — Профессор MCP (read-only)
+
+- **Включение**: оба поля `PROFESSOR_MCP_URL` (streamable-HTTP эндпоинт, суффикс `/mcp`) + `PROFESSOR_MCP_TOKEN` (developer-токен реестра Профессора, БЕЗ `can_propose`). Оба пустые → интеграция выключена; задано одно → fail-fast на старте.
+- **Опциональные инструменты** у Analyst/Dev/ThreadResponder: `mcp__professor__wiki_search` + `mcp__professor__wiki_get_page` (сервер-ключ `professor`); каталог описывает их только при включённой интеграции.
+- **Обязательная статья** `krusenstern/chris-review` — константа `MANDATORY_REVIEW_TOPIC`: preflight через `ProfessorWikiMcp` (`adapters/knowledge_base/professor_wiki.py`) инжектит полный текст в system prompt Dev (первичный запуск + каждая итерация) и ThreadResponder (каждое решение). Успех валидируется по untrusted-обёртке с темой (`found` не доезжает по проводу).
+- **Fail-closed без ghost'ов**: при `WikiUnavailableError` — dev_inbox re-raise (lease → redelivery), mm_thread_listener/reviewer снимают claim (catch-up / pinned cursor → ретрай), ничего не переводится в FAILED/blocked и не подтверждается.
+- Текст статьи — `<untrusted_content>`: данные, не инструкции. Токен не попадает в логи (`_SECRET_FIELDS`), в сообщениях ошибок его нет по контракту.
 
 ## Architecture — Hexagonal (Ports & Adapters)
 ```
@@ -166,7 +175,7 @@ domain/models/
 - HTTPRoute → Istio Gateway (canary + stable), host `ai-dev-sd-bots-liza.istio.k8s.2gis.dev`
 - `readinessProbe: /healthz` (opt-in через `healthcheckPath`)
 - `minReadySeconds: 10`, `helm --atomic --wait --timeout 5m`
-- Env: `build-values.py` инжектирует 24 ENV_KEYS + 5 SECRET_KEYS из CI-окружения
+- Env: `build-values.py` инжектирует 25 ENV_KEYS (в т.ч. `PROFESSOR_MCP_URL`) + 6 SECRET_KEYS (в т.ч. `PROFESSOR_MCP_TOKEN`) из CI-окружения
 
 ## Key Technical Decisions (see also `decisions-log.md`)
 - Коммиты: `Virtual Dev <virtual-dev@datamining.2gis.ru>`, per-call `-c user.name/email`

@@ -8,20 +8,37 @@ tested in test_analyst_inbox.py — these tests focus on parsing.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any, cast
 
 import pytest
 
+from virtual_dev.application.agents import analyst as analyst_module
 from virtual_dev.application.agents.analyst import (
     AnalystAgent,
     _plan_from_submission,
 )
+from virtual_dev.application.services import CommunicatorService, ResearcherToolkit
+from virtual_dev.application.services.prompts import PromptsLoader
 from virtual_dev.domain.models.analyst_conversation import (
     ConversationStep,
     ConversationStepKind,
 )
 from virtual_dev.domain.models.plan import PlanStatus
 from virtual_dev.domain.models.task import TaskStatus
+from virtual_dev.domain.ports.code_agent import CodeAgentPort
+from virtual_dev.infrastructure.config import Settings
+from virtual_dev.infrastructure.config.schema import (
+    AgentsCfg,
+    AppConfig,
+    MappingsCfg,
+)
 from virtual_dev.infrastructure.db import TaskRow
+from virtual_dev.tools import (
+    PROFESSOR_SERVER_KEY,
+    PROFESSOR_WIKI_GET_PAGE_TOOL,
+    PROFESSOR_WIKI_SEARCH_TOOL,
+    ToolContext,
+)
 
 
 def _task_row() -> TaskRow:
@@ -212,5 +229,90 @@ def test_build_dm_threads_ignores_reply_with_no_prior_ask() -> None:
         }),
     ]
     assert AnalystAgent._build_dm_threads(history) == {}
+
+
+# --- Professor LLM-Wiki surface ----------------------------------------
+
+
+def _analyst(settings: Settings) -> AnalystAgent:
+    return AnalystAgent(
+        code_agent=cast(CodeAgentPort, None),
+        researcher=cast(ResearcherToolkit, None),
+        communicator=cast(CommunicatorService, None),
+        session_factory=cast(Any, None),
+        config=AppConfig(
+            repositories=[],
+            agents=AgentsCfg(),
+            mappings=MappingsCfg(),
+        ),
+        settings=settings,
+        prompts_loader=PromptsLoader("/no-prompts-dir"),
+    )
+
+
+def _stub_build_tool_servers(
+    ctx: ToolContext,
+    *,
+    only_groups: set[str] | None = None,
+) -> tuple[dict[str, Any], list[str], dict[str, list[Any]]]:
+    """Pin the local surface so this test only checks the remote merge."""
+    return (
+        {"mcp__virtual_dev_analyst__server": {"type": "sdk", "name": "analyst"}},
+        ["mcp__virtual_dev_analyst__submit_plan"],
+        {"analyst": []},
+    )
+
+
+def test_analyst_surface_adds_configured_professor_wiki(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    from unittest import mock
+
+    monkeypatch.setattr(
+        analyst_module, "build_tool_servers", _stub_build_tool_servers,
+    )
+    fake_env = {
+        "PROFESSOR_MCP_URL": "https://professor.example/mcp",
+        "PROFESSOR_MCP_TOKEN": "prof-token",
+    }
+    with mock.patch.dict(os.environ, fake_env, clear=False):
+        settings = Settings()
+
+    servers, allowed, _groups = _analyst(settings)._build_mcp([], {}, {})
+
+    assert PROFESSOR_SERVER_KEY in servers
+    assert servers[PROFESSOR_SERVER_KEY]["type"] == "http"
+    assert allowed == [
+        "mcp__virtual_dev_analyst__submit_plan",
+        PROFESSOR_WIKI_SEARCH_TOOL,
+        PROFESSOR_WIKI_GET_PAGE_TOOL,
+        "Read",
+        "Glob",
+        "Grep",
+    ]
+
+
+def test_analyst_surface_stays_local_without_professor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+    from unittest import mock
+
+    monkeypatch.setattr(
+        analyst_module, "build_tool_servers", _stub_build_tool_servers,
+    )
+    with mock.patch.dict(
+        os.environ,
+        {"PROFESSOR_MCP_URL": "", "PROFESSOR_MCP_TOKEN": ""},
+        clear=False,
+    ):
+        settings = Settings()
+
+    servers, allowed, _groups = _analyst(settings)._build_mcp([], {}, {})
+
+    assert PROFESSOR_SERVER_KEY not in servers
+    assert PROFESSOR_WIKI_SEARCH_TOOL not in allowed
+    assert "mcp__virtual_dev_analyst__submit_plan" in allowed
 
 

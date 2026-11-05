@@ -86,6 +86,7 @@ def test_known_env_secrets_are_redacted_even_in_plain_text() -> None:
         "MATTERMOST_TOKEN": "",  # empty — must not redact empty strings!
         "CONFLUENCE_TOKEN": "",
         "ADMIN_TOKEN": "",
+        "PROFESSOR_MCP_TOKEN": "prof-token-uniqueXYZ",
     }
     with mock.patch.dict(os.environ, fake_env, clear=False):
         settings = Settings()  # picks up fake env
@@ -94,6 +95,7 @@ def test_known_env_secrets_are_redacted_even_in_plain_text() -> None:
     try:
         logger.info("oops we logged jira-token-uniqueABC plainly")
         logger.info("and then gl-tok-XYZdef somewhere else")
+        logger.info("and prof-token-uniqueXYZ too")
         # Empty strings must NOT cause global ""→[REDACTED] catastrophe.
         logger.info("normal log line with no secret")
     finally:
@@ -102,6 +104,7 @@ def test_known_env_secrets_are_redacted_even_in_plain_text() -> None:
     out = buf.getvalue()
     assert "jira-token-uniqueABC" not in out
     assert "gl-tok-XYZdef" not in out
+    assert "prof-token-uniqueXYZ" not in out
     # Sanity: a normal log line is unchanged in spirit.
     assert "normal log line" in out
 
