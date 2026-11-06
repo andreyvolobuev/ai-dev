@@ -24,6 +24,7 @@ from virtual_dev.domain.models.merge_request import (
     PipelineStatus,
 )
 from virtual_dev.domain.ports.chat import ChatPort
+from virtual_dev.domain.ports.professor_wiki import WikiUnavailableError
 from virtual_dev.infrastructure.config import (
     AgentsCfg,
     AppConfig,
@@ -1108,3 +1109,63 @@ async def test_progress_question_gets_runtime_facts_and_file_is_attached(
     assert root == "root-f"
     assert body.startswith("Затык в пуше — отчёт в файле.")
     assert "report.md" in body and "пуш отклонён" in body
+
+
+@pytest.mark.asyncio
+async def test_iterate_wiki_down_releases_claim_for_catchup_retry(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Wiki недоступна (Stage 4 preflight внутри DevAgent) — повторяемая
+    инфраструктурная ошибка, а не краш: crashed-шаблон не публикуется,
+    claim снимается, ✅ не ставится — catch-up повторит попытку после
+    восстановления Wiki. Ack-реплай уже ушёл; повторный при ретрае
+    приемлем."""
+    await _insert_mr(session_factory, root_id="root-wikidown")
+    event = _human_post(
+        id="post-wikidown", thread_root_id="root-wikidown",
+        text="please rename foo to bar",
+    )
+    chat = _ScriptedChat([event])
+    responder = _ScriptedResponder([ResponderDecision(
+        action=ResponderAction.ITERATE,
+        reply_text="Принято, правлю.",
+        iteration_feedback="Rename foo to bar.",
+        reasoning="clear-rename",
+    )])
+    communicator = CommunicatorService(chat, InjectionFilter(), respect_working_hours=False)
+
+    class _WikiDownDev:
+        _repo_key = "bellingshausen"
+
+        async def handle_iteration(self, **kwargs: object) -> DevResult:
+            raise WikiUnavailableError("Профессор: сеть/транспорт недоступны")
+
+    listener = MmThreadListener(
+        chat=chat, communicator=communicator,
+        responder=responder,   # type: ignore[arg-type]
+        dev_agents={"bellingshausen": _WikiDownDev()},   # type: ignore[dict-item]
+        session_factory=session_factory,
+        config=_test_config(), settings=Settings(),
+    )
+
+    task = asyncio.create_task(listener.run_forever())
+    await _settle(lambda: len(chat.sent) >= 1)
+    await listener.stop()
+    await asyncio.wait_for(task, timeout=2)
+
+    # Это НЕ краш — шаблон crashed-итерации не уходит.
+    assert not any(
+        body == "dev упал" for _, body, _ in chat.sent
+    ), f"crashed reply posted for wiki outage; posts = {chat.sent}"
+    # Пост без ✅ → catch-up повторит.
+    assert ("post-wikidown", _PROCESSED_REACTION) not in chat.reactions
+    # Claim снят — записи в processed_thread_posts нет.
+    from sqlalchemy import select
+
+    async with session_scope(session_factory) as session:
+        rows = (await session.execute(
+            select(ProcessedThreadPostRow).where(
+                ProcessedThreadPostRow.post_id == "post-wikidown",
+            )
+        )).scalars().all()
+    assert rows == []

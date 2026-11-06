@@ -20,6 +20,7 @@ from virtual_dev.application.agents import DevAgent, DevOutcome
 from virtual_dev.application.agents.dev import CodeAgentPermanentError
 from virtual_dev.application.services import CommunicatorService
 from virtual_dev.domain.ports.message_bus import AgentMessage
+from virtual_dev.domain.ports.professor_wiki import WikiUnavailableError
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 from virtual_dev.infrastructure.config import AppConfig
 
@@ -90,6 +91,17 @@ class DevInbox:
 
         try:
             result = await self._dev.handle_plan(tracker, external_id)
+        except WikiUnavailableError as exc:
+            # Wiki недоступна — повторяемая инфраструктурная ошибка: НЕ ack
+            # (lease истечёт — bus переедет сообщение), НЕ комментарий в
+            # трекер и НЕ DM лиду. Dev ничего не запустил, задача в
+            # прежнем статусе; после восстановления Wiki повторная
+            # доставка стартует её заново.
+            logger.warning(
+                "DevInbox: wiki unavailable for {} (will be redelivered): {}",
+                external_id, exc,
+            )
+            raise
         except CodeAgentPermanentError as exc:
             # Won't fix itself by retrying — DevAgent already flipped the
             # task to FAILED so the recovery sweep won't re-publish.

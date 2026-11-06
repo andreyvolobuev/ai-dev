@@ -62,6 +62,7 @@ from virtual_dev.application.services.ticket_reset import reset_ticket_state
 from virtual_dev.domain.models.chat import ChatMessage
 from virtual_dev.domain.models.plan import PlanStatus
 from virtual_dev.domain.ports.chat import ChannelReadDeniedError, ChatPort
+from virtual_dev.domain.ports.professor_wiki import WikiUnavailableError
 from virtual_dev.domain.ports.vcs import VcsPort
 from pathlib import Path
 
@@ -746,10 +747,17 @@ class MmThreadListener:
                     self._vcs, row.repo_key, row.iid, log_tail_lines=-1,
                 ) if self._vcs is not None else ci
                 feedback = f"{feedback}\n\n{render_failed_jobs(row, full.jobs)}"
-            await self._run_iteration(
-                row, feedback, channel_id, root_id,
-                thread=[*transcript, event],
-            )
+            try:
+                await self._run_iteration(
+                    row, feedback, channel_id, root_id,
+                    thread=[*transcript, event],
+                )
+            except WikiUnavailableError:
+                # Wiki недоступна — повторяемая ошибка: снимаем claim и
+                # не ставим ✅, catch-up повторит попытку (ack-реплай уже
+                # ушёл — при ретрае уйдёт повторный, это приемлемо).
+                await self._release_post_claim(event.id)
+                return
             self.stats.iterations_dispatched += 1
 
         if not delivered:
@@ -822,13 +830,25 @@ class MmThreadListener:
         tracker = "jira"   # Phase 3.5: single-tracker assumption
         assert row.task_external_id is not None
         external_id = row.task_external_id
-        result = await run_iteration_with_retry(lambda: dev.handle_iteration(
-            tracker=tracker,
-            external_id=external_id,
-            branch_name=row.source_branch,
-            feedback=feedback,
-            thread=thread,
-        ))
+        try:
+            result = await run_iteration_with_retry(lambda: dev.handle_iteration(
+                tracker=tracker,
+                external_id=external_id,
+                branch_name=row.source_branch,
+                feedback=feedback,
+                thread=thread,
+            ))
+        except WikiUnavailableError as exc:
+            # LLM-Wiki недоступна — повторяемая инфраструктурная ошибка
+            # (Stage 4/6 fail-closed): признавать крах нельзя, иначе пост
+            # останется заклеймленным и обработанным навсегда. Логируем
+            # тихо и пробрасываем — обработчик снимет claim, catch-up
+            # повторит попытку.
+            logger.warning(
+                "MmThreadListener: wiki unavailable for {} — iteration deferred: {}",
+                row.task_external_id, exc,
+            )
+            raise
 
         posted: str | None = None
         if result.outcome is DevOutcome.MR_OPENED and result.commit_sha:

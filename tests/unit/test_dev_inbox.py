@@ -19,6 +19,7 @@ from virtual_dev.application.agents.dev import (
 )
 from virtual_dev.domain.models.task import Task
 from virtual_dev.domain.ports.message_bus import AgentMessage
+from virtual_dev.domain.ports.professor_wiki import WikiUnavailableError
 from virtual_dev.domain.ports.task_tracker import TaskTrackerPort
 from virtual_dev.infrastructure.config import (
     AgentsCfg,
@@ -202,3 +203,23 @@ async def test_dev_inbox_dms_lead_on_permanent_error() -> None:
     assert "DM-7" in text
     # Jira comment still posted alongside the DM.
     assert len(tracker.comments) == 1
+
+
+@pytest.mark.asyncio
+async def test_dev_inbox_reraises_wiki_unavailable_for_redelivery() -> None:
+    """Wiki недоступна — повторяемая инфраструктурная ошибка: НЕ ack,
+    НЕ комментарий в трекер и НЕ DM лиду. Исключение уходит наверх,
+    lease истечёт и bus переедет сообщение."""
+    tracker = _FakeTracker()
+    dev = _FakeDev(raises=WikiUnavailableError("wiki down"))
+    inbox = DevInbox(
+        dev_agent=dev,  # type: ignore[arg-type]
+        task_tracker=tracker,
+        config=_cfg(),
+    )
+
+    with pytest.raises(WikiUnavailableError):
+        await inbox.handle(_msg())
+
+    assert tracker.comments == []
+    assert tracker.transitions == []

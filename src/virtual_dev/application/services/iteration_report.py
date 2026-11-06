@@ -26,6 +26,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from virtual_dev.domain.ports.professor_wiki import WikiUnavailableError
 from virtual_dev.infrastructure.db import MergeRequestRow
 from virtual_dev.infrastructure.db.base import session_scope
 
@@ -46,14 +47,21 @@ async def run_iteration_with_retry(
     run: Callable[[], Awaitable[DevResult]],
 ) -> DevResult:
     """``run()`` until it succeeds or fails for a non-transient reason,
-    at most :data:`MAX_ATTEMPTS` times. Never raises: a crash on the last
-    attempt comes back as a FAILED result with the traceback as detail."""
+    at most :data:`MAX_ATTEMPTS` times. Never raises except
+    :class:`WikiUnavailableError`: a crash on the last attempt comes back
+    as a FAILED result with the traceback as detail."""
     from virtual_dev.application.agents.dev import DevOutcome, DevResult
 
     result: DevResult | None = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             result = await run()
+        except WikiUnavailableError:
+            # LLM-Wiki outage is retryable infra, not a model/push crash:
+            # never convert it into a FAILED result (that would mark the
+            # comment handled and lose the work). The coordinating handler
+            # releases the claim and retries after the wiki recovers.
+            raise
         except Exception as exc:
             logger.exception("Iteration attempt {}/{} crashed", attempt, MAX_ATTEMPTS)
             result = DevResult(

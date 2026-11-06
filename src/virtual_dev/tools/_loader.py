@@ -22,7 +22,7 @@ from collections.abc import Callable
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server
-from claude_agent_sdk.types import McpSdkServerConfig  # type: ignore[attr-defined]
+from claude_agent_sdk.types import McpServerConfig
 from loguru import logger
 
 from virtual_dev.tools._context import ToolContext
@@ -96,12 +96,13 @@ def build_tool_servers(
     package_name: str = _DEFAULT_PACKAGE,
     mcp_name_prefix: str = _DEFAULT_PREFIX,
     only_groups: set[str] | None = None,
-) -> tuple[dict[str, McpSdkServerConfig], list[str], dict[str, list[Any]]]:
+) -> tuple[dict[str, McpServerConfig], list[str], dict[str, list[Any]]]:
     """Build one MCP server per group and the SDK allow-list of names.
 
     Returns ``(servers, allowed, groups)`` where:
-    * ``servers`` maps ``"<prefix><group>"`` → ``McpSdkServerConfig``
-      ready to pass into ``ClaudeAgentOptions(mcp_servers=...)``.
+    * ``servers`` maps ``"<prefix><group>"`` → an SDK MCP-server config
+      ready to pass into ``ClaudeAgentOptions(mcp_servers=...)``. The
+      union type also admits remote HTTP configs merged by callers.
     * ``allowed`` is the list of fully-qualified tool names
       (``mcp__<server>__<tool>``) ready for ``allowed_tools=``.
     * ``groups`` is the raw discovery output keyed by group name —
@@ -119,7 +120,7 @@ def build_tool_servers(
     only the routing into MCP servers + allow-list is filtered.
     """
     groups = discover_tools(ctx, package_name=package_name)
-    servers: dict[str, McpSdkServerConfig] = {}
+    servers: dict[str, McpServerConfig] = {}
     allowed: list[str] = []
     selected = {
         g: tools for g, tools in groups.items()

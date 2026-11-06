@@ -60,6 +60,7 @@ from virtual_dev.application.services.iteration_report import (
 )
 from virtual_dev.domain.models.merge_request import MRStatus, ReviewComment
 from virtual_dev.domain.ports.message_bus import AgentMessage, MessageBusPort
+from virtual_dev.domain.ports.professor_wiki import WikiUnavailableError
 from virtual_dev.domain.ports.vcs import VcsPort
 from virtual_dev.infrastructure.config import AppConfig
 from virtual_dev.infrastructure.db import MergeRequestRow, ProcessedReviewCommentRow
@@ -152,6 +153,14 @@ class ReviewerAgent:
         for row in rows:
             try:
                 await self._check_one(row, stats)
+            except WikiUnavailableError as exc:
+                # LLM-Wiki недоступна (Stage 5 preflight в responder.decide):
+                # повторяемая ошибка, комментарий не заклеймлен, курсор на
+                # месте — следующий тик повторит. Тихо, без traceback.
+                logger.warning(
+                    "Reviewer: wiki unavailable — {}!{} deferred: {}",
+                    row.repo_key, row.iid, exc,
+                )
             except Exception:
                 logger.exception("Reviewer: MR {}!{} check failed", row.repo_key, row.iid)
 
@@ -667,13 +676,27 @@ class ReviewerAgent:
             # for days with nothing to show.
             assert dev is not None and row.task_external_id is not None
             external_id = row.task_external_id
-            result = await run_iteration_with_retry(lambda: dev.handle_iteration(
-                tracker="jira",
-                external_id=external_id,
-                branch_name=row.source_branch,
-                feedback=decision.iteration_feedback or latest.body,
-                thread=[*transcript, latest_chat],
-            ))
+            try:
+                result = await run_iteration_with_retry(lambda: dev.handle_iteration(
+                    tracker="jira",
+                    external_id=external_id,
+                    branch_name=row.source_branch,
+                    feedback=decision.iteration_feedback or latest.body,
+                    thread=[*transcript, latest_chat],
+                ))
+            except WikiUnavailableError as exc:
+                # Wiki недоступна — повторяемая инфраструктурная ошибка
+                # (Stage 4 preflight в DevAgent; run_iteration_with_retry
+                # её не проглатывает). Снимаем claim и возвращаем False:
+                # курсор остаётся на месте, следующий тик повторит решение
+                # целиком. Ack уже ушёл — при ретрае уйдёт повторный, это
+                # приемлемо (зеркалит MM-путь).
+                await self._release_comment_claim(row, latest.id)
+                logger.warning(
+                    "Reviewer: wiki unavailable for {}!{} — iteration deferred: {}",
+                    row.repo_key, row.iid, exc,
+                )
+                return False
             from virtual_dev.application.agents.dev import DevOutcome
             followup: str | None = None
             if result.outcome is DevOutcome.MR_OPENED and result.commit_sha:

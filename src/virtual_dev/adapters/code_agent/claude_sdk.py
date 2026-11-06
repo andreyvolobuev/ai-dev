@@ -26,9 +26,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
     query,
 )
-from claude_agent_sdk.types import (
-    McpSdkServerConfig,  # type: ignore[attr-defined]
-)
+from claude_agent_sdk.types import McpServerConfig
 from loguru import logger
 
 from virtual_dev.application.services.agent_trace import (
@@ -283,7 +281,7 @@ class ClaudeAgentSdkCodeAgent(CodeAgentPort):
     def _build_options(
         self,
         request: CodeAgentRequest,
-        mcp_servers: dict[str, McpSdkServerConfig] | None,
+        mcp_servers: dict[str, McpServerConfig] | None,
         allowed_tool_names: Iterable[str] | None,
         stderr_sink: list[str] | None,
         *,
@@ -376,14 +374,14 @@ def _tool_input_preview(tool_input: Any) -> str:
     return joined[:240] + ("…" if len(joined) > 240 else "")
 
 
-def _as_mcp_servers(value: object) -> dict[str, McpSdkServerConfig] | None:
+def _as_mcp_servers(value: object) -> dict[str, McpServerConfig] | None:
     if value is None:
         return None
     if not isinstance(value, dict):
         raise TypeError(
             f"extras['mcp_servers'] must be a dict, got {type(value).__name__}"
         )
-    return cast(dict[str, McpSdkServerConfig], value)
+    return cast(dict[str, McpServerConfig], value)
 
 
 def _as_allowed_tools(value: object) -> Iterable[str] | None:

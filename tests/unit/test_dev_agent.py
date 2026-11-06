@@ -22,10 +22,16 @@ from virtual_dev.application.services import PromptsLoader, RulesLoader
 from virtual_dev.domain.models.merge_request import MergeRequest, MRStatus, PipelineStatus
 from virtual_dev.domain.models.plan import PlanStatus
 from virtual_dev.domain.models.task import TaskStatus
+from virtual_dev.domain.models.wiki_article import WikiArticle
 from virtual_dev.domain.ports.code_agent import (
     CodeAgentPort,
     CodeAgentRequest,
     CodeAgentResult,
+)
+from virtual_dev.domain.ports.professor_wiki import (
+    MANDATORY_REVIEW_TOPIC,
+    ProfessorWikiPort,
+    WikiUnavailableError,
 )
 from virtual_dev.domain.ports.vcs import VcsPort
 from virtual_dev.infrastructure.config import Settings
@@ -257,6 +263,7 @@ def _make_dev(
     edits: list[str] | None = None,
     rules_dir: Path | None = None,
     trace: object | None = None,
+    wiki: ProfessorWikiPort | None = None,
 ) -> _TestDev:
     cfg = _cfg()
     rules_loader = RulesLoader(rules_dir or Path("/nonexistent_rules"))
@@ -272,9 +279,50 @@ def _make_dev(
         config=cfg,
         settings=Settings(),
         trace=trace,
+        wiki=wiki,
         preset_submission=preset_submission,
         edits=edits,
     )
+
+
+class _WikiStub(ProfessorWikiPort):
+    """Подменный порт обязательной статьи: фиксированный результат или ошибка."""
+
+    def __init__(
+        self,
+        article: WikiArticle | None = None,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self._article = article
+        self._error = error
+        self.calls: list[str] = []
+
+    async def fetch_mandatory_article(self, topic: str) -> WikiArticle:
+        self.calls.append(topic)
+        if self._error is not None:
+            raise self._error
+        assert self._article is not None
+        return self._article
+
+
+_MANDATORY_ARTICLE = WikiArticle(
+    topic=MANDATORY_REVIEW_TOPIC,
+    text=(
+        '<untrusted_content source="lotsiya:krusenstern/chris-review">\n'
+        "Лоция — статья «Chris Review» (тема: krusenstern/chris-review).\n"
+        "Статус: проверено 2026-11-02.\n"
+        "- ревью честное: отсутствие данных не выдаётся за факт\n"
+        "</untrusted_content>"
+    ),
+)
+
+
+def _dummy_code_agent() -> _FakeCodeAgent:
+    return _FakeCodeAgent(CodeAgentResult(
+        final_text="", turns=1, input_tokens=0, output_tokens=0,
+        cost_usd=0.0, stopped_reason="end_turn",
+    ))
 
 
 class _RecordingTrace:
@@ -896,6 +944,58 @@ def test_dev_tool_surface_has_all_expected_tools(
     # captured is the same dict the runtime reads back after the
     # model calls submit_mr; must be a mutable dict.
     assert isinstance(captured, dict)
+
+
+def test_dev_tool_surface_adds_configured_professor_wiki(
+    tmp_path: Path,
+) -> None:
+    """When Professor is configured, the dev surface keeps its local
+    tools and gains exactly the two read-only wiki tools."""
+    import os
+    from unittest import mock
+
+    from virtual_dev.application.services import ResearcherToolkit
+    from virtual_dev.tools import (
+        PROFESSOR_SERVER_KEY,
+        PROFESSOR_WIKI_GET_PAGE_TOOL,
+        PROFESSOR_WIKI_SEARCH_TOOL,
+    )
+
+    fake_env = {
+        "PROFESSOR_MCP_URL": "https://professor.example/mcp",
+        "PROFESSOR_MCP_TOKEN": "prof-token",
+    }
+    with mock.patch.dict(os.environ, fake_env, clear=False):
+        settings = Settings()
+
+    dev = DevAgent(
+        agent_key="dev-bellingshausen-backend",
+        repo_key="bellingshausen",
+        specialisation="backend",
+        vcs=cast(VcsPort, _FakeVcs(tmp_path / "ws")),
+        code_agent=cast(CodeAgentPort, _FakeCodeAgent(CodeAgentResult(
+            final_text="", turns=0, input_tokens=0, output_tokens=0,
+            cost_usd=0.0, stopped_reason="end_turn",
+        ))),
+        rules_loader=RulesLoader(Path("/nonexistent_rules")),
+        prompts_loader=PromptsLoader("/no-prompts-dir"),
+        session_factory=cast(Any, None),
+        config=_cfg(),
+        settings=settings,
+        researcher=cast(ResearcherToolkit, object()),
+    )
+
+    servers, allowed_tool_names, _groups, _captured = dev._build_tool_surface()
+
+    assert PROFESSOR_SERVER_KEY in servers
+    assert servers[PROFESSOR_SERVER_KEY]["type"] == "http"
+    assert servers[PROFESSOR_SERVER_KEY]["headers"] == {
+        "Authorization": "Bearer prof-token",
+    }
+    assert PROFESSOR_WIKI_SEARCH_TOOL in allowed_tool_names
+    assert PROFESSOR_WIKI_GET_PAGE_TOOL in allowed_tool_names
+    # The shared-group filter must not affect the remote server.
+    assert "mcp__virtual_dev_shared__search_mr_history" in allowed_tool_names
 
 
 def test_rules_loader_reads_agent_file(tmp_path: Path) -> None:
@@ -1690,3 +1790,139 @@ async def test_in_progress_is_visible_while_an_iteration_runs(
     assert running is not None and getattr(running, "feedback", "") == "почини тест"
     assert dev.in_progress("ai-dev/dm-7") is None
     assert dev.queued("ai-dev/dm-7") == 0
+
+
+# --- Mandatory LLM-Wiki article (Этап 4) ---
+
+
+@pytest.mark.asyncio
+async def test_dev_injects_mandatory_wiki_article_into_system_prompt(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """Обязательная статья Лоции попадает в system prompt первичного запуска —
+    независимо от того, решит ли модель вызывать wiki-инструменты."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    wiki = _WikiStub(_MANDATORY_ARTICLE)
+    dev = _make_dev(
+        session_factory, vcs=_FakeVcs(tmp_path / "workspace"),
+        code_agent=_dummy_code_agent(),
+        preset_submission={
+            "title": "Add users endpoint",
+            "description": "Implemented per plan.",
+            "status": "success",
+        },
+        edits=["app/users.py"],
+        wiki=wiki,
+    )
+
+    result = await dev.handle_plan("jira", "DM-7")
+
+    assert result.outcome is DevOutcome.MR_OPENED
+    assert wiki.calls == [MANDATORY_REVIEW_TOPIC]
+    request = dev.last_request
+    assert request is not None
+    assert "<mandatory_wiki_context>" in request.system_prompt
+    assert _MANDATORY_ARTICLE.text in request.system_prompt
+    # Блок — последняя секция системного промпта.
+    assert request.system_prompt.rstrip().endswith("</mandatory_wiki_context>")
+
+
+@pytest.mark.asyncio
+async def test_iteration_injects_mandatory_wiki_article(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """Каждая итерация (review/CI) тоже получает свежую статью."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    wiki = _WikiStub(_MANDATORY_ARTICLE)
+    dev = _make_dev(
+        session_factory, vcs=_FakeVcs(tmp_path / "workspace"),
+        code_agent=_dummy_code_agent(),
+        preset_submission={
+            "status": "success",
+            "title": "address review: rename foo",
+            "description": "rename foo to bar per reviewer ask",
+        },
+        edits=["app/users.py"],
+        wiki=wiki,
+    )
+
+    result = await dev.handle_iteration(
+        tracker="jira", external_id="DM-7",
+        branch_name="ai-dev/dm-7",
+        feedback="please rename foo",
+        feedback_kind="ci_failure",
+    )
+
+    assert result.outcome is DevOutcome.MR_OPENED
+    assert wiki.calls == [MANDATORY_REVIEW_TOPIC]
+    request = dev.last_request
+    assert request is not None
+    assert "<mandatory_wiki_context>" in request.system_prompt
+    assert _MANDATORY_ARTICLE.text in request.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_dev_wiki_outage_blocks_initial_run_without_side_effects(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """Wiki недоступна → запуск не начинается: нет клона, нет ветки, нет
+    смены статуса, модель не стартует. Ошибка уходит наверх как
+    повторяемая — обработчик не сделает ack."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _FakeVcs(tmp_path / "workspace")
+    wiki = _WikiStub(error=WikiUnavailableError("wiki down"))
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=_dummy_code_agent(),
+        preset_submission=None, wiki=wiki,
+    )
+
+    with pytest.raises(WikiUnavailableError):
+        await dev.handle_plan("jira", "DM-7")
+
+    assert dev.last_request is None
+    kinds = [c[0] for c in vcs.calls]
+    assert "ensure_clone" not in kinds
+    assert "create_branch" not in kinds
+    async with session_factory() as session:
+        task_row = (await session.execute(
+            select(TaskRow).where(TaskRow.external_id == "DM-7")
+        )).scalar_one()
+    assert task_row.internal_status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_dev_wiki_outage_blocks_iteration_before_vcs(
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+) -> None:
+    """Итерация при недоступной Wiki тоже не стартует и не эмитит
+    iteration_failed — событие «итерация упала» означает, что модель
+    реально работала и упала, а тут она даже не начинала."""
+    await _insert_task(session_factory)
+    await _insert_plan(session_factory)
+    vcs = _FakeVcs(tmp_path / "workspace")
+    wiki = _WikiStub(error=WikiUnavailableError("wiki down"))
+    trace = _RecordingTrace()
+    dev = _make_dev(
+        session_factory, vcs=vcs, code_agent=_dummy_code_agent(),
+        preset_submission=None, trace=trace, wiki=wiki,
+    )
+
+    with pytest.raises(WikiUnavailableError):
+        await dev.handle_iteration(
+            tracker="jira", external_id="DM-7",
+            branch_name="ai-dev/dm-7",
+            feedback="please rename foo",
+        )
+
+    assert dev.last_request is None
+    kinds = [c[0] for c in vcs.calls]
+    assert "ensure_clone" not in kinds
+    assert "checkout_existing_branch" not in kinds
+    assert all(getattr(e, "type", None) != "iteration_failed" for e in trace.events)

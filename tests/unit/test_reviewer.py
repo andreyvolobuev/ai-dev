@@ -25,6 +25,7 @@ from virtual_dev.domain.models.merge_request import (
     ReviewComment,
 )
 from virtual_dev.domain.ports.chat import ChatPort
+from virtual_dev.domain.ports.professor_wiki import WikiUnavailableError
 from virtual_dev.domain.ports.vcs import VcsPort
 from virtual_dev.infrastructure.config import (
     AgentCfg,
@@ -2018,6 +2019,141 @@ async def test_gitlab_iterate_crash_tells_the_reviewer_and_stops_retrying(
         assert not (row.pending_comment_ids or []), (
             "crashed iteration left the comment pending — it would re-run forever"
         )
+
+
+@pytest.mark.asyncio
+async def test_gitlab_iterate_wiki_down_releases_claim_for_retry(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Wiki недоступна (Stage 4 preflight внутри DevAgent) — это
+    повторяемая инфраструктурная ошибка, а не краш: не публикуем
+    crashed-шаблон, снимаем claim и оставляем курсор на месте, чтобы
+    следующий тик повторил решение целиком. Ack уже ушёл — при ретрае
+    уйдёт повторный, это приемлемо (зеркалит MM-путь)."""
+    from virtual_dev.application.agents import ResponderAction
+
+    mr_id = await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(id="c-0", mr_id="42", author_username="alice", body="earlier note"),
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="please fix the typings",
+        ),
+    ]
+
+    class _OkVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+    vcs = _OkVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+    responder = _StubResponder(
+        ResponderAction.ITERATE,
+        reply_text="уже правлю, коммит будет здесь",
+        feedback="fix the typings",
+    )
+
+    class _WikiDownDev:
+        def in_progress(self, branch: str) -> None:
+            return None
+
+        def queued(self, branch: str) -> int:
+            return 0
+
+        async def handle_iteration(self, **kwargs: object) -> object:
+            raise WikiUnavailableError("Профессор: сеть/транспорт недоступны")
+
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=responder,
+        dev_agents={"bellingshausen": _WikiDownDev()},
+    )
+    await agent.tick()
+
+    # Это НЕ краш — crashed-шаблон не уходит.
+    assert not any(
+        body == "dev упал" for _, _, body in vcs.posted_mr_comments
+    ), f"crash follow-up posted for wiki outage; MR comments = {vcs.posted_mr_comments}"
+    # Claim снят и курсор не сдвинулся → следующий тик повторит.
+    # pending_comment_ids — это ДРУГОЙ механизм (pending-reply), он
+    # легитимно хранит c-1 при False-возврате; собственно claim живёт
+    # в ProcessedReviewCommentRow.
+    from virtual_dev.infrastructure.db import ProcessedReviewCommentRow
+
+    async with session_factory() as s:
+        claim = (await s.execute(
+            select(ProcessedReviewCommentRow).where(
+                ProcessedReviewCommentRow.comment_key == "bellingshausen!42:c-1",
+            )
+        )).scalar_one_or_none()
+        assert claim is None, (
+            "wiki outage must release the comment claim for retry"
+        )
+        # Курсор last_seen при claim'е уже уехал — это не «призрак»:
+        # повтор на следующем тике обеспечивают pending_comment_ids
+        # (легитимно хранит c-1 после False-возврата).
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.pending_comment_ids == ["c-1"]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_wiki_down_decide_keeps_mr_for_retry(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Preflight в responder.decide бросил WikiUnavailableError — тик
+    НЕ должен упасть (чтобы не обрывать обработку остальных MR) и НЕ
+    должен сдвинуть курсор: следующий тик повторит этот MR."""
+    mr_id = await _insert_mr(
+        session_factory, last_seen="c-0",
+        last_activity_at=datetime.now(timezone.utc),
+    )
+    comments = [
+        ReviewComment(
+            id="c-1", mr_id="42", author_username="alice",
+            body="please fix the typings",
+        ),
+    ]
+
+    class _OkVcs(_StubVcs):
+        async def get_mr_diff(self, repo_key: str, iid: int) -> str:
+            return ""
+
+    vcs = _OkVcs(
+        comments={("bellingshausen", 42): comments},
+        approvals={("bellingshausen", 42): ApprovalInfo(required=1)},
+    )
+    communicator = CommunicatorService(
+        _RecordingChat(), InjectionFilter(), respect_working_hours=False,
+    )
+
+    class _WikiDownResponder:
+        async def decide(self, **kwargs: object) -> object:
+            raise WikiUnavailableError("Профессор: сеть/транспорт недоступны")
+
+    agent = ReviewerAgent(
+        vcs=vcs, communicator=communicator, session_factory=session_factory,
+        config=_cfg(), comment_classifier=_StubClassifier(),
+        bot_username="virtual-dev", responder=_WikiDownResponder(),
+    )
+    await agent.tick()   # не бросает — MR остаётся на ретрай
+
+    async with session_factory() as s:
+        row = (await s.execute(
+            select(MergeRequestRow).where(MergeRequestRow.id == mr_id)
+        )).scalar_one()
+        assert row.last_seen_comment_id == "c-0"
+        assert not (row.pending_comment_ids or [])
 
 
 @pytest.mark.asyncio

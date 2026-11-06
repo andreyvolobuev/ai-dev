@@ -121,7 +121,7 @@ uv run virtual-dev run
 
 | Где | Что |
 |---|---|
-| `.env` | Секреты + per-machine: токены, URL'ы, `WEB_HOST/PORT`, `DB_URL`, `WORKSPACES_DIR`, `REPO_LOCAL_PATHS`, `ESCALATION_USER`, `DEFAULT_TEAM_CHANNEL`. См. `.env.example`. |
+| `.env` | Секреты + per-machine: токены, URL'ы, `WEB_HOST/PORT`, `DB_URL`, `WORKSPACES_DIR`, `REPO_LOCAL_PATHS`, `ESCALATION_USER`, `DEFAULT_TEAM_CHANNEL`, `PROFESSOR_MCP_URL`/`PROFESSOR_MCP_TOKEN` (LLM-Wiki, опционально). См. `.env.example`. |
 | `config/repositories.yaml` | Список репо. Добавил строчку → перезапустил → появились новые dev-агенты. |
 | `config/agents.yaml` | Параметры агентов: модели, лимиты итераций, таймауты. |
 | `config/mappings.yaml` | email ↔ MM-username, jira-component ↔ репо. |
